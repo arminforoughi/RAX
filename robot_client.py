@@ -37,6 +37,15 @@ from booster_robotics_sdk_python import (
 )
 
 SEND_SAMPLE_RATE = 16000
+RECV_SAMPLE_RATE = 24000
+AUDIO_CHANNELS = 1
+AUDIO_FORMAT = pyaudio.paInt16
+AUDIO_CHUNK = 1024
+
+# Binary message type prefixes (robot -> server stream)
+MSG_VIDEO = 0x01
+MSG_DEPTH = 0x02
+MSG_AUDIO_IN = 0x03
 
 # Optional low-level joint API (fight guard / jabs use real elbow/shoulder angles).
 _LOWLEVEL = None
@@ -75,12 +84,25 @@ def _ji(joint_index_enum, name):
         return j
 
 
-class FightLowCmdController:
-    """Publishes LowCmd from measured joint state + arm joint overrides (Custom mode)."""
+def _joint_index_enum():
+    """JointIndex for arm mapping (SDK may expose it even when DDS lowcmd is unused)."""
+    if _LOWLEVEL and _LOWLEVEL.get('JointIndex'):
+        return _LOWLEVEL['JointIndex']
+    try:
+        import booster_robotics_sdk_python as _br
+        return getattr(_br, 'JointIndex', None)
+    except ImportError:
+        return None
 
-    def __init__(self, loco_client: B1LocoClient, sdk_lock: threading.Lock):
+
+class FightLowCmdController:
+    """LowCmd fight control: ROS2 joint_ctrl + /low_state (Booster deploy), else DDS LowCmd."""
+
+    def __init__(self, loco_client: B1LocoClient, sdk_lock: threading.Lock, ros_node=None):
         self.client = loco_client
         self.sdk_lock = sdk_lock
+        self._ros_node = ros_node
+        self._use_ros = False
         self._q = None
         self._q_lock = threading.Lock()
         self._pub = None
@@ -97,9 +119,20 @@ class FightLowCmdController:
         self._overlay = {}
         self._overlay_lock = threading.Lock()
 
+    @staticmethod
+    def _booster_ros_msgs_ok():
+        try:
+            from booster_interface.msg import LowCmd  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
     @property
     def available(self):
-        return _LOWLEVEL is not None
+        return self._booster_ros_msgs_ok() or _LOWLEVEL is not None
+
+    def set_ros_node(self, node):
+        self._ros_node = node
 
     def _on_state(self, msg):
         try:
@@ -110,10 +143,41 @@ class FightLowCmdController:
         except Exception:
             pass
 
+    def _get_base_q(self):
+        if self._use_ros and self._ros_node is not None:
+            q = self._ros_node.booster_joint_snapshot()
+            if q and len(q) == self._n:
+                return q
+            return None
+        with self._q_lock:
+            return list(self._q) if self._q else None
+
     def _ensure_io(self):
-        if self._pub is not None:
-            return self._n > 0
-        if not self.available:
+        if self._n > 0 and (self._use_ros or self._pub is not None):
+            return True
+
+        if self._ros_node is not None and self._booster_ros_msgs_ok():
+            if self._ros_node.ensure_booster_fight_bridge():
+                t0 = time.time()
+                while time.time() - t0 < 3.0:
+                    n = self._ros_node.booster_num_joints()
+                    if n > 0:
+                        break
+                    time.sleep(0.02)
+                n = self._ros_node.booster_num_joints()
+                if n <= 0:
+                    print('[FightLowCmd] /low_state not received (check Booster ROS2 bridge)')
+                else:
+                    self._ros_node.booster_init_lowcmd_motors(n)
+                    if self._ros_node.booster_wait_joint_ctrl_subscriber(25.0):
+                        self._n = n
+                        self._use_ros = True
+                        print('[FightLowCmd] ROS2 joint_ctrl + /low_state (same as booster_deploy / teleop stack)')
+                        return True
+                    print('[FightLowCmd] No subscriber on joint_ctrl yet (motion stack listening?)')
+                    self._n = 0
+
+        if _LOWLEVEL is None:
             return False
         L = _LOWLEVEL
         topic = L['kTopicJointCtrl'] or 'rt/low_cmd'
@@ -121,7 +185,7 @@ class FightLowCmdController:
             self._sub = L['B1LowStateSubscriber'](self._on_state)
             self._sub.InitChannel()
         except Exception as e:
-            print(f"[FightLowCmd] LowState subscriber failed: {e}")
+            print(f"[FightLowCmd] DDS LowState subscriber failed: {e}")
             return False
         topics = []
         for t in (topic, 'rt/low_cmd', 'rt/joint_ctrl'):
@@ -142,11 +206,13 @@ class FightLowCmdController:
                 self._pub = L['B1LowCmdPublisher']()
                 self._pub.InitChannel()
             except Exception as e:
-                print(f"[FightLowCmd] LowCmd publisher failed ({last_err or e})")
+                print(f"[FightLowCmd] DDS LowCmd publisher failed ({last_err or e})")
                 return False
         t0 = time.time()
         while self._n == 0 and time.time() - t0 < 2.5:
             time.sleep(0.02)
+        if self._n > 0:
+            print('[FightLowCmd] DDS LowCmd publisher (fallback)')
         return self._n > 0
 
     def _cmd_type(self):
@@ -158,6 +224,21 @@ class FightLowCmdController:
 
     def _write_lowcmd(self, q_targets, arm_idx_set):
         """Publish one frame: position hold on all joints to q_targets."""
+        if self._use_ros and self._ros_node is not None:
+            mcs = self._ros_node._bf_motor_cmd
+            for i in range(self._n):
+                q = q_targets[i]
+                kp = self._kp_arm if i in arm_idx_set else self._kp_default
+                kd = self._kd_arm if i in arm_idx_set else self._kd_default
+                mcs[i].q = q
+                mcs[i].dq = 0.0
+                mcs[i].tau = 0.0
+                mcs[i].kp = kp
+                mcs[i].kd = kd
+                mcs[i].weight = 1.0
+            self._ros_node.booster_publish_lowcmd()
+            return True
+
         L = _LOWLEVEL
         LowCmd, MotorCmd = L['LowCmd'], L['MotorCmd']
         msg = LowCmd()
@@ -211,7 +292,7 @@ class FightLowCmdController:
         return [a[i] + (b[i] - a[i]) * alpha for i in range(len(a))]
 
     def _arm_indices(self):
-        J = _LOWLEVEL['JointIndex']
+        J = _joint_index_enum()
         idx = []
         for name in (
             'kLeftShoulderPitch', 'kLeftShoulderRoll', 'kLeftElbowPitch', 'kLeftElbowYaw',
@@ -224,7 +305,7 @@ class FightLowCmdController:
 
     def guard_targets(self):
         """Joint radians: arms up in guard (shoulders forward/up, elbows clearly bent)."""
-        J = _LOWLEVEL['JointIndex']
+        J = _joint_index_enum()
         t = {}
         # Tunable on-robot; signs follow Booster B1-style layout.
         t[_ji(J, 'kLeftShoulderPitch')] = 0.82
@@ -238,7 +319,7 @@ class FightLowCmdController:
         return {k: v for k, v in t.items() if k is not None}
 
     def punch_delta(self, hand):
-        J = _LOWLEVEL['JointIndex']
+        J = _joint_index_enum()
         if hand == 'left':
             return {
                 _ji(J, 'kLeftShoulderPitch'): 0.42,
@@ -276,8 +357,7 @@ class FightLowCmdController:
         """Hold loop: legs/head track measured q; arms use guard + optional punch overlay."""
         period = 1.0 / self._hz
         while self._hold.is_set():
-            with self._q_lock:
-                base = list(self._q) if self._q else None
+            base = self._get_base_q()
             if not base or len(base) != self._n:
                 time.sleep(period)
                 continue
@@ -288,8 +368,7 @@ class FightLowCmdController:
             time.sleep(period)
 
     def interpolate_to(self, target_overrides, arm_idx_set, duration_s=0.65):
-        with self._q_lock:
-            start = list(self._q) if self._q else None
+        start = self._get_base_q()
         if not start or len(start) != self._n:
             return False
         end = self._apply_overrides(start, target_overrides)
@@ -313,17 +392,45 @@ class FightLowCmdController:
             print('[FightLowCmd] No Custom/manual RobotMode — cannot use low-level fight')
             return False
         try:
+            with self.sdk_lock:
+                self.client.SwitchHandEndEffectorControlMode(False)
+        except Exception:
+            pass
+
+        # Booster deploy order: seed LowCmd from measured q, publish, sleep, then Custom.
+        if self._use_ros:
+            init = self._get_base_q()
+            if not init or len(init) != self._n:
+                print('[FightLowCmd] No joint snapshot for Custom startup')
+                return False
+            mcs = self._ros_node._bf_motor_cmd
+            for i in range(self._n):
+                mcs[i].q = init[i]
+                kp = self._kp_arm if i in arm_idx_set else self._kp_default
+                kd = self._kd_arm if i in arm_idx_set else self._kd_default
+                mcs[i].dq = 0.0
+                mcs[i].tau = 0.0
+                mcs[i].kp = kp
+                mcs[i].kd = kd
+                mcs[i].weight = 1.0
+            self._ros_node.booster_publish_lowcmd()
+            time.sleep(0.1)
             try:
                 with self.sdk_lock:
-                    self.client.SwitchHandEndEffectorControlMode(False)
-            except Exception:
-                pass
-            with self.sdk_lock:
-                self.client.ChangeMode(Custom)
-            time.sleep(0.05)
-        except Exception as e:
-            print(f"[FightLowCmd] ChangeMode(Custom) failed: {e}")
-            return False
+                    self.client.ChangeMode(Custom)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"[FightLowCmd] ChangeMode(Custom) failed: {e}")
+                return False
+        else:
+            try:
+                with self.sdk_lock:
+                    self.client.ChangeMode(Custom)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"[FightLowCmd] ChangeMode(Custom) failed: {e}")
+                return False
+
         self._guard_ov = dict(guard_overrides)
         with self._overlay_lock:
             self._overlay = {}
@@ -366,15 +473,6 @@ class FightLowCmdController:
             time.sleep(0.15)
         except Exception as e:
             print(f"[FightLowCmd] return to Walking failed: {e}")
-RECV_SAMPLE_RATE = 24000
-AUDIO_CHANNELS = 1
-AUDIO_FORMAT = pyaudio.paInt16
-AUDIO_CHUNK = 1024
-
-# Binary message type prefixes
-MSG_VIDEO = 0x01
-MSG_DEPTH = 0x02
-MSG_AUDIO_IN = 0x03  # robot mic -> server
 
 
 # ── ROS2 Camera Streamer ────────────────────────────────────────────────────
@@ -458,6 +556,97 @@ class CameraStreamer(Node):
         with self._lock:
             return self._depth_compressed
 
+    # ── Booster fight / teleop-style lowcmd (same stack as booster_deploy & typical teleop) ──
+    # Ref: github.com/BoosterRobotics/booster_deploy — booster_robot_controller.py:
+    # subscribe /low_state, publish LowCmd on "joint_ctrl", CMD_TYPE_SERIAL, wait for
+    # subscriber, seed q/kp/kd, publish, sleep 0.1s, ChangeMode(kCustom).
+
+    def ensure_booster_fight_bridge(self):
+        """Create /low_state subscription and joint_ctrl publisher if booster_interface is present."""
+        if getattr(self, '_booster_fight_ready', False):
+            return True
+        try:
+            from booster_interface.msg import LowState, LowCmd, MotorCmd
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        except ImportError:
+            return False
+
+        self._bf_q_lock = threading.Lock()
+        self._bf_joint_q = None
+        self._bf_num_joints = 0
+
+        def _on_low_state(msg):
+            try:
+                q = [float(m.q) for m in msg.motor_state_serial]
+                with self._bf_q_lock:
+                    self._bf_joint_q = q
+                    self._bf_num_joints = len(q)
+            except Exception:
+                pass
+
+        qos_be = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        qos_rel = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(LowState, '/low_state', _on_low_state, qos_be)
+        self._bf_lowcmd_pub = self.create_publisher(LowCmd, 'joint_ctrl', qos_rel)
+        self._bf_low_cmd = LowCmd()
+        self._bf_low_cmd.cmd_type = LowCmd.CMD_TYPE_SERIAL
+        self._bf_MotorCmd = MotorCmd
+        self._booster_fight_ready = True
+        return True
+
+    def booster_joint_snapshot(self):
+        with self._bf_q_lock:
+            if not self._bf_joint_q:
+                return None
+            return list(self._bf_joint_q)
+
+    def booster_num_joints(self):
+        with self._bf_q_lock:
+            return self._bf_num_joints
+
+    def booster_init_lowcmd_motors(self, n):
+        """Resize motor_cmd array like booster_deploy create_low_cmd_publisher."""
+        MotorCmd = self._bf_MotorCmd
+        seq = self._bf_low_cmd.motor_cmd
+        try:
+            seq.clear()
+        except AttributeError:
+            while len(seq) > 0:
+                seq.pop()
+        for _ in range(n):
+            mc = MotorCmd()
+            mc.q = 0.0
+            mc.dq = 0.0
+            mc.tau = 0.0
+            mc.kp = 0.0
+            mc.kd = 0.0
+            mc.weight = 0.0
+            seq.append(mc)
+        self._bf_motor_cmd = self._bf_low_cmd.motor_cmd
+
+    def booster_wait_joint_ctrl_subscriber(self, timeout_s=30.0):
+        """Controller on robot must subscribe to joint_ctrl before we stream."""
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            try:
+                if self._bf_lowcmd_pub.get_subscription_count() > 0:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def booster_publish_lowcmd(self):
+        self._bf_lowcmd_pub.publish(self._bf_low_cmd)
+
 
 # ── Robot Command Executor ──────────────────────────────────────────────────
 
@@ -475,8 +664,12 @@ class RobotExecutor:
         self._gesture_cancel = threading.Event()
         self._fight_active = False
         self._fight_punch_lock = threading.Lock()
-        self._fight_low = FightLowCmdController(client, self.lock)
+        self._fight_low = FightLowCmdController(client, self.lock, ros_node=None)
         self._fight_use_lowlevel = False
+
+    def attach_ros_camera(self, camera_node):
+        """Wire the same ROS2 node that spins for camera (needed for /low_state + joint_ctrl)."""
+        self._fight_low.set_ros_node(camera_node)
 
     def handle(self, msg):
         cmd = msg.get('cmd')
@@ -1172,6 +1365,7 @@ def main():
     # ROS2
     rclpy.init()
     camera = CameraStreamer()
+    executor.attach_ros_camera(camera)
     ros_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
     ros_thread.start()
 
