@@ -118,6 +118,25 @@ def _prepend_booster_interface_paths():
         for sp in glob.glob(os.path.join(prefix, 'lib', 'python*', 'site-packages')):
             _add(sp)
 
+    # Shallow walk: install layout on K1 often differs from the paths above.
+    for root, max_depth in (
+        ('/opt/booster', 10),
+        (os.path.expanduser('~/booster_ws/install'), 8),
+        (os.path.expanduser('~/ros2_ws/install'), 8),
+    ):
+        if not root or not os.path.isdir(root):
+            continue
+        root = os.path.abspath(root)
+        for dirpath, dirnames, _ in os.walk(root):
+            depth = dirpath[len(root) :].count(os.sep)
+            if depth > max_depth:
+                dirnames[:] = []
+                continue
+            if os.path.basename(dirpath) == 'site-packages' and os.path.isdir(
+                os.path.join(dirpath, 'booster_interface')
+            ):
+                _add(dirpath)
+
     return added
 
 
@@ -624,7 +643,8 @@ class CameraStreamer(Node):
         try:
             from booster_interface.msg import LowState, LowCmd, MotorCmd
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-        except ImportError:
+        except ImportError as e:
+            print(f'[FightLowCmd] booster_interface import failed: {e}')
             return False
 
         self._bf_q_lock = threading.Lock()
@@ -722,6 +742,9 @@ class RobotExecutor:
         self._fight_punch_lock = threading.Lock()
         self._fight_low = FightLowCmdController(client, self.lock, ros_node=None)
         self._fight_use_lowlevel = False
+        # End-effector fallback: orientations distinct from default arm pose (less "hug" IK branch).
+        self._fight_ee_orient_left = (-1.05, -1.12, 0.36)
+        self._fight_ee_orient_right = (1.05, -1.12, -0.36)
 
     def attach_ros_camera(self, camera_node):
         """Wire the same ROS2 node that spins for camera (needed for /low_state + joint_ctrl)."""
@@ -906,10 +929,10 @@ class RobotExecutor:
                 _hint_dds = _LOWLEVEL is None
                 if _hint_ros or _hint_dds:
                     print(
-                        '[Fight] No low-level joint pipe (need ROS2 `booster_interface` on PYTHONPATH '
-                        '— source e.g. `/opt/booster/BoosterRos2Interface/install/setup.bash` — '
-                        'and a subscriber on `joint_ctrl`; or a full SDK with B1LowCmdPublisher). '
-                        'Using MoveHandEndEffectorV2 fallback.'
+                        '[Fight] No LowCmd joint pipe: use `run_robot_client.sh` (sources Booster ROS2) or '
+                        '`--booster-ros-install /path/to/install`, and ensure motion stack subscribes to '
+                        '`joint_ctrl`; otherwise install SDK with B1LowCmdPublisher. '
+                        'Using Cartesian guard (worse than joint control).'
                     )
                 else:
                     print(
@@ -922,10 +945,13 @@ class RobotExecutor:
                     self.client.SwitchHandEndEffectorControlMode(True)
             except AttributeError:
                 pass
-            gl = [0.30, 0.12, 0.27]
-            gr = [0.30, -0.12, 0.27]
-            self._move_hand_ee(gl[0], gl[1], gl[2], 'left', 750)
-            self._move_hand_ee(gr[0], gr[1], gr[2], 'right', 750)
+            # Hands higher, slightly closer than side pose; custom orientation to bias IK away from hug.
+            gl = [0.27, 0.11, 0.30]
+            gr = [0.27, -0.11, 0.30]
+            self._move_hand_ee_pose(
+                gl[0], gl[1], gl[2], 'left', 850, *self._fight_ee_orient_left)
+            self._move_hand_ee_pose(
+                gr[0], gr[1], gr[2], 'right', 850, *self._fight_ee_orient_right)
             self.left_arm_pos = list(gl)
             self.right_arm_pos = list(gr)
         threading.Thread(target=_do, daemon=True).start()
@@ -1035,6 +1061,14 @@ class RobotExecutor:
         with self.lock:
             self.client.MoveHandEndEffectorV2(posture, 300, hand_idx)
 
+    def _move_hand_ee_pose(self, x, y, z, hand, duration_ms, roll, pitch, yaw):
+        hand_idx = B1HandIndex.kLeftHand if hand == 'left' else B1HandIndex.kRightHand
+        posture = Posture()
+        posture.position = Position(x, y, z)
+        posture.orientation = Orientation(roll, pitch, yaw)
+        with self.lock:
+            self.client.MoveHandEndEffectorV2(posture, int(duration_ms), hand_idx)
+
     def _move_hand_ee(self, x, y, z, hand, duration_ms):
         is_left = hand == 'left'
         y_sign = 1 if is_left else -1
@@ -1061,12 +1095,16 @@ class RobotExecutor:
                 is_left = hand == 'left'
                 pos = self.left_arm_pos if is_left else self.right_arm_pos
                 gx, gy, gz = pos[0], pos[1], pos[2]
+                y_sign = 1 if is_left else -1
                 hx = min(gx + 0.11, 0.42)
                 hy = gy + (-0.025 if is_left else 0.025)
                 hz = max(gz - 0.06, 0.12)
-                self._move_hand_ee(hx, hy, hz, hand, 115)
+                # Jab: straighter wrist for reach; return to fight guard orientation (not default side IK).
+                jab_r, jab_p, jab_y = (-y_sign * 1.35, -1.45, 0.12 * y_sign)
+                self._move_hand_ee_pose(hx, hy, hz, hand, 115, jab_r, jab_p, jab_y)
                 time.sleep(0.13)
-                self._move_hand_ee(gx, gy, gz, hand, 210)
+                gor = self._fight_ee_orient_left if is_left else self._fight_ee_orient_right
+                self._move_hand_ee_pose(gx, gy, gz, hand, 220, gor[0], gor[1], gor[2])
             finally:
                 self._fight_punch_lock.release()
 
