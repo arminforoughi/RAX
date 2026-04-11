@@ -10,6 +10,7 @@ Usage:
 
 import os
 import sys
+import glob
 import asyncio
 import threading
 import time
@@ -69,6 +70,55 @@ try:
         _LOWLEVEL = None
 except ImportError:
     _LOWLEVEL = None
+
+
+def _prepend_booster_interface_paths():
+    """Find booster_interface Python bindings without sourcing setup.bash (systemd / wrong cwd)."""
+    added = []
+    seen = set(sys.path)
+
+    def _add(sp):
+        sp = os.path.abspath(sp)
+        if not os.path.isdir(sp) or sp in seen:
+            return
+        bi = os.path.join(sp, 'booster_interface')
+        if not os.path.isdir(bi):
+            return
+        sys.path.insert(0, sp)
+        seen.add(sp)
+        added.append(sp)
+
+    roots = []
+    for key in ('BOOSTER_ROS2_INSTALL', 'COLCON_PREFIX_PATH'):
+        raw = os.environ.get(key, '')
+        for part in raw.split(os.pathsep):
+            part = part.strip()
+            if not part:
+                continue
+            roots.append(part)
+            if not part.rstrip(os.sep).endswith('install') and os.path.isdir(os.path.join(part, 'install')):
+                roots.append(os.path.join(part, 'install'))
+
+    roots.extend([
+        '/opt/booster/BoosterRos2Interface/install',
+        '/opt/booster/ros2_ws/install',
+    ])
+
+    for base in roots:
+        if not base or not os.path.isdir(base):
+            continue
+        pattern = os.path.join(base, 'booster_interface', 'lib', 'python*', 'site-packages')
+        for sp in glob.glob(pattern):
+            _add(sp)
+
+    for prefix in os.environ.get('AMENT_PREFIX_PATH', '').split(os.pathsep):
+        prefix = prefix.strip()
+        if not prefix or not os.path.isdir(prefix):
+            continue
+        for sp in glob.glob(os.path.join(prefix, 'lib', 'python*', 'site-packages')):
+            _add(sp)
+
+    return added
 
 
 def _ji(joint_index_enum, name):
@@ -568,6 +618,9 @@ class CameraStreamer(Node):
         """Create /low_state subscription and joint_ctrl publisher if booster_interface is present."""
         if getattr(self, '_booster_fight_ready', False):
             return True
+        extra = _prepend_booster_interface_paths()
+        if extra:
+            print(f'[FightLowCmd] Prepended booster_interface path(s): {extra}')
         try:
             from booster_interface.msg import LowState, LowCmd, MotorCmd
             from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -1354,7 +1407,15 @@ def main():
     parser.add_argument('--depth-fps', type=int, default=5, help='Depth stream FPS')
     parser.add_argument('--mic-gain', type=float, default=3.0, help='Mic gain multiplier')
     parser.add_argument('--mic-device', type=int, default=None, help='PyAudio mic device index')
+    parser.add_argument(
+        '--booster-ros-install',
+        default=None,
+        metavar='PATH',
+        help='colcon install/ directory that contains booster_interface (same as after sourcing Booster ROS2)',
+    )
     args = parser.parse_args()
+    if args.booster_ros_install and not os.environ.get('BOOSTER_ROS2_INSTALL'):
+        os.environ['BOOSTER_ROS2_INSTALL'] = os.path.abspath(args.booster_ros_install)
 
     print("=" * 60)
     print("K1 Robot Client")
