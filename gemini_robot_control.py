@@ -1879,7 +1879,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div id="known-faces"><h3>Known Faces</h3><div id="kf-list">None yet</div></div>
     <div id="chat"></div>
     <div id="chat-input">
-      <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
+      <input type="text" id="msg-input" placeholder="Type a message (or say Jimmy, then your command)..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
     <div id="status"><span class="dot"></span>Listening... speak commands or use buttons above</div>
@@ -2300,7 +2300,7 @@ async def send_video(session, camera_node, interval):
         pass
 
 
-async def receive_responses(session, pya, cmd_dispatcher):
+async def receive_responses(session, pya, cmd_dispatcher, robot_name='Jimmy'):
     stream = pya.open(
         format=FORMAT, channels=CHANNELS, rate=RECV_SAMPLE_RATE,
         output=True, frames_per_buffer=CHUNK_SIZE,
@@ -2314,16 +2314,19 @@ async def receive_responses(session, pya, cmd_dispatcher):
 
                 sc = msg.server_content
                 if sc:
-                    if sc.input_transcription and sc.input_transcription.text:
-                        txt = sc.input_transcription.text
-                        print(f"  You: {txt}")
-                        add_transcript("You", txt)
-                    if sc.output_transcription and sc.output_transcription.text:
-                        txt = sc.output_transcription.text
-                        print(f"Robot: {txt}")
-                        add_transcript("Robot", txt)
-                        # Check for action commands in robot speech
-                        cmd_dispatcher.check_transcript(txt)
+                    input_txt = (sc.input_transcription.text if sc.input_transcription else None) or ""
+                    output_txt = (sc.output_transcription.text if sc.output_transcription else None) or ""
+                    # Only process when user addressed robot by name (wake-word filter)
+                    if input_txt and not _is_addressed_to_robot(input_txt, robot_name):
+                        print(f"  [ignored - not addressed to {robot_name}]: {(input_txt[:50] + '...') if len(input_txt) > 50 else input_txt}")
+                        continue
+                    if input_txt:
+                        print(f"  You: {input_txt}")
+                        add_transcript("You", input_txt)
+                    if output_txt:
+                        print(f"Robot: {output_txt}")
+                        add_transcript("Robot", output_txt)
+                        cmd_dispatcher.check_transcript(output_txt)
     except asyncio.CancelledError:
         pass
     finally:
@@ -2334,10 +2337,34 @@ async def receive_responses(session, pya, cmd_dispatcher):
 # ── Main session ─────────────────────────────────────────────────────────────
 
 
-SYSTEM_INSTRUCTION = """You are a Booster K1 humanoid robot with stereo vision cameras, face recognition, \
+def _is_addressed_to_robot(text, robot_name):
+    """True if the user addressed the robot by name (e.g. 'Jimmy, follow me')."""
+    if not text or not robot_name:
+        return False
+    text = text.strip()
+    name = re.escape(robot_name)
+    pat = re.compile(
+        r"^(?:hey\s+|hi\s+|oh\s+|um\s+)?"
+        + name
+        + r"[,\s:]*(.*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return pat.match(text) is not None
+
+
+def _get_system_instruction(robot_name):
+    return f"""You are a Booster K1 humanoid robot named {robot_name}. You have stereo vision cameras, face recognition, \
 and full body control. Video frames are streamed to you with real-time object detection overlays — \
 each detected object has a bounding box, class label, confidence score, and distance in meters. \
 People you recognize are labeled with their name; unknown people are labeled 'Unknown #N'.
+
+WAKE WORD / NOISE FILTERING (CRITICAL):
+- Your name is {robot_name}. You MUST only respond when the user addresses you by name first.
+- Valid examples: "{robot_name}, follow me" / "Hey {robot_name}, walk forward" / "{robot_name} dance"
+- If the user speaks without saying "{robot_name}" first (e.g. background conversation, someone talking to someone else), \
+do NOT respond. Stay silent. Ignore it completely.
+- Focus on the primary speaker. Ignore background conversations, TV, music, and ambient noise.
+- Only process commands that are clearly directed at you by name.
 
 You can PHYSICALLY ACT by saying certain trigger phrases in your responses. When you decide to act, \
 naturally include one of these phrases — your body will respond automatically:
@@ -2415,11 +2442,12 @@ IMPORTANT RULES:
 - Only trigger actions when explicitly asked or when socially appropriate (like waving back).
 - When tracking, your body automatically turns to follow the target — you don't just move your head.
 - You understand distances — when asked to go to an object, you can see how far it is in the detection overlay.
+- Remember: only respond when addressed as {robot_name} first. Ignore background conversations and focus on the primary speaker.
 """
 
 
 async def run_session(api_key, camera_node, cmd_dispatcher, voice, frame_interval,
-                      mic_device=None, mic_gain=1.0):
+                      robot_name='Jimmy', mic_device=None, mic_gain=1.0):
     global _session_ref, _event_loop_ref
 
     client = genai.Client(api_key=api_key)
@@ -2431,7 +2459,7 @@ async def run_session(api_key, camera_node, cmd_dispatcher, voice, frame_interva
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
             ),
         ),
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=_get_system_instruction(robot_name),
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
     )
@@ -2453,7 +2481,7 @@ async def run_session(api_key, camera_node, cmd_dispatcher, voice, frame_interva
             tasks = [
                 asyncio.create_task(send_audio(session, pya, mic_device, mic_gain)),
                 asyncio.create_task(send_video(session, camera_node, frame_interval)),
-                asyncio.create_task(receive_responses(session, pya, cmd_dispatcher)),
+                asyncio.create_task(receive_responses(session, pya, cmd_dispatcher, robot_name)),
             ]
 
             try:
@@ -2508,6 +2536,10 @@ def main():
         '--mic-device', type=int, default=None,
         help='PyAudio input device index (default: auto-detect iFlytek, or system default)',
     )
+    parser.add_argument(
+        '--robot-name', type=str, default='Jimmy',
+        help='Robot wake word: only respond when addressed by this name (default: Jimmy)',
+    )
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
@@ -2521,6 +2553,7 @@ def main():
     print("=" * 60)
     print("Gemini Robot Control")
     print("  Vision + Voice + Follow + Dance + Head Tracking")
+    print(f"  Wake word: {args.robot_name}")
     print("=" * 60)
 
     # Initialize robot SDK
@@ -2598,7 +2631,7 @@ def main():
     try:
         asyncio.run(run_session(
             api_key, camera_node, cmd_dispatcher, args.voice, args.frame_interval,
-            mic_device=mic_device, mic_gain=args.mic_gain,
+            robot_name=args.robot_name, mic_device=mic_device, mic_gain=args.mic_gain,
         ))
     except KeyboardInterrupt:
         print("\nShutting down...")

@@ -117,6 +117,10 @@ _CMD_PATTERNS = [
     (re.compile(r"\b(?:chicken\s*dance|do(?:ing)?\s+(?:the\s+)?chicken)\b", re.IGNORECASE), "dance_chicken"),
     (re.compile(r"\b(?:disco)\b", re.IGNORECASE), "dance_disco"),
     (re.compile(r"\b(?:karate|kung\s*fu)\b", re.IGNORECASE), "dance_karate"),
+    (re.compile(r"\b(?:i'll |let me |okay,? )?(?:throw\s+a\s+)?(?:right\s+punch|punch\s+right|right\s+hook|right\s+jab)\b", re.IGNORECASE), "punch_right"),
+    (re.compile(r"\b(?:i'll |let me |okay,? )?(?:throw\s+a\s+)?(?:left\s+punch|punch\s+left|left\s+hook|left\s+jab)\b", re.IGNORECASE), "punch_left"),
+    (re.compile(r"\b(?:fight\s*mode|put\s+(?:your\s+)?(?:hands|fists|arms)\s+up|boxing\s+stance|guard\s+up|get\s+ready\s+to\s+fight)\b", re.IGNORECASE), "fight_mode_on"),
+    (re.compile(r"\b(?:stop\s+fight(?:ing)?|lower\s+(?:your\s+)?(?:hands|arms|fists)|exit\s+fight\s*mode|stand\s+down)\b", re.IGNORECASE), "fight_mode_off"),
     (re.compile(r"\b(?:nod(?:ding)?)\b", re.IGNORECASE), "nod"),
     (re.compile(r"\b(?:shak(?:e|ing)\s+(?:my\s+)?head)\b", re.IGNORECASE), "head_shake"),
     (re.compile(r"\b(?:get\s+up|stand\s+up|get\s+back\s+up)\b", re.IGNORECASE), "get_up"),
@@ -259,12 +263,13 @@ class FrameProcessor:
     """Receives frames from robot WebSocket, runs YOLO + face recognition."""
 
     def __init__(self, model_path='yolov8n.pt', confidence=0.5,
-                 face_cache=None, enable_faces=True):
+                 face_cache=None, enable_faces=True, face_encoding='small'):
         print(f'Loading YOLO model: {model_path}')
         self.model = YOLO(model_path)
         self.confidence = confidence
         self.enable_faces = enable_faces
         self.face_cache = face_cache
+        self.face_encoding = face_encoding  # 'small' or 'large' for face_encodings
 
         self._unknown_faces = {}
         self._next_unknown_id = 1
@@ -419,7 +424,7 @@ class FrameProcessor:
         face_locs = face_recognition.face_locations(rgb, model='cnn')
         if not face_locs:
             return []
-        face_encs = face_recognition.face_encodings(rgb, face_locs, model='small')
+        face_encs = face_recognition.face_encodings(rgb, face_locs, model=self.face_encoding)
         results = []
         for loc, enc in zip(face_locs, face_encs):
             top, right, bottom, left = loc
@@ -708,6 +713,18 @@ class RobotController:
     def do_stop_gesture(self):
         """Stop any ongoing gesture and reset arms/head on the robot."""
         self._send({'cmd': 'stop_gesture'})
+
+    def do_punch_right(self):
+        self._send({'cmd': 'punch_right'})
+
+    def do_punch_left(self):
+        self._send({'cmd': 'punch_left'})
+
+    def do_fight_mode_on(self):
+        self._send({'cmd': 'fight_mode_on'})
+
+    def do_fight_mode_off(self):
+        self._send({'cmd': 'fight_mode_off'})
 
     # ── Tracking ─────────────────────────────────────────────────────────
 
@@ -1256,6 +1273,10 @@ class CommandDispatcher:
             "visual_kick": lambda: self.robot.do_visual_kick(True),
             "stop_visual_kick": self.robot.do_stop_visual_kick,
             "soccer_combo": self.robot.do_soccer_combo,
+            "punch_right": self.robot.do_punch_right,
+            "punch_left": self.robot.do_punch_left,
+            "fight_mode_on": self.robot.do_fight_mode_on,
+            "fight_mode_off": self.robot.do_fight_mode_off,
         }
 
         if cmd in actions:
@@ -1430,6 +1451,10 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="ctrl-btn btn-action" onclick="cmd('handshake')">Handshake</button>
         <button class="ctrl-btn btn-action" onclick="cmd('dab')">Dab</button>
         <button class="ctrl-btn btn-action" onclick="cmd('flex')">Flex</button>
+        <button class="ctrl-btn btn-action" style="background:#5a1a1a;color:#eee;" onclick="cmd('fight_mode_on')">Fight guard</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('fight_mode_off')">Drop guard</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('punch_left')">Punch L</button>
+        <button class="ctrl-btn btn-action" onclick="cmd('punch_right')">Punch R</button>
         <button class="ctrl-btn btn-action" onclick="cmd('nod')">Nod</button>
         <button class="ctrl-btn btn-action" onclick="cmd('head_shake')">Shake Head</button>
       </div>
@@ -1463,10 +1488,10 @@ HTML_PAGE = """<!DOCTYPE html>
     <div id="known-faces"><h3>Known Faces</h3><div id="kf-list">None yet</div></div>
     <div id="chat"></div>
     <div id="chat-input">
-      <input type="text" id="msg-input" placeholder="Type a message or question..." autocomplete="off">
+      <input type="text" id="msg-input" placeholder="Type a message (or say Jimmy, then your command)..." autocomplete="off">
       <button id="send-btn" onclick="sendChat()">Send</button>
     </div>
-    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">3D View</a> | <a href="/slam/map" target="_blank" style="color:#4CAF50;">SLAM Map</a></div>
+    <div id="status"><span class="dot"></span>Listening... | <a href="/3d" target="_blank" style="color:#4CAF50;">3D View</a> | <a href="/slam/map" target="_blank" style="color:#4CAF50;">SLAM Map</a> | <a href="/fight" target="_blank" style="color:#cc2200;">&#x1F94A; Fight</a></div>
   </div>
 <script>
   const img = document.getElementById('feed');
@@ -1821,6 +1846,168 @@ window.addEventListener('resize', () => {
 </html>"""
 
 
+HTML_FIGHT_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<title>Fight — Guard &amp; Punches</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a0a;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    gap: 32px;
+    user-select: none;
+  }
+  h1 { font-size: 1.4rem; letter-spacing: 0.15em; text-transform: uppercase; color: #cc2200; }
+  #status {
+    font-size: 0.85rem;
+    color: #888;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  #guard-btn {
+    padding: 14px 48px;
+    font-size: 1rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    background: #5a1a1a;
+    color: #eee;
+    transition: background 0.2s;
+  }
+  #guard-btn.active { background: #cc2200; }
+  .punch-row {
+    display: flex;
+    gap: 24px;
+  }
+  .punch-btn {
+    width: 160px;
+    height: 160px;
+    border-radius: 16px;
+    border: none;
+    font-size: 1.4rem;
+    font-weight: 900;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    background: #1a1a2e;
+    color: #aaa;
+    transition: background 0.1s, transform 0.08s, color 0.1s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .punch-btn .key-hint { font-size: 0.7rem; color: #555; letter-spacing: 0.15em; }
+  .punch-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .punch-btn.firing {
+    background: #cc2200;
+    color: #fff;
+    transform: scale(0.93);
+  }
+  #hint {
+    font-size: 0.78rem;
+    color: #555;
+    text-align: center;
+    line-height: 1.7;
+  }
+  #back { font-size: 0.75rem; color: #444; text-decoration: none; }
+  #back:hover { color: #888; }
+</style>
+</head>
+<body>
+<a id="back" href="/">&#8592; back to main</a>
+<h1>&#x1F94A; Fight</h1>
+<div id="status">fight mode off</div>
+
+<button id="guard-btn" onclick="toggleGuard()">Enable Guard</button>
+
+<div class="punch-row">
+  <button class="punch-btn" id="btn-left" disabled onclick="punch('left')">
+    LEFT<br><span class="key-hint">[ J ]</span>
+  </button>
+  <button class="punch-btn" id="btn-right" disabled onclick="punch('right')">
+    RIGHT<br><span class="key-hint">[ K ]</span>
+  </button>
+</div>
+
+<div id="hint">
+  Enable guard first, then punch with buttons or keyboard.<br>
+  <b>J</b> = left punch &nbsp;&nbsp; <b>K</b> = right punch &nbsp;&nbsp; <b>G</b> = toggle guard
+</div>
+
+<script>
+  let guardOn = false;
+  let firing = { left: false, right: false };
+
+  async function post(action) {
+    try {
+      await fetch('/cmd', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+    } catch(e) { console.error(e); }
+  }
+
+  function toggleGuard() {
+    guardOn = !guardOn;
+    const btn = document.getElementById('guard-btn');
+    const status = document.getElementById('status');
+    const lbtn = document.getElementById('btn-left');
+    const rbtn = document.getElementById('btn-right');
+    if (guardOn) {
+      post('fight_mode_on');
+      btn.textContent = 'Drop Guard';
+      btn.classList.add('active');
+      status.textContent = 'fight mode — guard up (J / K to jab)';
+      status.style.color = '#cc2200';
+      lbtn.disabled = false;
+      rbtn.disabled = false;
+    } else {
+      post('fight_mode_off');
+      btn.textContent = 'Enable Guard';
+      btn.classList.remove('active');
+      status.textContent = 'fight mode off';
+      status.style.color = '#888';
+      lbtn.disabled = true;
+      rbtn.disabled = true;
+    }
+  }
+
+  function punch(side) {
+    if (!guardOn || firing[side]) return;
+    firing[side] = true;
+    const btn = document.getElementById('btn-' + side);
+    btn.classList.add('firing');
+    post('punch_' + side);
+    setTimeout(() => {
+      btn.classList.remove('firing');
+      firing[side] = false;
+    }, 480);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    if (e.key === 'j' || e.key === 'J') { e.preventDefault(); punch('left'); }
+    if (e.key === 'k' || e.key === 'K') { e.preventDefault(); punch('right'); }
+    if (e.key === 'g' || e.key === 'G') { e.preventDefault(); toggleGuard(); }
+  });
+</script>
+</body>
+</html>"""
+
+
 class WebHandler(BaseHTTPRequestHandler):
     slam_ref = None  # set by start_web_server
     frame_processor = None
@@ -1847,6 +2034,11 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode())
+        elif self.path == '/fight':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML_FIGHT_PAGE.encode())
         elif self.path.startswith('/frame'):
             fp = self.frame_processor
             if fp and fp.latest_frame is not None:
@@ -2101,6 +2293,14 @@ class WebHandler(BaseHTTPRequestHandler):
             robot.head_shake()
         elif action == 'stop_gesture':
             robot.do_stop_gesture()
+        elif action == 'punch_right':
+            robot.do_punch_right()
+        elif action == 'punch_left':
+            robot.do_punch_left()
+        elif action == 'fight_mode_on':
+            robot.do_fight_mode_on()
+        elif action == 'fight_mode_off':
+            robot.do_fight_mode_off()
         elif action == 'look_up':
             robot.rotate_head(-0.3, 0.0)
         elif action == 'look_down':
@@ -2142,10 +2342,34 @@ def start_web_server(frame_processor, robot_controller, host, port, slam_ref=Non
 
 # ── Gemini Session ───────────────────────────────────────────────────────────
 
-SYSTEM_INSTRUCTION = """You are a Booster K1 humanoid robot with stereo vision cameras, face recognition, \
+def _is_addressed_to_robot(text, robot_name):
+    """True if the user addressed the robot by name (e.g. 'Jimmy, follow me')."""
+    if not text or not robot_name:
+        return False
+    text = text.strip()
+    name = re.escape(robot_name)
+    pat = re.compile(
+        r"^(?:hey\s+|hi\s+|oh\s+|um\s+)?"
+        + name
+        + r"[,\s:]*(.*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return pat.match(text) is not None
+
+
+def _get_system_instruction(robot_name):
+    return f"""You are a Booster K1 humanoid robot named {robot_name}. You have stereo vision cameras, face recognition, \
 and full body control. Video frames are streamed to you with real-time object detection overlays — \
 each detected object has a bounding box, class label, confidence score, and distance in meters. \
 People you recognize are labeled with their name; unknown people are labeled 'Unknown #N'.
+
+WAKE WORD / NOISE FILTERING (CRITICAL):
+- Your name is {robot_name}. You MUST only respond when the user addresses you by name first.
+- Valid examples: "{robot_name}, follow me" / "Hey {robot_name}, walk forward" / "{robot_name} dance"
+- If the user speaks without saying "{robot_name}" first (e.g. background conversation, someone talking to someone else), \
+do NOT respond. Stay silent. Ignore it completely.
+- Focus on the primary speaker. Ignore background conversations, TV, music, and ambient noise.
+- Only process commands that are clearly directed at you by name.
 
 You can PHYSICALLY ACT by saying certain trigger phrases in your responses. When you decide to act, \
 naturally include one of these phrases — your body will respond automatically:
@@ -2185,11 +2409,16 @@ SOCCER MOVES:
 - "Celebrate!" / "We scored!" — celebration dance
 - "Boxing kick!" / "Roundhouse!" — whole-body kick moves
 
+FIGHT / GUARD (use /fight page or voice):
+- "Fight mode!" / "Guard up!" / "Boxing stance!" — arms to guard; then "Left punch!" / "Right punch!" for jabs
+- "Stop fighting" / "Lower your hands" / "Exit fight mode" — drop guard
+
 IMPORTANT RULES:
 - When someone says "follow me", respond with "I'll follow you!"
 - When someone says "go to the chair", respond with "Going to the chair!"
 - Keep responses short and conversational.
 - Only trigger actions when explicitly asked or socially appropriate.
+- Remember: only respond when addressed as {robot_name} first.
 """
 
 
@@ -2277,7 +2506,7 @@ async def _slam_update_loop(frame_processor, slam_ref, interval=0.35):
             pass
 
 
-async def gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref):
+async def gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref, robot_name):
     """Receive Gemini responses: play audio locally + send to robot, parse commands."""
     stream = pya.open(
         format=AUDIO_FORMAT, channels=AUDIO_CHANNELS, rate=RECV_SAMPLE_RATE,
@@ -2298,15 +2527,19 @@ async def gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref):
 
                 sc = msg.server_content
                 if sc:
-                    if sc.input_transcription and sc.input_transcription.text:
-                        txt = sc.input_transcription.text
-                        print(f"  You: {txt}")
-                        add_transcript("You", txt)
-                    if sc.output_transcription and sc.output_transcription.text:
-                        txt = sc.output_transcription.text
-                        print(f"Robot: {txt}")
-                        add_transcript("Robot", txt)
-                        cmd_dispatcher.check_transcript(txt)
+                    input_txt = (sc.input_transcription.text if sc.input_transcription else None) or ""
+                    output_txt = (sc.output_transcription.text if sc.output_transcription else None) or ""
+                    # Only process when user addressed robot by name (wake-word filter)
+                    if input_txt and not _is_addressed_to_robot(input_txt, robot_name):
+                        print(f"  [ignored - not addressed to {robot_name}]: {(input_txt[:50] + '...') if len(input_txt) > 50 else input_txt}")
+                        continue
+                    if input_txt:
+                        print(f"  You: {input_txt}")
+                        add_transcript("You", input_txt)
+                    if output_txt:
+                        print(f"Robot: {output_txt}")
+                        add_transcript("Robot", output_txt)
+                        cmd_dispatcher.check_transcript(output_txt)
     except asyncio.CancelledError:
         pass
     finally:
@@ -2369,6 +2602,7 @@ async def run_server(args):
     frame_processor = FrameProcessor(
         model_path=args.model, confidence=args.confidence,
         face_cache=face_cache, enable_faces=enable_faces,
+        face_encoding=args.face_encoding,
     )
     _frame_processor_ref = frame_processor
 
@@ -2422,7 +2656,7 @@ async def run_server(args):
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=args.voice)
             ),
         ),
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=_get_system_instruction(args.robot_name),
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
     )
@@ -2433,7 +2667,7 @@ async def run_server(args):
     print("Connecting to Gemini Live...")
     try:
         async with client.aio.live.connect(
-            model="gemini-2.5-flash-native-audio-preview-12-2025",
+            model=args.gemini_model,
             config=config,
         ) as session:
             _session_ref = session
@@ -2443,7 +2677,7 @@ async def run_server(args):
 
             tasks = [
                 asyncio.create_task(gemini_send_video(session, frame_processor, args.frame_interval)),
-                asyncio.create_task(gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref)),
+                asyncio.create_task(gemini_receive(session, pya, cmd_dispatcher, robot_ws_ref, args.robot_name)),
             ]
             if not getattr(args, 'no_slam', False):
                 tasks.append(asyncio.create_task(_slam_update_loop(frame_processor, _slam_ref)))
@@ -2498,12 +2732,19 @@ def main():
                         help='PyAudio mic device (only for --audio-source local)')
     parser.add_argument('--no-slam', action='store_true',
                         help='Disable SLAM (localization + map from depth stream)')
+    parser.add_argument('--robot-name', type=str, default='Jimmy',
+                        help='Robot wake word: only respond when addressed by this name (default: Jimmy)')
+    parser.add_argument('--gemini-model', type=str,
+                        default='gemini-2.5-flash-native-audio-preview-12-2025',
+                        help='Gemini Live model ID (default: flash native audio)')
+    parser.add_argument('--face-encoding', type=str, choices=['small', 'large'], default='small',
+                        help='Face encoding model: small (fast) or large (better accuracy)')
     args = parser.parse_args()
 
     print("=" * 60)
     print("Remote Robot Server")
     print("  YOLO + Face Recognition + Gemini Live + Robot Control")
-    print(f"  Audio: {args.audio_source} mic")
+    print(f"  Audio: {args.audio_source} mic | Wake word: {args.robot_name}")
     print("=" * 60)
 
     try:
