@@ -37,6 +37,335 @@ from booster_robotics_sdk_python import (
 )
 
 SEND_SAMPLE_RATE = 16000
+
+# Optional low-level joint API (fight guard / jabs use real elbow/shoulder angles).
+_LOWLEVEL = None
+try:
+    import booster_robotics_sdk_python as _br_sdk
+    _b1 = getattr(_br_sdk, 'b1', None)
+    _LOWLEVEL = {
+        'B1LowStateSubscriber': getattr(_br_sdk, 'B1LowStateSubscriber', None),
+        'B1LowCmdPublisher': getattr(_br_sdk, 'B1LowCmdPublisher', None),
+        'LowCmd': getattr(_br_sdk, 'LowCmd', None),
+        'MotorCmd': getattr(_br_sdk, 'MotorCmd', None),
+        'CmdType': getattr(_br_sdk, 'CmdType', None),
+        'JointIndex': getattr(_br_sdk, 'JointIndex', None),
+        'kTopicJointCtrl': getattr(_br_sdk, 'kTopicJointCtrl', None) or (
+            getattr(_b1, 'kTopicJointCtrl', None) if _b1 else None
+        ),
+        'kJointCnt': getattr(_br_sdk, 'kJointCnt', None),
+    }
+    if not all((_LOWLEVEL['B1LowStateSubscriber'], _LOWLEVEL['B1LowCmdPublisher'],
+                _LOWLEVEL['LowCmd'], _LOWLEVEL['MotorCmd'], _LOWLEVEL['JointIndex'])):
+        _LOWLEVEL = None
+except ImportError:
+    _LOWLEVEL = None
+
+
+def _ji(joint_index_enum, name):
+    """Safe JointIndex lookup (int value for motor_cmd index)."""
+    if joint_index_enum is None:
+        return None
+    j = getattr(joint_index_enum, name, None)
+    if j is None:
+        return None
+    try:
+        return int(j)
+    except (TypeError, ValueError):
+        return j
+
+
+class FightLowCmdController:
+    """Publishes LowCmd from measured joint state + arm joint overrides (Custom mode)."""
+
+    def __init__(self, loco_client: B1LocoClient, sdk_lock: threading.Lock):
+        self.client = loco_client
+        self.sdk_lock = sdk_lock
+        self._q = None
+        self._q_lock = threading.Lock()
+        self._pub = None
+        self._sub = None
+        self._n = 0
+        self._hold = threading.Event()
+        self._hold_thread = None
+        self._hz = 50.0
+        self._kp_default = 55.0
+        self._kd_default = 2.2
+        self._kp_arm = 72.0
+        self._kd_arm = 2.8
+        self._guard_ov = {}
+        self._overlay = {}
+        self._overlay_lock = threading.Lock()
+
+    @property
+    def available(self):
+        return _LOWLEVEL is not None
+
+    def _on_state(self, msg):
+        try:
+            serial = msg.motor_state_serial
+            with self._q_lock:
+                self._q = [float(m.q) for m in serial]
+                self._n = len(self._q)
+        except Exception:
+            pass
+
+    def _ensure_io(self):
+        if self._pub is not None:
+            return self._n > 0
+        if not self.available:
+            return False
+        L = _LOWLEVEL
+        topic = L['kTopicJointCtrl'] or 'rt/low_cmd'
+        try:
+            self._sub = L['B1LowStateSubscriber'](self._on_state)
+            self._sub.InitChannel()
+        except Exception as e:
+            print(f"[FightLowCmd] LowState subscriber failed: {e}")
+            return False
+        topics = []
+        for t in (topic, 'rt/low_cmd', 'rt/joint_ctrl'):
+            if t and t not in topics:
+                topics.append(t)
+        self._pub = None
+        last_err = None
+        for tp in topics:
+            try:
+                pub = L['B1LowCmdPublisher'](tp)
+                pub.InitChannel()
+                self._pub = pub
+                break
+            except Exception as e:
+                last_err = e
+        if self._pub is None:
+            try:
+                self._pub = L['B1LowCmdPublisher']()
+                self._pub.InitChannel()
+            except Exception as e:
+                print(f"[FightLowCmd] LowCmd publisher failed ({last_err or e})")
+                return False
+        t0 = time.time()
+        while self._n == 0 and time.time() - t0 < 2.5:
+            time.sleep(0.02)
+        return self._n > 0
+
+    def _cmd_type(self):
+        L = _LOWLEVEL
+        ct = L['CmdType']
+        if ct is None:
+            return None
+        return getattr(ct, 'SERIAL', None) or getattr(ct, 'PARALLEL', None)
+
+    def _write_lowcmd(self, q_targets, arm_idx_set):
+        """Publish one frame: position hold on all joints to q_targets."""
+        L = _LOWLEVEL
+        LowCmd, MotorCmd = L['LowCmd'], L['MotorCmd']
+        msg = LowCmd()
+        ct = self._cmd_type()
+        if ct is not None:
+            try:
+                msg.cmd_type = ct
+            except Exception:
+                try:
+                    msg.cmd_type(ct)
+                except Exception:
+                    pass
+        motors = []
+        for i in range(self._n):
+            mc = MotorCmd()
+            q = q_targets[i]
+            kp = self._kp_arm if i in arm_idx_set else self._kp_default
+            kd = self._kd_arm if i in arm_idx_set else self._kd_default
+            for attr, val in (('q', q), ('dq', 0.0), ('tau', 0.0), ('kp', kp), ('kd', kd), ('weight', 1.0)):
+                try:
+                    setattr(mc, attr, val)
+                except Exception:
+                    try:
+                        getattr(mc, attr)(val)
+                    except Exception:
+                        pass
+            motors.append(mc)
+        try:
+            msg.motor_cmd = motors
+        except Exception:
+            try:
+                for m in motors:
+                    msg.motor_cmd.append(m)
+            except Exception:
+                return False
+        try:
+            if hasattr(self._pub, 'Write'):
+                self._pub.Write(msg)
+            elif hasattr(self._pub, 'write'):
+                self._pub.write(msg)
+            elif hasattr(self._pub, 'Publish'):
+                self._pub.Publish(msg)
+            else:
+                return False
+        except Exception as e:
+            print(f"[FightLowCmd] Write failed: {e}")
+            return False
+        return True
+
+    def _blend(self, a, b, alpha):
+        return [a[i] + (b[i] - a[i]) * alpha for i in range(len(a))]
+
+    def _arm_indices(self):
+        J = _LOWLEVEL['JointIndex']
+        idx = []
+        for name in (
+            'kLeftShoulderPitch', 'kLeftShoulderRoll', 'kLeftElbowPitch', 'kLeftElbowYaw',
+            'kRightShoulderPitch', 'kRightShoulderRoll', 'kRightElbowPitch', 'kRightElbowYaw',
+        ):
+            v = _ji(J, name)
+            if v is not None and v < self._n:
+                idx.append(v)
+        return set(idx)
+
+    def guard_targets(self):
+        """Joint radians: arms up in guard (shoulders forward/up, elbows clearly bent)."""
+        J = _LOWLEVEL['JointIndex']
+        t = {}
+        # Tunable on-robot; signs follow Booster B1-style layout.
+        t[_ji(J, 'kLeftShoulderPitch')] = 0.82
+        t[_ji(J, 'kLeftShoulderRoll')] = 0.58
+        t[_ji(J, 'kLeftElbowPitch')] = 1.72
+        t[_ji(J, 'kLeftElbowYaw')] = -0.08
+        t[_ji(J, 'kRightShoulderPitch')] = 0.82
+        t[_ji(J, 'kRightShoulderRoll')] = -0.58
+        t[_ji(J, 'kRightElbowPitch')] = 1.72
+        t[_ji(J, 'kRightElbowYaw')] = 0.08
+        return {k: v for k, v in t.items() if k is not None}
+
+    def punch_delta(self, hand):
+        J = _LOWLEVEL['JointIndex']
+        if hand == 'left':
+            return {
+                _ji(J, 'kLeftShoulderPitch'): 0.42,
+                _ji(J, 'kLeftElbowPitch'): -0.82,
+            }
+        return {
+            _ji(J, 'kRightShoulderPitch'): 0.42,
+            _ji(J, 'kRightElbowPitch'): -0.82,
+        }
+
+    def punch_peak_overrides(self, hand):
+        """Absolute arm targets = guard + punch delta (elbow extends, shoulder drives forward)."""
+        out = dict(self._guard_ov)
+        for k, dv in self.punch_delta(hand).items():
+            if k is not None and k in out:
+                out[k] = out[k] + dv
+        return out
+
+    def set_overlay(self, d):
+        with self._overlay_lock:
+            self._overlay = dict(d) if d else {}
+
+    def clear_overlay(self):
+        with self._overlay_lock:
+            self._overlay = {}
+
+    def _apply_overrides(self, base_q, overrides):
+        out = list(base_q)
+        for idx, val in overrides.items():
+            if idx is not None and 0 <= idx < len(out):
+                out[idx] = val
+        return out
+
+    def run_hold_loop(self, arm_idx_set):
+        """Hold loop: legs/head track measured q; arms use guard + optional punch overlay."""
+        period = 1.0 / self._hz
+        while self._hold.is_set():
+            with self._q_lock:
+                base = list(self._q) if self._q else None
+            if not base or len(base) != self._n:
+                time.sleep(period)
+                continue
+            with self._overlay_lock:
+                ov = {**self._guard_ov, **self._overlay}
+            tgt = self._apply_overrides(base, ov)
+            self._write_lowcmd(tgt, arm_idx_set)
+            time.sleep(period)
+
+    def interpolate_to(self, target_overrides, arm_idx_set, duration_s=0.65):
+        with self._q_lock:
+            start = list(self._q) if self._q else None
+        if not start or len(start) != self._n:
+            return False
+        end = self._apply_overrides(start, target_overrides)
+        steps = max(1, int(duration_s * self._hz))
+        for s in range(1, steps + 1):
+            if not self._hold.is_set():
+                break
+            a = s / steps
+            blended = self._blend(start, end, a)
+            self._write_lowcmd(blended, arm_idx_set)
+            time.sleep(1.0 / self._hz)
+        return True
+
+    def enter_custom_and_stream(self, guard_overrides, arm_idx_set):
+        Custom = (
+            getattr(RobotMode, 'kCustom', None)
+            or getattr(RobotMode, 'k_Manual', None)
+            or getattr(RobotMode, 'kDevelop', None)
+        )
+        if Custom is None:
+            print('[FightLowCmd] No Custom/manual RobotMode — cannot use low-level fight')
+            return False
+        try:
+            try:
+                with self.sdk_lock:
+                    self.client.SwitchHandEndEffectorControlMode(False)
+            except Exception:
+                pass
+            with self.sdk_lock:
+                self.client.ChangeMode(Custom)
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[FightLowCmd] ChangeMode(Custom) failed: {e}")
+            return False
+        self._guard_ov = dict(guard_overrides)
+        with self._overlay_lock:
+            self._overlay = {}
+        self._hold.set()
+        if not self.interpolate_to(guard_overrides, arm_idx_set, duration_s=0.7):
+            self._hold.clear()
+            self._guard_ov = {}
+            try:
+                with self.sdk_lock:
+                    self.client.ChangeMode(RobotMode.kPrepare)
+                time.sleep(0.25)
+                with self.sdk_lock:
+                    self.client.ChangeMode(RobotMode.kWalking)
+            except Exception:
+                pass
+            print('[FightLowCmd] No LowState yet — cannot hold Custom pose')
+            return False
+
+        def _loop():
+            self.run_hold_loop(arm_idx_set)
+
+        self._hold_thread = threading.Thread(target=_loop, daemon=True)
+        self._hold_thread.start()
+        return True
+
+    def stop_and_walk(self):
+        self._hold.clear()
+        if self._hold_thread and self._hold_thread.is_alive():
+            self._hold_thread.join(timeout=1.5)
+        self._hold_thread = None
+        self._guard_ov = {}
+        with self._overlay_lock:
+            self._overlay = {}
+        try:
+            with self.sdk_lock:
+                self.client.ChangeMode(RobotMode.kPrepare)
+            time.sleep(0.35)
+            with self.sdk_lock:
+                self.client.ChangeMode(RobotMode.kWalking)
+            time.sleep(0.15)
+        except Exception as e:
+            print(f"[FightLowCmd] return to Walking failed: {e}")
 RECV_SAMPLE_RATE = 24000
 AUDIO_CHANNELS = 1
 AUDIO_FORMAT = pyaudio.paInt16
@@ -146,6 +475,8 @@ class RobotExecutor:
         self._gesture_cancel = threading.Event()
         self._fight_active = False
         self._fight_punch_lock = threading.Lock()
+        self._fight_low = FightLowCmdController(client, self.lock)
+        self._fight_use_lowlevel = False
 
     def handle(self, msg):
         cmd = msg.get('cmd')
@@ -310,13 +641,25 @@ class RobotExecutor:
             self._gesture_cancel.set()
             time.sleep(0.08)
             self._gesture_cancel.clear()
+            self._fight_use_lowlevel = False
+            fl = self._fight_low
+            if fl.available and fl._ensure_io():
+                arm_idx = fl._arm_indices()
+                g = fl.guard_targets()
+                if len(arm_idx) >= 4 and g and fl.enter_custom_and_stream(g, arm_idx):
+                    self._fight_use_lowlevel = True
+                    self._fight_active = True
+                    print('[Fight] Joint-space LowCmd guard (Custom mode).')
+                    return
+                print('[Fight] LowCmd stream failed; using MoveHandEndEffectorV2 fallback.')
+            elif not fl.available:
+                print('[Fight] SDK has no B1LowCmdPublisher/LowState; using MoveHandEndEffectorV2 fallback.')
             self._fight_active = True
             try:
                 with self.lock:
                     self.client.SwitchHandEndEffectorControlMode(True)
             except AttributeError:
                 pass
-            # Guard: hands up in front, elbows bent (high z, moderate x, hands toward midline).
             gl = [0.30, 0.12, 0.27]
             gr = [0.30, -0.12, 0.27]
             self._move_hand_ee(gl[0], gl[1], gl[2], 'left', 750)
@@ -328,6 +671,10 @@ class RobotExecutor:
     def _cmd_fight_mode_off(self, _):
         def _do():
             self._fight_active = False
+            if self._fight_use_lowlevel:
+                self._fight_low.stop_and_walk()
+                self._fight_use_lowlevel = False
+                return
             self._arm_to_side('left')
             self._arm_to_side('right')
         threading.Thread(target=_do, daemon=True).start()
@@ -376,6 +723,9 @@ class RobotExecutor:
     def _cancel_gesture_and_reset(self):
         """Stop any running gesture and reset arms/head to neutral."""
         self._fight_active = False
+        if self._fight_use_lowlevel:
+            self._fight_low.stop_and_walk()
+            self._fight_use_lowlevel = False
         self._gesture_cancel.set()
         time.sleep(0.08)  # let previous gesture thread notice and exit
         self._gesture_cancel.clear()
@@ -440,10 +790,15 @@ class RobotExecutor:
             if not self._fight_punch_lock.acquire(blocking=False):
                 return
             try:
+                if self._fight_use_lowlevel:
+                    peak = self._fight_low.punch_peak_overrides(hand)
+                    self._fight_low.set_overlay(peak)
+                    time.sleep(0.14)
+                    self._fight_low.clear_overlay()
+                    return
                 is_left = hand == 'left'
                 pos = self.left_arm_pos if is_left else self.right_arm_pos
                 gx, gy, gz = pos[0], pos[1], pos[2]
-                # Jab: shoulder forward (+x), elbow extends (hand reaches farther, slight drop).
                 hx = min(gx + 0.11, 0.42)
                 hy = gy + (-0.025 if is_left else 0.025)
                 hz = max(gz - 0.06, 0.12)
