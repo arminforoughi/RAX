@@ -144,6 +144,8 @@ class RobotExecutor:
         self.right_arm_pos = [0.35, -0.25, 0.1]
         self.left_arm_pos = [0.35, 0.25, 0.1]
         self._gesture_cancel = threading.Event()
+        self._fight_active = False
+        self._fight_punch_lock = threading.Lock()
 
     def handle(self, msg):
         cmd = msg.get('cmd')
@@ -301,6 +303,41 @@ class RobotExecutor:
                     self.client.SendApiRequest(2030, json.dumps({'dance_id': 6}))
         threading.Thread(target=_do, daemon=True).start()
 
+    # ── Fight mode (guard + jab punches for /fight page and voice)
+
+    def _cmd_fight_mode_on(self, _):
+        def _do():
+            self._gesture_cancel.set()
+            time.sleep(0.08)
+            self._gesture_cancel.clear()
+            self._fight_active = True
+            try:
+                with self.lock:
+                    self.client.SwitchHandEndEffectorControlMode(True)
+            except AttributeError:
+                pass
+            # Guard: hands up in front, elbows bent (high z, moderate x, hands toward midline).
+            gl = [0.30, 0.12, 0.27]
+            gr = [0.30, -0.12, 0.27]
+            self._move_hand_ee(gl[0], gl[1], gl[2], 'left', 750)
+            self._move_hand_ee(gr[0], gr[1], gr[2], 'right', 750)
+            self.left_arm_pos = list(gl)
+            self.right_arm_pos = list(gr)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _cmd_fight_mode_off(self, _):
+        def _do():
+            self._fight_active = False
+            self._arm_to_side('left')
+            self._arm_to_side('right')
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _cmd_punch_left(self, _):
+        self._run_fight_punch('left')
+
+    def _cmd_punch_right(self, _):
+        self._run_fight_punch('right')
+
     # ── Arm commands (for server-driven choreography if needed)
 
     def _cmd_arm_to_side(self, m):
@@ -338,6 +375,7 @@ class RobotExecutor:
 
     def _cancel_gesture_and_reset(self):
         """Stop any running gesture and reset arms/head to neutral."""
+        self._fight_active = False
         self._gesture_cancel.set()
         time.sleep(0.08)  # let previous gesture thread notice and exit
         self._gesture_cancel.clear()
@@ -384,6 +422,38 @@ class RobotExecutor:
         posture.orientation = Orientation(-y_sign * 1.57, -1.57, 0.0)
         with self.lock:
             self.client.MoveHandEndEffectorV2(posture, 300, hand_idx)
+
+    def _move_hand_ee(self, x, y, z, hand, duration_ms):
+        is_left = hand == 'left'
+        y_sign = 1 if is_left else -1
+        hand_idx = B1HandIndex.kLeftHand if is_left else B1HandIndex.kRightHand
+        posture = Posture()
+        posture.position = Position(x, y, z)
+        posture.orientation = Orientation(-y_sign * 1.57, -1.57, 0.0)
+        with self.lock:
+            self.client.MoveHandEndEffectorV2(posture, int(duration_ms), hand_idx)
+
+    def _run_fight_punch(self, hand):
+        def _do():
+            if not self._fight_active:
+                return
+            if not self._fight_punch_lock.acquire(blocking=False):
+                return
+            try:
+                is_left = hand == 'left'
+                pos = self.left_arm_pos if is_left else self.right_arm_pos
+                gx, gy, gz = pos[0], pos[1], pos[2]
+                # Jab: shoulder forward (+x), elbow extends (hand reaches farther, slight drop).
+                hx = min(gx + 0.11, 0.42)
+                hy = gy + (-0.025 if is_left else 0.025)
+                hz = max(gz - 0.06, 0.12)
+                self._move_hand_ee(hx, hy, hz, hand, 115)
+                time.sleep(0.13)
+                self._move_hand_ee(gx, gy, gz, hand, 210)
+            finally:
+                self._fight_punch_lock.release()
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Dance routines (run locally for timing precision) ───────────────────
 
