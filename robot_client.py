@@ -742,9 +742,8 @@ class RobotExecutor:
         self._fight_punch_lock = threading.Lock()
         self._fight_low = FightLowCmdController(client, self.lock, ros_node=None)
         self._fight_use_lowlevel = False
-        # End-effector fallback: orientations distinct from default arm pose (less "hug" IK branch).
-        self._fight_ee_orient_left = (-1.05, -1.12, 0.36)
-        self._fight_ee_orient_right = (1.05, -1.12, -0.36)
+        # EE fallback: same standby + jab poses as teleop_ctrl_booster (MoveHandEndEffector in C++).
+        self._fight_ee_guard_orient = (0.0, -0.9, 0.0)
 
     def attach_ros_camera(self, camera_node):
         """Wire the same ROS2 node that spins for camera (needed for /low_state + joint_ctrl)."""
@@ -945,13 +944,12 @@ class RobotExecutor:
                     self.client.SwitchHandEndEffectorControlMode(True)
             except AttributeError:
                 pass
-            # Hands higher, slightly closer than side pose; custom orientation to bias IK away from hug.
-            gl = [0.27, 0.11, 0.30]
-            gr = [0.27, -0.11, 0.30]
-            self._move_hand_ee_pose(
-                gl[0], gl[1], gl[2], 'left', 850, *self._fight_ee_orient_left)
-            self._move_hand_ee_pose(
-                gr[0], gr[1], gr[2], 'right', 850, *self._fight_ee_orient_right)
+            # Standby matches teleop Invoke(): kLeftStandbyPosture / kRightStandbyPosture.
+            gl = [0.3, 0.2, 0.1]
+            gr = [0.3, -0.2, 0.1]
+            o = self._fight_ee_guard_orient
+            self._move_hand_ee_pose(gl[0], gl[1], gl[2], 'left', 1000, *o)
+            self._move_hand_ee_pose(gr[0], gr[1], gr[2], 'right', 1000, *o)
             self.left_arm_pos = list(gl)
             self.right_arm_pos = list(gr)
         threading.Thread(target=_do, daemon=True).start()
@@ -1096,15 +1094,16 @@ class RobotExecutor:
                 pos = self.left_arm_pos if is_left else self.right_arm_pos
                 gx, gy, gz = pos[0], pos[1], pos[2]
                 y_sign = 1 if is_left else -1
-                hx = min(gx + 0.11, 0.42)
-                hy = gy + (-0.025 if is_left else 0.025)
-                hz = max(gz - 0.06, 0.12)
-                # Jab: straighter wrist for reach; return to fight guard orientation (not default side IK).
-                jab_r, jab_p, jab_y = (-y_sign * 1.35, -1.45, 0.12 * y_sign)
-                self._move_hand_ee_pose(hx, hy, hz, hand, 115, jab_r, jab_p, jab_y)
-                time.sleep(0.13)
-                gor = self._fight_ee_orient_left if is_left else self._fight_ee_orient_right
-                self._move_hand_ee_pose(gx, gy, gz, hand, 220, gor[0], gor[1], gor[2])
+                # LeftJab / RightJab from teleop_ctrl_booster (Cartesian, not low_state).
+                hx, hy, hz = 0.7, (0.2 if is_left else -0.2), 0.1
+                jab_r, jab_p, jab_y = (0.6 * y_sign, 0.0, 0.0)
+                self._move_hand_ee_pose(hx, hy, hz, hand, 200, jab_r, jab_p, jab_y)
+                time.sleep(0.2)
+                gor = self._fight_ee_guard_orient
+                self._move_hand_ee_pose(gx, gy, gz, hand, 400, *gor)
+                time.sleep(0.4)
+                self._move_hand_ee_pose(gx, gy, gz, hand, 200, *gor)
+                time.sleep(0.2)
             finally:
                 self._fight_punch_lock.release()
 
