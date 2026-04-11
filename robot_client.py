@@ -744,6 +744,10 @@ class RobotExecutor:
         self._fight_use_lowlevel = False
         # EE fallback: same standby + jab poses as teleop_ctrl_booster (MoveHandEndEffector in C++).
         self._fight_ee_guard_orient = (0.0, -0.9, 0.0)
+        self._fight_ee_guard_left = [0.3, 0.2, 0.1]
+        self._fight_ee_guard_right = [0.3, -0.2, 0.1]
+        # Booster walking stack retakes arms on locomotion unless hand-EE mode is reasserted (see _cmd_move).
+        self._fight_ee_reassert_t = 0.0
 
     def attach_ros_camera(self, camera_node):
         """Wire the same ROS2 node that spins for camera (needed for /low_state + joint_ctrl)."""
@@ -764,9 +768,30 @@ class RobotExecutor:
 
     # ── Low-level commands (called at high frequency by server tracking loops)
 
+    def _walking_hand_ee_enable_locked(self):
+        """Must hold self.lock. Walking + Cartesian arms: SDK needs EE mode on while Move() streams."""
+        try:
+            self.client.SwitchHandEndEffectorControlMode(True)
+        except AttributeError:
+            pass
+
+    def _walking_hand_ee_disable_locked(self):
+        """Must hold self.lock. Return full arm blending to the walk controller."""
+        try:
+            self.client.SwitchHandEndEffectorControlMode(False)
+        except AttributeError:
+            pass
+
     def _cmd_move(self, m):
+        x, y, yaw = m.get('x', 0), m.get('y', 0), m.get('yaw', 0)
         with self.lock:
-            self.client.Move(m.get('x', 0), m.get('y', 0), m.get('yaw', 0))
+            # High-level fight on walking: reassert hand EE mode or gait Move() overrides the arms.
+            if self._fight_active and not self._fight_use_lowlevel:
+                now = time.time()
+                if now - self._fight_ee_reassert_t >= 0.05:
+                    self._fight_ee_reassert_t = now
+                    self._walking_hand_ee_enable_locked()
+            self.client.Move(x, y, yaw)
 
     def _cmd_rotate_head(self, m):
         p = max(-0.5, min(1.0, m.get('pitch', 0)))
@@ -906,6 +931,8 @@ class RobotExecutor:
         threading.Thread(target=_do, daemon=True).start()
 
     # ── Fight mode (guard + jab punches for /fight page and voice)
+    # High-level (EE) path stays in RobotMode.kWalking: locomotion uses Move(); the stack
+    # otherwise retakes arms unless SwitchHandEndEffectorControlMode(True) is reapplied (see _cmd_move).
 
     def _cmd_fight_mode_on(self, _):
         def _do():
@@ -939,14 +966,16 @@ class RobotExecutor:
                         'Using MoveHandEndEffectorV2 fallback.'
                     )
             self._fight_active = True
-            try:
-                with self.lock:
-                    self.client.SwitchHandEndEffectorControlMode(True)
-            except AttributeError:
-                pass
+            with self.lock:
+                try:
+                    self.client.ChangeMode(RobotMode.kWalking)
+                except Exception as e:
+                    print(f'[Fight] ChangeMode(Walking) before hand EE: {e}')
+                self._walking_hand_ee_enable_locked()
+            time.sleep(0.12)
             # Standby matches teleop Invoke(): kLeftStandbyPosture / kRightStandbyPosture.
-            gl = [0.3, 0.2, 0.1]
-            gr = [0.3, -0.2, 0.1]
+            gl = list(self._fight_ee_guard_left)
+            gr = list(self._fight_ee_guard_right)
             o = self._fight_ee_guard_orient
             self._move_hand_ee_pose(gl[0], gl[1], gl[2], 'left', 1000, *o)
             self._move_hand_ee_pose(gr[0], gr[1], gr[2], 'right', 1000, *o)
@@ -963,6 +992,9 @@ class RobotExecutor:
                 return
             self._arm_to_side('left')
             self._arm_to_side('right')
+            time.sleep(0.1)
+            with self.lock:
+                self._walking_hand_ee_disable_locked()
         threading.Thread(target=_do, daemon=True).start()
 
     def _cmd_punch_left(self, _):
@@ -1008,6 +1040,7 @@ class RobotExecutor:
 
     def _cancel_gesture_and_reset(self):
         """Stop any running gesture and reset arms/head to neutral."""
+        was_ee_fight = self._fight_active and not self._fight_use_lowlevel
         self._fight_active = False
         if self._fight_use_lowlevel:
             self._fight_low.stop_and_walk()
@@ -1017,6 +1050,10 @@ class RobotExecutor:
         self._gesture_cancel.clear()
         self._arm_to_side('right')
         self._arm_to_side('left')
+        if was_ee_fight:
+            time.sleep(0.1)
+            with self.lock:
+                self._walking_hand_ee_disable_locked()
         self._set_head(0.0, 0.0)
 
     def _arm_to_side(self, hand):
@@ -1065,6 +1102,8 @@ class RobotExecutor:
         posture.position = Position(x, y, z)
         posture.orientation = Orientation(roll, pitch, yaw)
         with self.lock:
+            if self._fight_active and not self._fight_use_lowlevel:
+                self._walking_hand_ee_enable_locked()
             self.client.MoveHandEndEffectorV2(posture, int(duration_ms), hand_idx)
 
     def _move_hand_ee(self, x, y, z, hand, duration_ms):
