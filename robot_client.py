@@ -129,6 +129,9 @@ class FightLowCmdController:
 
     @property
     def available(self):
+        # Always try if we have the streaming node (it will import booster_interface on demand).
+        if self._ros_node is not None:
+            return True
         return self._booster_ros_msgs_ok() or _LOWLEVEL is not None
 
     def set_ros_node(self, node):
@@ -156,7 +159,7 @@ class FightLowCmdController:
         if self._n > 0 and (self._use_ros or self._pub is not None):
             return True
 
-        if self._ros_node is not None and self._booster_ros_msgs_ok():
+        if self._ros_node is not None:
             if self._ros_node.ensure_booster_fight_bridge():
                 t0 = time.time()
                 while time.time() - t0 < 3.0:
@@ -836,7 +839,7 @@ class RobotExecutor:
             self._gesture_cancel.clear()
             self._fight_use_lowlevel = False
             fl = self._fight_low
-            if fl.available and fl._ensure_io():
+            if fl._ensure_io():
                 arm_idx = fl._arm_indices()
                 g = fl.guard_targets()
                 if len(arm_idx) >= 4 and g and fl.enter_custom_and_stream(g, arm_idx):
@@ -844,9 +847,22 @@ class RobotExecutor:
                     self._fight_active = True
                     print('[Fight] Joint-space LowCmd guard (Custom mode).')
                     return
-                print('[Fight] LowCmd stream failed; using MoveHandEndEffectorV2 fallback.')
-            elif not fl.available:
-                print('[Fight] SDK has no B1LowCmdPublisher/LowState; using MoveHandEndEffectorV2 fallback.')
+                print('[Fight] LowCmd guard/Custom stream failed; using MoveHandEndEffectorV2 fallback.')
+            else:
+                _hint_ros = not fl._booster_ros_msgs_ok()
+                _hint_dds = _LOWLEVEL is None
+                if _hint_ros or _hint_dds:
+                    print(
+                        '[Fight] No low-level joint pipe (need ROS2 `booster_interface` on PYTHONPATH '
+                        '— source e.g. `/opt/booster/BoosterRos2Interface/install/setup.bash` — '
+                        'and a subscriber on `joint_ctrl`; or a full SDK with B1LowCmdPublisher). '
+                        'Using MoveHandEndEffectorV2 fallback.'
+                    )
+                else:
+                    print(
+                        '[Fight] Low-level init failed (see [FightLowCmd] lines above). '
+                        'Using MoveHandEndEffectorV2 fallback.'
+                    )
             self._fight_active = True
             try:
                 with self.lock:
