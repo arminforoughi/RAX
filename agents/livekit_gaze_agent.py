@@ -218,8 +218,7 @@ class _GazeRunner:
             approach_close_step_m=0.010,
         )
         self._cloud  = cloud
-        # CartesianKinematics (mock) lacks get_link_transforms_chain; don't pass to viz
-        self._kin    = None if USE_MOCK else kin
+        self._kin    = kin  # CartesianKinematics now has get_link_transforms_chain
         self._engine = GazeEngine(
             self._arm, kin, cloud, cfg,
             cartesian=USE_MOCK,
