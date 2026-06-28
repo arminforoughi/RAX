@@ -20,6 +20,10 @@ import zlib
 
 import numpy as np
 import cv2
+# Make shared common/audio importable (pyaudio_compat) after the dir reorg
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+    'common', 'audio'))
 try:
     import pyaudio
 except ImportError:

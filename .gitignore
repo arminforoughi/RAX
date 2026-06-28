@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv*/
+venv/
+
+# Caches
+.cache/
+
+# Model weights / large artifacts (download separately, do not commit)
+weights/
+*.pt
+*.pth
+*.onnx
+
+# Media
+*.mp4
+*.mov
+*.avi
+
+# OS
+.DS_Store

@@ -1,6 +1,51 @@
-# K1 Walking & Talking
+# RAX — Robot Agent eXchange
 
-Voice-controlled robot system for the Booster K1 — talk to your robot and it walks, follows people, tracks objects, dances, waves, and more. Powered by Google Gemini Live API + YOLOv8 + stereo depth + face recognition.
+A language-controlled robotics platform: an **exchange** where **agents** meet
+**robots**. An agent understands the outside world, and the robot acts on its
+commands. The reference implementation drives a Booster K1 — talk to it and it
+walks, follows people, tracks objects, dances, waves, and more. Powered by
+Google Gemini Live API + YOLOv8 + stereo depth + face recognition.
+
+- **R**obot — any platform (humanoids, arms, drones) behind a common driver.
+- **A**gent — a smart model (Gemini) that perceives the world and commands action.
+- **X** (eXchange) — the hub that brokers perception, commands, and speech
+  between any agent and any robot.
+
+## Project Structure
+
+A DIMOS-style layout: a reusable agent/model/perception/control stack, plus
+per-platform drivers, meeting at a shared exchange. An **agent** (Gemini)
+understands the outside world from **perception** (vision + depth cloud), then
+issues **high-** and **low-level** **control** commands — for humanoid mobility
+(SLAM) or arm **manipulation** — over the **exchange**.
+
+```
+agents/        Smart models that understand the world & command action
+               └─ gemini_live_camera.py   Gemini Live voice + vision (no control)
+models/        Perception models
+               ├─ detection/   YOLOv8 object detection (2D box + class)
+               ├─ depth/       Depth estimation (stereo / MiDaS)
+               └─ face/        Face recognition + name cache
+perception/    Connections to vision
+               ├─ vision/      Camera frames -> labeled scene
+               └─ depth_cloud/ Depth + detections -> object 3D position
+control/       Agent intent -> motion
+               ├─ high_level/  Follow, go-to, track, navigate
+               └─ low_level/   Gait, turn, strafe, head, gestures
+manipulation/  Arm reach / grasp / pick-and-place (arms/)
+mobility/      Move the base; SLAM navigation around objects (slam/)
+exchange/      Agent <-> robot hub (the "X" in RAX)
+               └─ server.py    Central hub: models + agent + dispatcher + web UI
+robots/        Platform-specific drivers
+               ├─ humanoids/   booster_k1 (implemented), unitree_g1 / G01 (scaffold)
+               ├─ arms/        aloha, lerobot_so101 (scaffold)
+               └─ drones/      (scaffold)
+common/        Shared utilities
+               └─ audio/       pyaudio_compat (sounddevice-backed PyAudio shim)
+```
+
+Each empty package carries an `__init__.py` docstring describing its role and
+where new platforms plug in.
 
 ## Connecting to the Robot
 
@@ -25,9 +70,9 @@ The K1 robot communicates over Ethernet. Your control machine (Jetson, laptop, e
 
 4. **If running directly on the robot's onboard Jetson**, use the loopback or the internal interface:
    ```bash
-   python3 gemini_robot_control.py eth0
+   python3 robots/humanoids/booster_k1/gemini_robot_control.py eth0
    # or if running locally on the robot:
-   python3 gemini_robot_control.py 127.0.0.1
+   python3 robots/humanoids/booster_k1/gemini_robot_control.py 127.0.0.1
    ```
 
 ### ROS 2 Camera Bridge
@@ -62,7 +107,7 @@ pip install -r requirements.txt
 export GEMINI_API_KEY="your-key-here"
 
 # 4. Run (replace eth0 with your network interface)
-python3 gemini_robot_control.py eth0
+python3 robots/humanoids/booster_k1/gemini_robot_control.py eth0
 
 # 5. Open the web UI in your browser
 #    http://<robot-ip>:8080
@@ -72,10 +117,10 @@ python3 gemini_robot_control.py eth0
 
 | Script | Description |
 |--------|-------------|
-| **server.py** | Remote server — runs YOLO + face + Gemini on your PC (recommended) |
-| **robot_client.py** | Thin client — runs on the robot, streams video, executes commands |
-| **gemini_robot_control.py** | All-in-one on-robot mode (original, slower) |
-| **gemini_live_camera.py** | Gemini Live camera stream (no robot control) |
+| **exchange/server.py** | Remote server — runs YOLO + face + Gemini on your PC (recommended) |
+| **robots/humanoids/booster_k1/robot_client.py** | Thin client — runs on the robot, streams video, executes commands |
+| **robots/humanoids/booster_k1/gemini_robot_control.py** | All-in-one on-robot mode (original, slower) |
+| **agents/gemini_live_camera.py** | Gemini Live camera stream (no robot control) |
 
 ## Remote Mode (Recommended)
 
@@ -106,7 +151,7 @@ Offload all heavy computation (YOLO, face recognition, Gemini AI) to your PC/lap
 pip install websockets
 
 export GEMINI_API_KEY="your-key-here"
-python3 server.py --voice Puck
+python3 exchange/server.py --voice Puck
 # Web UI at http://localhost:8080
 # Robot WebSocket at ws://0.0.0.0:9090
 ```
@@ -116,13 +161,13 @@ python3 server.py --voice Puck
 ```bash
 pip install websockets
 
-python3 robot_client.py eth0 --server ws://YOUR_PC_IP:9090
+python3 robots/humanoids/booster_k1/robot_client.py eth0 --server ws://YOUR_PC_IP:9090
 ```
 
 ### Server Arguments
 
 ```
-python3 server.py [options]
+python3 exchange/server.py [options]
 ```
 
 | Argument | Default | Description |
@@ -141,7 +186,7 @@ python3 server.py [options]
 ### Robot Client Arguments
 
 ```
-python3 robot_client.py <interface> [options]
+python3 robots/humanoids/booster_k1/robot_client.py <interface> [options]
 ```
 
 | Argument | Default | Description |
@@ -191,7 +236,7 @@ The robot understands natural language. Example commands:
 ### Command-Line Arguments
 
 ```
-python3 gemini_robot_control.py <interface> [options]
+python3 robots/humanoids/booster_k1/gemini_robot_control.py <interface> [options]
 ```
 
 | Argument | Default | Description |
@@ -295,6 +340,91 @@ Key packages:
 - Check firewall: `sudo ufw allow 8080`
 - Verify port: `netstat -tulpn | grep 8080`
 - Try a different port: `--port 8081`
+
+## Arm Manipulation — Gaze Engine & Point-Cloud Streaming
+
+A cleaner, decoupled take on visual-servo grasping: **detect and tag every object,
+stream each one's own point cloud, focus on one and follow it, then grasp it or
+place it on top of another tagged object.** Point clouds are updated on a budget —
+the focused object every tick, the rest round-robin — so cost stays bounded in a
+cluttered scene. The 3D target is the focused object's cloud **centroid** (robust),
+not a bbox-size guess.
+
+### Pipeline
+
+```
+detector (YOLO-World)  ─┐                          ┌─ ObjectTrack(tag, cloud, centroid, top)
+mask tracker (SAM2)    ─┤   CloudTracker (budget)  ─┤   ...one per object, base frame
+stereo (RAFT-Stereo)   ─┘   focus=every tick       └─ PointCloudStream → subscribers
+                            others=round-robin
+                                   │
+                              GazeEngine:  SEARCH → TRACK → APPROACH → GRASP → PLACE → DONE
+                                   │
+                              ArmInterface  (MockArm  |  So101Arm + OAK-D)
+```
+
+Every backend is behind a typed Protocol with a graceful fallback, so the whole
+thing runs with **no GPU and no model weights**: detection falls back to HSV
+colour blobs, masks to an inscribed ellipse, and stereo to OpenCV SGBM.
+
+| Module | Role |
+|--------|------|
+| `models/detection/` | `PromptDetector` (YOLO-World / colour-blob), `MaskTracker` (SAM2 / ellipse) |
+| `models/depth/` | `StereoDepth` — RAFT-Stereo (default), FoundationStereo, SGBM, behind `make_stereo()` |
+| `perception/depth_cloud/` | `CloudTracker` (tag + budgeted per-object clouds), `PointCloudStream` |
+| `manipulation/arms/` | `GazeEngine`, `grasp.py`, `kinematics.py`, `ArmInterface`, `MockArm` |
+| `robots/arms/lerobot_so101/` | `So101Arm` — real SO-101 + OAK-D rectified stereo |
+
+### Quick Start (no hardware)
+
+The mock is a **headless** synthetic scene with a red, a green, and a blue object
+~0.4 m in front of an eye-in-hand camera (no popup window — the `cloud:` lines and
+state logs *are* the output). The colour-blob fallback detector keys off the colour
+word in the query, so any noun works ("red cube", "red box", ...).
+
+```bash
+# Locate the red object, grasp it, and place it on top of the green one — fully synthetic.
+python -m manipulation.arms.run_gaze --backend mock --query "red cube" --place-on "green cube"
+
+# Come in from straight above instead of along the view ray
+python -m manipulation.arms.run_gaze --backend mock --query "red cube" --approach top
+
+# Unit checks
+pytest tests/test_gaze_pipeline.py
+```
+
+### Real SO-101 + OAK-D
+
+```bash
+# RAFT-Stereo weights (optional; falls back to SGBM if unset)
+export RAFT_STEREO_REPO=/path/to/RAFT-Stereo  RAFT_STEREO_CKPT=/path/to/raftstereo.pth
+# or FoundationStereo:
+export FOUNDATION_STEREO_REPO=/path/to/FoundationStereo  FOUNDATION_STEREO_CKPT=/path/to/model.pth
+
+# SAM2 mask tracking for the focused object (optional)
+export SAM2_MODEL_CFG=sam2_hiera_s.yaml  SAM2_CHECKPOINT=/path/to/sam2_hiera_small.pt
+
+python -m manipulation.arms.run_gaze --backend so101 --interface eth0 \
+    --query "red cube" --stereo raft --detector yolo --mask sam2
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--backend` | `mock` | `mock` (synthetic) or `so101` (real arm + OAK-D) |
+| `--query` | `red box` | Object to focus, follow, and grasp |
+| `--place-on` | *(none)* | Label of the object to place the grasped item onto |
+| `--stereo` | `auto` | `auto`/`raft`/`foundation`/`sgbm` |
+| `--detector` | `auto` | `auto`/`yolo`/`color_blob` |
+| `--mask` | `auto` | `auto`/`sam2`/`ellipse` |
+| `--detect-every` | `5` | Run the open-vocab detector every N ticks (tracks persist between) |
+| `--approach` | `los` | `los` (along the view ray), `top` (from above), or `side` (horizontal) |
+| `--approach-az` / `--approach-el` | `0` / auto | Fine control of the approach angle (azimuth around up, elevation deg) |
+
+The engine understands **where to come from**: `--approach top` orbits the EE
+directly above the object (camera looking down) before lowering in to grasp;
+`--approach side` comes in horizontally; `--approach-az`/`--approach-el` set any
+angle in between. The vantage is built from the configured world-up axis, so it
+is correct on any robot regardless of base-frame convention.
 
 ## License
 
