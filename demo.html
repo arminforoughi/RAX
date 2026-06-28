@@ -34,20 +34,36 @@
   /* ── Video panel ── */
   #video-panel {
     position: relative; background: #000;
-    display: flex; align-items: center; justify-content: center;
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    overflow: hidden;
   }
-  #robot-eye {
+  .cam-slot {
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    border-bottom: 1px solid #111;
+    overflow: hidden;
+  }
+  .cam-slot:last-child { border-bottom: none; }
+  .cam-label {
+    position: absolute; top: 6px; left: 8px;
+    background: rgba(0,0,0,0.6); color: #888;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    letter-spacing: 0.5px; text-transform: uppercase;
+  }
+  #robot-eye, #top-view {
     max-width: 100%; max-height: 100%;
     object-fit: contain;
   }
-  #no-video {
-    color: #333; font-size: 13px; text-align: center; line-height: 2;
+  .no-cam {
+    color: #2a2a2a; font-size: 12px; text-align: center;
   }
   #arm-state {
-    position: absolute; top: 12px; left: 12px;
+    position: absolute; bottom: 8px; right: 8px;
     background: rgba(0,0,0,0.7); border: 1px solid #333;
-    padding: 6px 12px; border-radius: 6px;
-    font-size: 13px; color: #4caf50; letter-spacing: 1px;
+    padding: 4px 10px; border-radius: 5px;
+    font-size: 12px; color: #4caf50; letter-spacing: 1px;
+    z-index: 10;
   }
 
   /* ── Side panel ── */
@@ -125,11 +141,28 @@
 
 <main>
   <div id="video-panel">
-    <div id="no-video">
-      robot-eye camera<br>
-      <span style="font-size:11px;color:#2a2a2a">connects when arm is active</span>
+    <!-- Top row: robot eye-in-hand camera (OAK-D / LiveKit track) -->
+    <div class="cam-slot" id="eye-slot">
+      <span class="cam-label">robot eye</span>
+      <div class="no-cam" id="no-eye">
+        connects when arm is active
+      </div>
+      <video id="robot-eye" autoplay playsinline muted style="display:none"></video>
     </div>
-    <video id="robot-eye" autoplay playsinline muted style="display:none"></video>
+
+    <!-- Bottom row: top-view overhead camera (MJPEG from localhost:5000) -->
+    <div class="cam-slot" id="top-slot">
+      <span class="cam-label">top view</span>
+      <img id="top-view"
+           src="http://localhost:5000/view/0"
+           onerror="this.style.display='none'; document.getElementById('no-top').style.display='flex';"
+           onload="document.getElementById('no-top').style.display='none';">
+      <div class="no-cam" id="no-top" style="display:none">
+        top camera offline<br>
+        <span style="font-size:10px;color:#222">localhost:5000/view/0</span>
+      </div>
+    </div>
+
     <div id="arm-state" style="display:none">IDLE</div>
   </div>
 
@@ -217,7 +250,7 @@ async function connect() {
       const video = document.getElementById('robot-eye');
       track.attach(video);
       video.style.display = 'block';
-      document.getElementById('no-video').style.display = 'none';
+      document.getElementById('no-eye').style.display = 'none';
       document.getElementById('arm-state').style.display = 'block';
     }
     if (track.kind === Track.Kind.Audio) {
@@ -237,6 +270,15 @@ async function connect() {
       if (el) { track.detach(el); el.remove(); }
     }
   });
+
+  // Reload the MJPEG top-view if it drops (mjpeg streams reset on agent restart)
+  setInterval(() => {
+    const img = document.getElementById('top-view');
+    if (img && connected) {
+      const src = img.src.split('?')[0];
+      img.src = src + '?t=' + Date.now();
+    }
+  }, 10000);
 
   // Receive text messages from the agent
   room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
@@ -299,7 +341,7 @@ async function sendCmd() {
 
 function hideVideo() {
   document.getElementById('robot-eye').style.display = 'none';
-  document.getElementById('no-video').style.display = 'flex';
+  document.getElementById('no-eye').style.display = 'flex';
   document.getElementById('arm-state').style.display = 'none';
 }
 
