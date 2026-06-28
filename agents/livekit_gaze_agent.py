@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-3.1-flash-live-preview"
+REALTIME_MODEL   = "gemini-2.5-flash-preview-native-audio-dialog"
+VISION_MODEL     = "gemini-2.5-flash"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
 GRIPPER_CAM_TF   = os.environ.get("GRIPPER_CAM_TF", "0.04,0,0.09,-0.2690,0.2824,-1.6014")
@@ -483,7 +484,7 @@ async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> 
         client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
         resp = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash",
+            model=VISION_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
                 question,
@@ -536,7 +537,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice="Aoede",
-            api_version="v1alpha",
+            api_version="v1beta",
         ),
     )
 
