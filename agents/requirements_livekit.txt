@@ -1,0 +1,17 @@
+# LiveKit gaze agent dependencies
+# Install into the RAX venv:
+#   pip install -r agents/requirements_livekit.txt
+
+livekit-agents[google]>=0.13
+livekit>=0.18
+python-dotenv>=1.0
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.11
+
+# Google Gemini (included via livekit-agents[google], listed explicitly for clarity)
+google-genai>=1.0
+
+# RAX robot stack (install separately with hardware extras as needed):
+#   pip install -e ".[feetech,kinematics,oakd,yolo-world]"  (lerobot fork)
+#   pip install scservo_sdk depthai placo ultralytics

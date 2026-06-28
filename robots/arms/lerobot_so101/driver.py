@@ -128,6 +128,26 @@ class So101Arm:
         except Exception:
             return None
 
+    def latest_left_bgr(self) -> "np.ndarray | None":
+        """Non-blocking peek at the most recent left frame as BGR (for video streaming).
+
+        Returns None when no new frame is ready yet.
+        """
+        import cv2
+
+        try:
+            left, _ = self._cam.read_stereo_rectified()
+            if left is None:
+                return None
+            arr = np.asarray(left)
+            if arr.ndim == 2:
+                return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+            if arr.shape[2] == 3:
+                return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            return arr
+        except Exception:
+            return None
+
     def disconnect(self) -> None:
         try:
             self.robot.disconnect()

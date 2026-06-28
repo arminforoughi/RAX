@@ -2,14 +2,45 @@
 
 A language-controlled robotics platform: an **exchange** where **agents** meet
 **robots**. An agent understands the outside world, and the robot acts on its
-commands. The reference implementation drives a Booster K1 — talk to it and it
-walks, follows people, tracks objects, dances, waves, and more. Powered by
-Google Gemini Live API + YOLOv8 + stereo depth + face recognition.
+commands. The reference implementation drives a Booster K1 humanoid and an
+SO-101 arm — talk to them and they walk, follow people, or pick up objects on
+command. Powered by **Google Gemini 3.1 + LiveKit + YOLOv8 + stereo depth**.
 
 - **R**obot — any platform (humanoids, arms, drones) behind a common driver.
 - **A**gent — a smart model (Gemini) that perceives the world and commands action.
 - **X** (eXchange) — the hub that brokers perception, commands, and speech
   between any agent and any robot.
+
+## Gaze Agent — LiveKit + Gemini 3.1 (Hackathon Demo)
+
+> Speak to the robot. It finds the object and picks it up.
+
+The [LiveKit Gaze Agent](docs/livekit_gaze_agent.md) connects Gemini 3.1 Flash
+Audio to the SO-101 arm's visual-servo gaze engine over a LiveKit room. The user's
+webcam and voice arrive via WebRTC; Gemini sees the scene, calls `gaze_robot("red
+cube")`, and the arm searches → approaches → grasps autonomously. The robot's
+OAK-D camera streams back to the browser as a `robot-eye` video track.
+
+```bash
+# No hardware needed — full mock run:
+cp .env.local.example .env.local   # add your LiveKit + Google keys
+ROBOT_MOCK=1 ./run_livekit_gaze.sh dev
+
+# Real SO-101 arm:
+./run_livekit_gaze.sh dev
+```
+
+**Docs:** [docs/livekit_gaze_agent.md](docs/livekit_gaze_agent.md) · [docs/gemini_livekit.md](docs/gemini_livekit.md) · [docs/manipulation_arms.md](docs/manipulation_arms.md)
+
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/livekit_gaze_agent.md](docs/livekit_gaze_agent.md) | LiveKit + Gemini voice agent — setup, env vars, tools, troubleshooting |
+| [docs/gemini_livekit.md](docs/gemini_livekit.md) | Gemini 3.1 + LiveKit Agents integration guide |
+| [docs/manipulation_arms.md](docs/manipulation_arms.md) | GazeEngine, ArmInterface, SO-101 driver, stereo/detection backends |
+
+---
 
 ## Project Structure
 
@@ -21,6 +52,7 @@ issues **high-** and **low-level** **control** commands — for humanoid mobilit
 
 ```
 agents/        Smart models that understand the world & command action
+               ├─ livekit_gaze_agent.py   LiveKit + Gemini 3.1 → GazeEngine → SO-101 ★
                └─ gemini_live_camera.py   Gemini Live voice + vision (no control)
 models/        Perception models
                ├─ detection/   YOLOv8 object detection (2D box + class)
@@ -33,6 +65,7 @@ control/       Agent intent -> motion
                ├─ high_level/  Follow, go-to, track, navigate
                └─ low_level/   Gait, turn, strafe, head, gestures
 manipulation/  Arm reach / grasp / pick-and-place (arms/)
+               └─ arms/lerobot_so101/   RAX-native lerobot-gaze-engine CLI ★
 mobility/      Move the base; SLAM navigation around objects (slam/)
 exchange/      Agent <-> robot hub (the "X" in RAX)
                └─ server.py    Central hub: models + agent + dispatcher + web UI
