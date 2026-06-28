@@ -426,60 +426,55 @@ class GazeRobotAgent(Agent):
         Args:
             question: The question to answer about the robot's view.
         """
-        import cv2
-        import base64
-        import numpy as np
+        return await _look(self, question)
 
-        # Grab a frame from the active runner or directly from mock arm
-        frame_bgr = None
-        runner = self._runner
-        if runner is not None and runner._arm is not None:
-            try:
-                if USE_MOCK:
-                    obs = runner._arm.get_observation()
-                    frame_bgr = obs.left
-                    if frame_bgr.shape[2] == 3:
-                        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)
-                else:
-                    frame_bgr = runner._arm.latest_left_bgr()
-            except Exception:
-                pass
 
-        if frame_bgr is None:
-            # Spin up a fresh mock arm just to get a frame
-            if USE_MOCK:
-                try:
-                    from manipulation.arms.mock_arm import MockArm
-                    _tmp = MockArm()
-                    obs = _tmp.get_observation()
-                    frame_bgr = obs.left
-                    if frame_bgr.ndim == 3 and frame_bgr.shape[2] == 3:
-                        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)
-                except Exception as e:
-                    return f"Could not capture robot camera frame: {e}"
-            else:
-                return "Robot camera not active — start the arm first or use ROBOT_MOCK=1."
+# ---------------------------------------------------------------------------
+# Shared look() implementation (used by function tool AND direct text dispatch)
+# ---------------------------------------------------------------------------
 
-        # Encode as JPEG for the vision model
-        _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        b64 = base64.b64encode(buf.tobytes()).decode()
+async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> str:
+    import cv2
 
-        # Ask Gemini Flash to describe the scene
+    frame_bgr = None
+    runner = agent._runner
+    if runner is not None and runner._arm is not None:
         try:
-            from google import genai
-            from google.genai import types as genai_types
-            client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
-            resp = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-2.0-flash",
-                contents=[
-                    genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
-                    question,
-                ],
-            )
-            return resp.text.strip()
+            if USE_MOCK:
+                obs = runner._arm.get_observation()
+                frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = runner._arm.latest_left_bgr()
+        except Exception:
+            pass
+
+    if frame_bgr is None and USE_MOCK:
+        try:
+            from manipulation.arms.mock_arm import MockArm
+            obs = MockArm().get_observation()
+            frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
         except Exception as e:
-            return f"Vision query failed: {e}"
+            return f"Could not capture frame: {e}"
+
+    if frame_bgr is None:
+        return "Robot camera not active."
+
+    _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash",
+            contents=[
+                genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
+                question,
+            ],
+        )
+        return resp.text.strip()
+    except Exception as e:
+        return f"Vision query failed: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +495,10 @@ async def _broadcast_state(room: rtc.Room, state: str) -> None:
 
 @server.rtc_session(agent_name="rax-gaze-agent")
 async def entrypoint(ctx: agents.JobContext) -> None:
+    logger.info("[entrypoint] job received, connecting…")
+    await ctx.connect()
+    logger.info("[entrypoint] connected to room: %s", ctx.room.name)
+
     robot_agent = GazeRobotAgent(room=ctx.room)
 
     session = AgentSession(
@@ -508,15 +507,22 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             voice="Aoede",
         ),
     )
-
     await session.start(room=ctx.room, agent=robot_agent)
-    await ctx.connect()
+    logger.info("[entrypoint] session started")
 
-    # Listen for text messages from the browser demo UI
+    loop = asyncio.get_running_loop()
+
+    # ----------------------------------------------------------------
+    # Text commands from the browser demo UI
+    # ----------------------------------------------------------------
+    # Realtime (audio) models don't accept text injection via generate_reply,
+    # so we parse intent directly and dispatch to the arm + session.say().
+    # ----------------------------------------------------------------
     @ctx.room.on("data_received")
     def on_data(packet: rtc.DataPacket):
         try:
-            msg = json.loads(packet.data.decode())
+            raw = packet.data.decode()
+            msg = json.loads(raw)
         except Exception:
             return
         if msg.get("type") != "command":
@@ -524,22 +530,106 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         text = msg.get("text", "").strip()
         if not text:
             return
-        logger.info("[entrypoint] browser text: %r", text)
-        # Route to Gemini as a user turn — it decides whether to call a tool or just answer
-        asyncio.get_running_loop().create_task(
-            session.generate_reply(user_input=text)
-        )
+        logger.info("[entrypoint] text command: %r", text)
+        loop.create_task(_dispatch_text(robot_agent, session, ctx.room, text))
 
+    # Greet on startup
     try:
-        arm_desc = "mock arm (ROBOT_MOCK=1)" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
-        await session.generate_reply(
-            instructions=(
-                f"Greet the user. Tell them you control a robot arm ({arm_desc}) "
-                "and can pick up objects they describe. Ask what they'd like you to grab."
-            )
+        arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
+        await session.say(
+            f"RAX gaze robot online. Running {arm_desc}. "
+            "Tell me what to pick up, or ask what I see."
         )
     except Exception as exc:
         logger.warning("[entrypoint] greeting failed: %s", exc)
+
+
+_PICK_WORDS  = {"pick", "grab", "get", "take", "grasp", "fetch", "lift"}
+_LOOK_WORDS  = {"see", "look", "what", "describe", "show", "view", "scene", "there", "visible"}
+_STOP_WORDS  = {"stop", "halt", "cancel", "freeze", "abort"}
+_STATUS_WORDS = {"status", "state", "doing", "happening", "progress"}
+
+
+async def _dispatch_text(
+    agent: "GazeRobotAgent",
+    session: "AgentSession",
+    room: rtc.Room,
+    text: str,
+) -> None:
+    """Parse a browser text command and dispatch to gaze engine or look()."""
+    words = set(text.lower().split())
+
+    # ── STOP ──
+    if words & _STOP_WORDS:
+        if agent._runner:
+            agent._runner.stop()
+            agent._runner = None
+            agent._runner_ref[0] = None
+            await session.say("Stopping the arm.")
+        else:
+            await session.say("Arm is already idle.")
+        return
+
+    # ── STATUS ──
+    if words & _STATUS_WORDS:
+        if agent._runner:
+            r = agent._runner
+            msg = f"State is {r.state}, query is {r.query}."
+        else:
+            msg = "Arm is idle, no active task."
+        await session.say(msg)
+        return
+
+    # ── LOOK / DESCRIBE ──
+    if words & _LOOK_WORDS and not (words & _PICK_WORDS):
+        await _broadcast(room, {"type": "log", "text": f"Looking… ({text})"})
+        result = await _look(agent, text)
+        await session.say(result)
+        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:120]}"})
+        return
+
+    # ── PICK UP / GRASP ──
+    # Extract object name: everything after pick/grab/get/… keyword
+    query = text
+    for w in sorted(_PICK_WORDS, key=len, reverse=True):
+        for phrase in (f"{w} up the ", f"{w} up a ", f"{w} up ", f"{w} the ", f"{w} a ", f"{w} "):
+            if phrase in text.lower():
+                query = text.lower().split(phrase, 1)[-1].strip()
+                break
+
+    if not query or query == text.lower():
+        # no keyword — treat whole input as the object description
+        query = text
+
+    logger.info("[dispatch] gaze_robot query=%r", query)
+    await _broadcast(room, {"type": "log", "text": f"Gaze engine starting: {query!r}"})
+    await _broadcast(room, {"type": "state", "state": "SEARCH"})
+
+    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
+        await session.say(f"Already running — state is {agent._runner.state}. Say stop first.")
+        return
+
+    await session.say(f"On it. Searching for {query}.")
+
+    def on_state(state: str):
+        asyncio.get_running_loop().call_soon_threadsafe(
+            lambda: asyncio.ensure_future(_broadcast(room, {"type": "state", "state": state}))
+        )
+
+    runner = _GazeRunner(query=query, on_state_change=on_state)
+    agent._runner        = runner
+    agent._runner_ref[0] = runner
+
+    executor = agent._executor or __import__('concurrent.futures').futures.ThreadPoolExecutor(1)
+    agent._executor = executor
+    asyncio.get_running_loop().run_in_executor(executor, runner.run_until_done)
+
+
+async def _broadcast(room: rtc.Room, msg: dict) -> None:
+    try:
+        await room.local_participant.publish_data(json.dumps(msg).encode(), reliable=True)
+    except Exception as e:
+        logger.debug("[broadcast] %s", e)
 
 
 
