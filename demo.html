@@ -56,6 +56,9 @@
     display: flex; flex-direction: column; overflow: hidden;
   }
 
+  /* audio */
+  #audio-container { display: none; }
+
   /* log */
   #log {
     flex: 1; overflow-y: auto; padding: 10px 12px;
@@ -129,6 +132,8 @@
     <video id="robot-eye" autoplay playsinline muted style="display:none"></video>
     <div id="arm-state" style="display:none">IDLE</div>
   </div>
+
+  <div id="audio-container"></div>
 
   <div id="side">
     <div id="log"></div>
@@ -215,11 +220,21 @@ async function connect() {
       document.getElementById('no-video').style.display = 'none';
       document.getElementById('arm-state').style.display = 'block';
     }
+    if (track.kind === Track.Kind.Audio) {
+      log('agent audio connected — you should hear Gemini', 'msg-sys');
+      const audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.id = 'agent-audio-' + pub.trackSid;
+      document.getElementById('audio-container').appendChild(audio);
+      track.attach(audio);
+    }
   });
 
   room.on(RoomEvent.TrackUnsubscribed, (track, pub) => {
-    if (pub.trackName === 'robot-eye') {
-      hideVideo();
+    if (pub.trackName === 'robot-eye') hideVideo();
+    if (track.kind === Track.Kind.Audio) {
+      const el = document.getElementById('agent-audio-' + pub.trackSid);
+      if (el) { track.detach(el); el.remove(); }
     }
   });
 
@@ -242,16 +257,18 @@ async function connect() {
     }
   });
 
-  // Transcriptions (Gemini → text)
+  // Transcriptions (Gemini speech → text, and your speech → text)
   room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
     const t = document.getElementById('transcript-area');
-    const latest = segments.filter(s => s.final).map(s => s.text).join(' ');
-    if (latest) {
-      t.textContent = latest;
-      log(latest, participant?.isLocal ? 'msg-user' : 'msg-agent');
+    const isAgent = !participant?.isLocal;
+    const finals = segments.filter(s => s.final).map(s => s.text).join(' ');
+    if (finals) {
+      t.textContent = '';
+      log((isAgent ? 'Gemini: ' : 'You (voice): ') + finals,
+          isAgent ? 'msg-agent' : 'msg-user');
     } else {
       const partial = segments.map(s => s.text).join(' ');
-      t.textContent = partial + '…';
+      t.textContent = (isAgent ? 'Gemini: ' : 'You: ') + partial + '…';
     }
   });
 

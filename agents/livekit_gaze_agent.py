@@ -514,9 +514,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     # Listen for text messages from the browser demo UI
     @ctx.room.on("data_received")
-    def on_data(payload: bytes, participant, kind, topic):
+    def on_data(packet: rtc.DataPacket):
         try:
-            msg = json.loads(payload.decode())
+            msg = json.loads(packet.data.decode())
         except Exception:
             return
         if msg.get("type") != "command":
@@ -526,7 +526,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             return
         logger.info("[entrypoint] browser text: %r", text)
         # Route to Gemini as a user turn — it decides whether to call a tool or just answer
-        asyncio.get_event_loop().create_task(
+        asyncio.get_running_loop().create_task(
             session.generate_reply(user_input=text)
         )
 
