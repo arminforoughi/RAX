@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-2.5-flash-preview-native-audio-dialog"
+REALTIME_MODEL   = "gemini-2.5-flash-preview-native-audio-dialog"   # v1alpha
+# Fallback if above 404s: "gemini-2.0-flash-live-001" (v1alpha)
 VISION_MODEL     = "gemini-2.5-flash"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
@@ -217,7 +218,8 @@ class _GazeRunner:
             approach_close_step_m=0.010,
         )
         self._cloud  = cloud
-        self._kin    = kin
+        # CartesianKinematics (mock) lacks get_link_transforms_chain; don't pass to viz
+        self._kin    = None if USE_MOCK else kin
         self._engine = GazeEngine(
             self._arm, kin, cloud, cfg,
             cartesian=USE_MOCK,
@@ -546,7 +548,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice="Aoede",
-            api_version="v1beta",
+            api_version="v1alpha",
         ),
     )
 
