@@ -29,6 +29,7 @@ Run::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -63,6 +64,7 @@ GAZE_APPROACH    = os.environ.get("GAZE_APPROACH", "angled")
 GAZE_DETECTOR    = os.environ.get("GAZE_DETECTOR", "auto")
 GAZE_STEREO      = os.environ.get("GAZE_STEREO", "sgbm")
 USE_MOCK         = os.environ.get("ROBOT_MOCK", "0").strip() in ("1", "true", "yes")
+USE_RERUN        = os.environ.get("ROBOT_RERUN", "1").strip() in ("1", "true", "yes")
 
 PERSONA = """You are a gaze-controlled robot arm assistant at the AI Engineer World's Fair Hackathon 2026.
 
@@ -99,11 +101,13 @@ class _GazeRunner:
         approach_style: str = GAZE_APPROACH,
         max_ticks: int = 600,
         loop_hz: float = 20.0,
+        on_state_change: "callable | None" = None,
     ) -> None:
         self.query          = query
         self.approach_style = approach_style
         self.max_ticks      = max_ticks
         self.loop_hz        = loop_hz
+        self.on_state_change = on_state_change  # called(state) on each transition
 
         self.state       = "INIT"
         self.final_state: str | None = None
@@ -111,6 +115,7 @@ class _GazeRunner:
 
         self._stop = threading.Event()
         self._arm  = None   # set inside the thread
+        self._viz  = None   # RerunViz if available
 
     # -- public API -------------------------------------------------------
 
@@ -144,6 +149,9 @@ class _GazeRunner:
         from models.detection import make_detector, make_mask_tracker
         from perception.depth_cloud import CloudTracker, PointCloudStream
         from manipulation.arms.gaze_engine import GazeConfig, GazeEngine, DONE, FAILED
+        if USE_RERUN:
+            from perception.depth_cloud.rerun_viz import RerunViz
+            self._viz = RerunViz.try_create(session="rax_gaze_agent", spawn=True)
 
         self._note(f"opening arm  mock={USE_MOCK}  query={self.query!r}")
 
@@ -192,6 +200,7 @@ class _GazeRunner:
             world_up=world_up,
             approach_style=self.approach_style,
         )
+        self._cloud  = cloud
         self._engine = GazeEngine(
             self._arm, kin, cloud, cfg,
             cartesian=USE_MOCK,
@@ -207,6 +216,8 @@ class _GazeRunner:
             if self._stop.is_set():
                 self._note("stopped by user")
                 self.final_state = "STOPPED"
+                if self.on_state_change:
+                    self.on_state_change("STOPPED")
                 return
 
             prev = self.state
@@ -215,6 +226,18 @@ class _GazeRunner:
 
             if s != prev:
                 self._note(f"→ {s}")
+                if self.on_state_change:
+                    self.on_state_change(s)
+
+            # Stream to Rerun viewer
+            if self._viz is not None:
+                try:
+                    obs   = self._arm.get_observation()
+                    u_aim = getattr(engine, '_u_aim', None)
+                    v_aim = getattr(engine, '_v_aim', None)
+                    self._viz.log(obs, self._cloud, state=s, u_aim=u_aim, v_aim=v_aim)
+                except Exception:
+                    pass
 
             if s in (self._DONE, self._FAILED):
                 break
@@ -222,6 +245,8 @@ class _GazeRunner:
             time.sleep(dt)
 
         self.final_state = self.state
+        if self.on_state_change:
+            self.on_state_change(self.final_state)
         self._note(f"finished: {self.final_state}")
 
     def _teardown(self) -> None:
@@ -397,8 +422,19 @@ class GazeRobotAgent(Agent):
 server = AgentServer()
 
 
+async def _broadcast_state(room: rtc.Room, state: str) -> None:
+    """Push arm state to all browser participants as a JSON data message."""
+    try:
+        payload = json.dumps({"type": "state", "state": state}).encode()
+        await room.local_participant.publish_data(payload, reliable=True)
+    except Exception:
+        pass
+
+
 @server.rtc_session(agent_name="rax-gaze-agent")
 async def entrypoint(ctx: agents.JobContext) -> None:
+    robot_agent = GazeRobotAgent(room=ctx.room)
+
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
@@ -406,11 +442,24 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         ),
     )
 
-    await session.start(
-        room=ctx.room,
-        agent=GazeRobotAgent(room=ctx.room),
-    )
+    await session.start(room=ctx.room, agent=robot_agent)
     await ctx.connect()
+
+    # Listen for text commands from the browser demo UI
+    @ctx.room.on("data_received")
+    def on_data(payload: bytes, participant, kind, topic):
+        try:
+            msg = json.loads(payload.decode())
+        except Exception:
+            return
+        if msg.get("type") != "command":
+            return
+        query = msg.get("text", "").strip()
+        if not query:
+            return
+        logger.info("[entrypoint] text command: %r", query)
+        # Schedule gaze_robot on the event loop
+        asyncio.get_event_loop().create_task(_handle_text_command(robot_agent, ctx.room, query))
 
     try:
         arm_desc = "mock arm (ROBOT_MOCK=1)" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
@@ -422,6 +471,30 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         )
     except Exception as exc:
         logger.warning("[entrypoint] greeting failed: %s", exc)
+
+
+async def _handle_text_command(agent: "GazeRobotAgent", room: rtc.Room, query: str) -> None:
+    """Route a browser text command directly to the gaze engine."""
+    if agent._runner is not None and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
+        msg = json.dumps({"type": "log", "text": f"Already running: {agent._runner.state}. Say stop first."}).encode()
+        await room.local_participant.publish_data(msg, reliable=True)
+        return
+
+    def on_state(state: str):
+        asyncio.get_event_loop().call_soon_threadsafe(
+            asyncio.get_event_loop().create_task,
+            _broadcast_state(room, state),
+        )
+
+    runner = _GazeRunner(query=query, on_state_change=on_state)
+    agent._runner            = runner
+    agent._runner_ref[0]     = runner
+
+    msg = json.dumps({"type": "log", "text": f"Starting gaze engine for: {query!r}"}).encode()
+    await room.local_participant.publish_data(msg, reliable=True)
+
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(agent._executor, runner.run_until_done)
 
 
 if __name__ == "__main__":

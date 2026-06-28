@@ -54,14 +54,21 @@ fi
 
 export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
 
+DEMO_PORT="${DEMO_PORT:-8888}"
+
 echo ">>> LiveKit gaze agent"
 echo "    python  : $PY"
 echo "    mock    : ${ROBOT_MOCK:-0}"
 [[ -n "${ROBOT_PORT:-}" ]] && echo "    port    : $ROBOT_PORT"
 echo "    approach: ${GAZE_APPROACH:-angled}"
+echo "    rerun   : ${ROBOT_RERUN:-1}"
 echo ""
-echo "Frontend: open gemini-hacker-starter/frontend (pnpm dev)"
-echo "          or point your LiveKit client at the same room."
+echo "    Demo UI : http://localhost:$DEMO_PORT"
 echo ""
+
+# Start the demo web server in the background (serves demo.html + mints tokens)
+"$PY" "$REPO_DIR/demo_server.py" --port "$DEMO_PORT" &
+DEMO_PID=$!
+trap "kill $DEMO_PID 2>/dev/null" EXIT
 
 exec "$PY" -m agents.livekit_gaze_agent "$@"
