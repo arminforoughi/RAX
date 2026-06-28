@@ -495,34 +495,16 @@ async def _broadcast_state(room: rtc.Room, state: str) -> None:
 
 @server.rtc_session(agent_name="rax-gaze-agent")
 async def entrypoint(ctx: agents.JobContext) -> None:
-    logger.info("[entrypoint] job received, connecting…")
-    await ctx.connect()
-    logger.info("[entrypoint] connected to room: %s", ctx.room.name)
+    print(f"\n>>> [RAX] job received for room: {ctx.room.name}", flush=True)
 
     robot_agent = GazeRobotAgent(room=ctx.room)
-
-    session = AgentSession(
-        llm=google.realtime.RealtimeModel(
-            model=REALTIME_MODEL,
-            voice="Aoede",
-        ),
-    )
-    await session.start(room=ctx.room, agent=robot_agent)
-    logger.info("[entrypoint] session started")
-
     loop = asyncio.get_running_loop()
 
-    # ----------------------------------------------------------------
-    # Text commands from the browser demo UI
-    # ----------------------------------------------------------------
-    # Realtime (audio) models don't accept text injection via generate_reply,
-    # so we parse intent directly and dispatch to the arm + session.say().
-    # ----------------------------------------------------------------
+    # Register data_received BEFORE connecting so we never miss a message
     @ctx.room.on("data_received")
     def on_data(packet: rtc.DataPacket):
         try:
-            raw = packet.data.decode()
-            msg = json.loads(raw)
+            msg = json.loads(packet.data.decode())
         except Exception:
             return
         if msg.get("type") != "command":
@@ -530,18 +512,30 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         text = msg.get("text", "").strip()
         if not text:
             return
-        logger.info("[entrypoint] text command: %r", text)
+        print(f">>> [RAX] text command: {text!r}", flush=True)
         loop.create_task(_dispatch_text(robot_agent, session, ctx.room, text))
 
-    # Greet on startup
+    session = AgentSession(
+        llm=google.realtime.RealtimeModel(
+            model=REALTIME_MODEL,
+            voice="Aoede",
+        ),
+    )
+
+    # start session first (hackathon-starter pattern), then connect
+    await session.start(room=ctx.room, agent=robot_agent)
+    await ctx.connect()
+    print(f">>> [RAX] connected. Participants: {list(ctx.room.remote_participants.keys())}", flush=True)
+
     try:
         arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
         await session.say(
             f"RAX gaze robot online. Running {arm_desc}. "
             "Tell me what to pick up, or ask what I see."
         )
+        print(">>> [RAX] greeting sent", flush=True)
     except Exception as exc:
-        logger.warning("[entrypoint] greeting failed: %s", exc)
+        print(f">>> [RAX] greeting failed: {exc}", flush=True)
 
 
 _PICK_WORDS  = {"pick", "grab", "get", "take", "grasp", "fetch", "lift"}
@@ -557,6 +551,7 @@ async def _dispatch_text(
     text: str,
 ) -> None:
     """Parse a browser text command and dispatch to gaze engine or look()."""
+    print(f">>> [dispatch] {text!r}", flush=True)
     words = set(text.lower().split())
 
     # ── STOP ──

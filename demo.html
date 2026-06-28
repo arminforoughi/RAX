@@ -227,11 +227,23 @@ async function connect() {
 
   room.on(RoomEvent.Connected, () => {
     connected = true;
-    setStatus('connected', 'connected');
+    setStatus('connected — waiting for agent…', 'connected');
     log(`joined room: ${roomName}`, 'msg-sys');
+    log('waiting for rax-gaze-agent to join…', 'msg-sys');
     document.getElementById('cmd').disabled = false;
     document.getElementById('send-btn').disabled = false;
     document.getElementById('cmd').focus();
+  });
+
+  room.on(RoomEvent.ParticipantConnected, (p) => {
+    log(`participant joined: ${p.identity}`, 'msg-sys');
+    if (p.identity.includes('agent') || p.identity.includes('rax')) {
+      setStatus('agent connected', 'connected');
+    }
+  });
+
+  room.on(RoomEvent.ParticipantDisconnected, (p) => {
+    log(`participant left: ${p.identity}`, 'msg-sys');
   });
 
   room.on(RoomEvent.Disconnected, () => {
