@@ -217,6 +217,7 @@ class _GazeRunner:
             approach_close_step_m=0.010,
         )
         self._cloud  = cloud
+        self._kin    = kin
         self._engine = GazeEngine(
             self._arm, kin, cloud, cfg,
             cartesian=USE_MOCK,
@@ -245,15 +246,23 @@ class _GazeRunner:
                 if self.on_state_change:
                     self.on_state_change(s)
 
-            # Stream to Rerun viewer
-            if self._viz is not None:
+            # Stream to Rerun viewer — mirrors entrypoint.py exactly
+            if self._viz is not None and engine.last_obs is not None:
                 try:
-                    obs   = self._arm.get_observation()
-                    u_aim = getattr(engine, '_u_aim', None)
-                    v_aim = getattr(engine, '_v_aim', None)
-                    self._viz.log(obs, self._cloud, state=s, u_aim=u_aim, v_aim=v_aim)
-                except Exception:
-                    pass
+                    focus = self._cloud.focus_track()
+                    u_aim = v_aim = None
+                    if focus is not None:
+                        u_aim, v_aim = engine._gaze_uv(focus, engine.last_obs)
+                    self._viz.log(
+                        engine.last_obs, self._cloud, s,
+                        kin=getattr(self, '_kin', None),
+                        depth_m=engine.range_m,
+                        u_aim=u_aim,
+                        v_aim=v_aim,
+                        aim_v_offset_px=engine._aim_v_now,
+                    )
+                except Exception as e:
+                    logger.debug("[rerun] log error: %s", e)
 
             if s in (self._DONE, self._FAILED):
                 break
