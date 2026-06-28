@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-3.1-flash-audio-eap"
+REALTIME_MODEL   = "gemini-2.0-flash-live-001"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
 GRIPPER_CAM_TF   = os.environ.get("GRIPPER_CAM_TF", "0.04,0,0.09,-0.2690,0.2824,-1.6014")
@@ -351,8 +351,11 @@ class GazeRobotAgent(Agent):
     async def on_enter(self) -> None:
         import concurrent.futures
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gaze")
-        asyncio.create_task(_stream_robot_camera(self._room, self._runner_ref))
+        # Camera stream started later (after room connects) via start_camera_stream()
         logger.info("[GazeRobotAgent] entered")
+
+    def start_camera_stream(self) -> None:
+        asyncio.create_task(_stream_robot_camera(self._room, self._runner_ref))
 
     # ---- function tools -------------------------------------------------
 
@@ -525,17 +528,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # start session first (hackathon-starter pattern), then connect
     await session.start(room=ctx.room, agent=robot_agent)
     await ctx.connect()
+    robot_agent.start_camera_stream()  # safe now — room is connected
     print(f">>> [RAX] connected. Participants: {list(ctx.room.remote_participants.keys())}", flush=True)
 
-    try:
-        arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
-        await session.say(
-            f"RAX gaze robot online. Running {arm_desc}. "
-            "Tell me what to pick up, or ask what I see."
-        )
-        print(">>> [RAX] greeting sent", flush=True)
-    except Exception as exc:
-        print(f">>> [RAX] greeting failed: {exc}", flush=True)
+    arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
+    greeting = f"RAX gaze robot online. Running {arm_desc}. Tell me what to pick up, or ask what I see."
+    await _say(session, ctx.room, greeting)
 
 
 _PICK_WORDS  = {"pick", "grab", "get", "take", "grasp", "fetch", "lift"}
@@ -560,9 +558,9 @@ async def _dispatch_text(
             agent._runner.stop()
             agent._runner = None
             agent._runner_ref[0] = None
-            await session.say("Stopping the arm.")
+            await _say(session, room, "Stopping the arm.")
         else:
-            await session.say("Arm is already idle.")
+            await _say(session, room, "Arm is already idle.")
         return
 
     # ── STATUS ──
@@ -572,19 +570,18 @@ async def _dispatch_text(
             msg = f"State is {r.state}, query is {r.query}."
         else:
             msg = "Arm is idle, no active task."
-        await session.say(msg)
+        await _say(session, room, msg)
         return
 
     # ── LOOK / DESCRIBE ──
     if words & _LOOK_WORDS and not (words & _PICK_WORDS):
         await _broadcast(room, {"type": "log", "text": f"Looking… ({text})"})
         result = await _look(agent, text)
-        await session.say(result)
-        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:120]}"})
+        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:200]}"})
+        await _say(session, room, result)
         return
 
     # ── PICK UP / GRASP ──
-    # Extract object name: everything after pick/grab/get/… keyword
     query = text
     for w in sorted(_PICK_WORDS, key=len, reverse=True):
         for phrase in (f"{w} up the ", f"{w} up a ", f"{w} up ", f"{w} the ", f"{w} a ", f"{w} "):
@@ -593,31 +590,34 @@ async def _dispatch_text(
                 break
 
     if not query or query == text.lower():
-        # no keyword — treat whole input as the object description
         query = text
+
+    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
+        await _say(session, room, f"Already running — state is {agent._runner.state}. Say stop first.")
+        return
 
     logger.info("[dispatch] gaze_robot query=%r", query)
     await _broadcast(room, {"type": "log", "text": f"Gaze engine starting: {query!r}"})
     await _broadcast(room, {"type": "state", "state": "SEARCH"})
 
-    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-        await session.say(f"Already running — state is {agent._runner.state}. Say stop first.")
-        return
-
-    await session.say(f"On it. Searching for {query}.")
+    loop = asyncio.get_running_loop()
 
     def on_state(state: str):
-        asyncio.get_running_loop().call_soon_threadsafe(
+        loop.call_soon_threadsafe(
             lambda: asyncio.ensure_future(_broadcast(room, {"type": "state", "state": state}))
         )
 
+    # Start gaze engine FIRST, then speak (so a crash in say() doesn't abort the engine)
     runner = _GazeRunner(query=query, on_state_change=on_state)
     agent._runner        = runner
     agent._runner_ref[0] = runner
 
-    executor = agent._executor or __import__('concurrent.futures').futures.ThreadPoolExecutor(1)
+    import concurrent.futures
+    executor = agent._executor or concurrent.futures.ThreadPoolExecutor(max_workers=1)
     agent._executor = executor
-    asyncio.get_running_loop().run_in_executor(executor, runner.run_until_done)
+    loop.run_in_executor(executor, runner.run_until_done)
+
+    await _say(session, room, f"On it. Searching for {query}.")
 
 
 async def _broadcast(room: rtc.Room, msg: dict) -> None:
@@ -625,6 +625,15 @@ async def _broadcast(room: rtc.Room, msg: dict) -> None:
         await room.local_participant.publish_data(json.dumps(msg).encode(), reliable=True)
     except Exception as e:
         logger.debug("[broadcast] %s", e)
+
+
+async def _say(session: "AgentSession", room: rtc.Room, text: str) -> None:
+    """Speak text via Gemini if running, otherwise send as browser log."""
+    print(f">>> [say] {text!r}", flush=True)
+    try:
+        await session.say(text)
+    except Exception:
+        await _broadcast(room, {"type": "reply", "text": text})
 
 
 
