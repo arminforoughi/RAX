@@ -91,118 +91,225 @@ Never invent visual details you cannot actually see — use look() to check."""
 # GazeRunner — manages GazeEngine in a background thread
 # ---------------------------------------------------------------------------
 
-class _GazeRunner:
-    """Runs a single gaze-pick task synchronously in a worker thread.
+class _PersistentGaze:
+    """Always-on gaze engine: initializes hardware once, accepts queries at runtime.
 
-    Thread-safe state is exposed via ``state``, ``final_state``, and ``log``.
+    Architecture:
+      - Background thread initializes arm + camera + Rerun once on start().
+      - pick(query) queues a new task; a fresh CloudTracker + GazeEngine is
+        created per query (cheap, ~50 ms) while the arm stays connected.
+      - Rerun streams continuously — even while idle the camera image updates.
     """
 
-    def __init__(
-        self,
-        query: str,
-        approach_style: str = GAZE_APPROACH,
-        max_ticks: int = 600,
-        loop_hz: float = 20.0,
-        on_state_change: "callable | None" = None,
-    ) -> None:
-        self.query          = query
-        self.approach_style = approach_style
-        self.max_ticks      = max_ticks
-        self.loop_hz        = loop_hz
-        self.on_state_change = on_state_change  # called(state) on each transition
+    LOOP_HZ  = 20.0
+    MAX_TICKS = 600   # 30 s at 20 Hz
 
+    def __init__(self) -> None:
         self.state       = "INIT"
+        self.query: str | None = None
         self.final_state: str | None = None
         self.log: list[str] = []
+        self.on_state_change: "callable | None" = None
 
-        self._stop = threading.Event()
-        self._arm  = None   # set inside the thread
-        self._viz  = None   # RerunViz if available
+        self._shutdown   = threading.Event()
+        self._task_stop  = threading.Event()
+        self._task_ready = threading.Event()
+        self._lock       = threading.Lock()
+        self._pending_query: str | None = None
 
-    # -- public API -------------------------------------------------------
+        # initialized in _setup()
+        self._arm   = None
+        self._kin   = None
+        self._viz   = None
+        self._cfg   = None
+        self._detector     = None
+        self._mask_tracker = None
+        self._stereo       = None
+        self._idle_cloud   = None   # empty cloud for idle Rerun ticks
 
-    def run_until_done(self) -> None:
-        """Blocking: open hardware, run engine, close hardware. Call in a thread."""
-        try:
-            self._setup()
-            self._loop()
-        except Exception as exc:
-            logger.exception("[GazeRunner] fatal: %s", exc)
-            self._note(f"FAILED: {exc}")
-            self.state = self.final_state = "FAILED"
-        finally:
-            self._teardown()
+        self._thread: threading.Thread | None = None
 
-    def stop(self) -> None:
-        """Signal the engine to stop after the current tick."""
-        self._stop.set()
+    # ── public API ──────────────────────────────────────────────────────────
 
-    def stopped(self) -> bool:
-        return self._stop.is_set()
+    def start(self) -> None:
+        """Spawn background thread; returns immediately."""
+        self._thread = threading.Thread(target=self._run, daemon=True, name="persistent-gaze")
+        self._thread.start()
 
-    # -- internals --------------------------------------------------------
+    def pick(self, query: str) -> bool:
+        """Queue a pick task. Returns False if arm is currently mid-task."""
+        with self._lock:
+            busy = self.state not in ("IDLE", "DONE", "FAILED", "STOPPED", "INIT")
+            if busy:
+                return False
+            self._pending_query = query
+            self._task_stop.clear()
+            self._task_ready.set()
+        return True
+
+    def stop_task(self) -> None:
+        self._task_stop.set()
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        self._task_stop.set()
+        self._task_ready.set()
+
+    # ── internals ───────────────────────────────────────────────────────────
 
     def _note(self, msg: str) -> None:
-        logger.info("[GazeRunner] %s", msg)
+        logger.info("[PersistentGaze] %s", msg)
         self.log.append(msg)
 
+    def _run(self) -> None:
+        try:
+            self._setup()
+        except Exception as exc:
+            logger.exception("[PersistentGaze] setup failed: %s", exc)
+            self.state = "FAILED"
+            if self.on_state_change:
+                self.on_state_change("FAILED")
+            return
+
+        self._note("arm ready — waiting for queries")
+        self.state = "IDLE"
+        if self.on_state_change:
+            self.on_state_change("IDLE")
+
+        dt = 1.0 / self.LOOP_HZ
+        while not self._shutdown.is_set():
+            # Wait up to 50 ms then do an idle Rerun tick
+            self._task_ready.wait(timeout=0.05)
+            if self._shutdown.is_set():
+                break
+
+            with self._lock:
+                query = self._pending_query
+                if query:
+                    self._pending_query = None
+                    self._task_ready.clear()
+
+            if query:
+                self.query = query
+                self._run_task(query, dt)
+                self.state = "IDLE"
+                if self.on_state_change:
+                    self.on_state_change("IDLE")
+            else:
+                self._idle_tick()
+
+        self._teardown()
+
+    def _idle_tick(self) -> None:
+        """Stream camera to Rerun while waiting for a command."""
+        if self._viz is None or self._arm is None:
+            return
+        try:
+            obs = self._arm.get_observation()
+            self._viz.log(obs, self._idle_cloud, "IDLE", kin=self._kin)
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+    def _run_task(self, query: str, dt: float) -> None:
+        from perception.depth_cloud import CloudTracker, PointCloudStream
+        from manipulation.arms.gaze_engine import GazeEngine, DONE, FAILED
+
+        self._note(f"starting task query={query!r}")
+        stream = PointCloudStream()
+        cloud  = CloudTracker(
+            self._detector, self._mask_tracker, self._stereo, query,
+            detect_every=1, stream=stream,
+        )
+        engine = GazeEngine(self._arm, self._kin, cloud, self._cfg, cartesian=USE_MOCK)
+
+        prev = None
+        for _ in range(self.MAX_TICKS):
+            if self._task_stop.is_set() or self._shutdown.is_set():
+                self._note("task stopped")
+                self.state = "STOPPED"
+                self.final_state = "STOPPED"
+                if self.on_state_change:
+                    self.on_state_change("STOPPED")
+                return
+
+            s = engine.step(dt)
+            self.state = s
+            if s != prev:
+                self._note(f"→ {s}")
+                if self.on_state_change:
+                    self.on_state_change(s)
+                prev = s
+
+            if self._viz is not None and engine.last_obs is not None:
+                try:
+                    focus = cloud.focus_track()
+                    u_aim = v_aim = None
+                    if focus is not None:
+                        u_aim, v_aim = engine._gaze_uv(focus, engine.last_obs)
+                    self._viz.log(
+                        engine.last_obs, cloud, s,
+                        kin=self._kin,
+                        depth_m=engine.range_m,
+                        u_aim=u_aim, v_aim=v_aim,
+                        aim_v_offset_px=engine._aim_v_now,
+                    )
+                except Exception as e:
+                    logger.debug("[rerun] %s", e)
+
+            if s in (DONE, FAILED):
+                self.final_state = s
+                self._note(f"finished: {s}")
+                return
+
+            time.sleep(dt)
+
+        self.final_state = self.state
+        self._note(f"timed out in state={self.state}")
+
     def _setup(self) -> None:
+        import numpy as np
         from models.depth import make_stereo
         from models.detection import make_detector, make_mask_tracker
         from perception.depth_cloud import CloudTracker, PointCloudStream
-        from manipulation.arms.gaze_engine import GazeConfig, GazeEngine, DONE, FAILED
+        from manipulation.arms.gaze_engine import GazeConfig
+
         if USE_RERUN:
             from perception.depth_cloud.rerun_viz import RerunViz
             self._viz = RerunViz.try_create(session="rax_gaze_agent", spawn=True)
 
-        self._note(f"opening arm  mock={USE_MOCK}  query={self.query!r}")
-
         if USE_MOCK:
             from manipulation.arms.mock_arm import WORLD_UP, MockArm
             from manipulation.arms.kinematics import CartesianKinematics
-            import numpy as np
-
-            self._arm = MockArm()
-            kin       = CartesianKinematics()
-            T_ee_cam  = np.eye(4)
-            world_up  = WORLD_UP
+            self._arm    = MockArm()
+            self._kin    = CartesianKinematics()
+            T_ee_cam     = np.eye(4)
+            world_up     = WORLD_UP
+            det_backend  = "color_blob"
+            mask_backend = "ellipse"
+            stereo_backend = "sgbm"
         else:
             from robots.arms.lerobot_so101.driver import So101Arm
-            self._arm = So101Arm(
+            self._arm    = So101Arm(
                 port=ROBOT_PORT or self._auto_detect_port(),
                 urdf=ROBOT_URDF,
                 gripper_camera_tf=GRIPPER_CAM_TF,
             )
-            kin      = self._arm.kin
-            T_ee_cam = self._arm.T_ee_cam
-            import numpy as np
-            world_up = np.array([0.0, 0.0, 1.0])
+            self._kin    = self._arm.kin
+            T_ee_cam     = self._arm.T_ee_cam
+            world_up     = np.array([0.0, 0.0, 1.0])
+            det_backend  = GAZE_DETECTOR if GAZE_DETECTOR != "auto" else "yolo"
+            mask_backend = "auto"
+            stereo_backend = GAZE_STEREO
 
-        # detector
-        det_backend = GAZE_DETECTOR
-        if det_backend == "auto":
-            from models.detection.prompt_detector import _HSV_RANGES
-            words = self.query.lower().split()
-            det_backend = "color_blob" if any(w in _HSV_RANGES for w in words) else "blob"
-        if USE_MOCK:
-            det_backend = "color_blob"
+        self._detector     = make_detector(det_backend)
+        self._mask_tracker = make_mask_tracker(mask_backend)
+        self._stereo       = make_stereo(stereo_backend)
 
-        detector     = make_detector(det_backend)
-        mask_tracker = make_mask_tracker("ellipse" if USE_MOCK else "auto")
-        stereo       = make_stereo("sgbm" if USE_MOCK else GAZE_STEREO)
-
-        stream = PointCloudStream()
-        cloud  = CloudTracker(
-            detector, mask_tracker, stereo, self.query,
-            detect_every=1,   # detect every tick (lerobot config: detect_every_n_ticks=1)
-            stream=stream,
-        )
-
-        cfg = GazeConfig(
+        self._cfg = GazeConfig(
             T_ee_cam=T_ee_cam,
             world_up=world_up,
-            approach_style=self.approach_style,
-            # --- from lerobot/configs/gaze_engine_zmq.yaml ---
+            approach_style=GAZE_APPROACH,
             gaze_kp_pan=0.4,
             gaze_kp_tilt=0.5,
             approach_kp=1.8,
@@ -216,76 +323,22 @@ class _GazeRunner:
             approach_close_m=0.125,
             approach_close_step_m=0.010,
         )
-        self._cloud  = cloud
-        self._kin    = kin  # CartesianKinematics now has get_link_transforms_chain
-        self._engine = GazeEngine(
-            self._arm, kin, cloud, cfg,
-            cartesian=USE_MOCK,
+
+        # Empty cloud used for idle Rerun ticks (shows camera with no detections)
+        stream = PointCloudStream()
+        self._idle_cloud = CloudTracker(
+            self._detector, self._mask_tracker, self._stereo, "",
+            detect_every=999999, stream=stream,
         )
-        self._DONE   = "DONE"
-        self._FAILED = "FAILED"
-
-    def _loop(self) -> None:
-        dt     = 1.0 / max(1.0, self.loop_hz)
-        engine = self._engine
-
-        for _ in range(self.max_ticks):
-            if self._stop.is_set():
-                self._note("stopped by user")
-                self.final_state = "STOPPED"
-                if self.on_state_change:
-                    self.on_state_change("STOPPED")
-                return
-
-            prev = self.state
-            s    = engine.step(dt)
-            self.state = s
-
-            if s != prev:
-                self._note(f"→ {s}")
-                if self.on_state_change:
-                    self.on_state_change(s)
-
-            # Stream to Rerun viewer — mirrors entrypoint.py exactly
-            if self._viz is not None and engine.last_obs is not None:
-                try:
-                    focus = self._cloud.focus_track()
-                    u_aim = v_aim = None
-                    if focus is not None:
-                        u_aim, v_aim = engine._gaze_uv(focus, engine.last_obs)
-                    self._viz.log(
-                        engine.last_obs, self._cloud, s,
-                        kin=getattr(self, '_kin', None),
-                        depth_m=engine.range_m,
-                        u_aim=u_aim,
-                        v_aim=v_aim,
-                        aim_v_offset_px=engine._aim_v_now,
-                    )
-                except Exception as e:
-                    logger.debug("[rerun] log error: %s", e)
-
-            if s in (self._DONE, self._FAILED):
-                break
-
-            time.sleep(dt)
-
-        self.final_state = self.state
-        if self.on_state_change:
-            self.on_state_change(self.final_state)
-        self._note(f"finished: {self.final_state}")
 
     def _teardown(self) -> None:
         arm = self._arm
-        if arm is None:
-            return
-        try:
-            if USE_MOCK:
-                pass
-            else:
-                arm.disconnect()
-        except Exception:
-            pass
         self._arm = None
+        if arm is not None and not USE_MOCK:
+            try:
+                arm.disconnect()
+            except Exception:
+                pass
 
     @staticmethod
     def _auto_detect_port() -> str:
@@ -294,9 +347,7 @@ class _GazeRunner:
             cands = sorted(_glob.glob(pat))
             if cands:
                 return cands[0]
-        raise RuntimeError(
-            "No serial port found for SO-101. Set ROBOT_PORT=/dev/ttyACMx"
-        )
+        raise RuntimeError("No serial port found for SO-101. Set ROBOT_PORT=/dev/ttyACMx")
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +356,10 @@ class _GazeRunner:
 
 async def _stream_robot_camera(
     room: rtc.Room,
-    runner_ref: list[_GazeRunner | None],
+    gaze: "_PersistentGaze",
     fps: int = 15,
 ) -> None:
-    """Continuously publish the robot's OAK-D left frame as a LiveKit video track.
-
-    Reads frames directly from the arm that the current GazeRunner holds.
-    Falls back to a black 640×400 frame when the arm is idle.
-    """
+    """Publish the robot's camera as a LiveKit video track. Reads from the persistent arm."""
     import numpy as np
     import cv2
 
@@ -323,35 +370,31 @@ async def _stream_robot_camera(
     await room.local_participant.publish_track(track, opts)
     logger.info("[robot-cam] published robot-eye video track")
 
-    blank = np.zeros((H, W, 4), dtype=np.uint8)  # RGBA black
-
+    blank    = np.zeros((H, W, 4), dtype=np.uint8)
     interval = 1.0 / fps
+
     while True:
         try:
-            runner = runner_ref[0]
             frame_bgr = None
-            if runner is not None and not USE_MOCK:
-                arm = runner._arm
-                if arm is not None:
-                    try:
-                        frame_bgr = arm.latest_left_bgr()
-                    except Exception:
-                        pass
+            arm = gaze._arm
+            if arm is not None and not USE_MOCK:
+                try:
+                    frame_bgr = arm.latest_left_bgr()
+                except Exception:
+                    pass
 
             if frame_bgr is not None:
-                frame_resized = cv2.resize(frame_bgr, (W, H))
-                rgba = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGBA)
+                rgba = cv2.cvtColor(cv2.resize(frame_bgr, (W, H)), cv2.COLOR_BGR2RGBA)
             else:
                 rgba = blank
 
-            vf = rtc.VideoFrame(
+            source.capture_frame(rtc.VideoFrame(
                 width=W, height=H,
                 type=rtc.VideoBufferType.RGBA,
                 data=rgba.tobytes(),
-            )
-            source.capture_frame(vf)
+            ))
         except Exception as exc:
-            logger.debug("[robot-cam] frame error: %s", exc)
+            logger.debug("[robot-cam] %s", exc)
 
         await asyncio.sleep(interval)
 
@@ -365,94 +408,61 @@ class GazeRobotAgent(Agent):
 
     def __init__(self, room: rtc.Room) -> None:
         super().__init__(instructions=PERSONA)
-        self._room       = room
-        self._runner: _GazeRunner | None = None
-        self._runner_ref: list[_GazeRunner | None] = [None]  # shared with camera streamer
-        self._executor   = None   # ThreadPoolExecutor set in on_session_start
+        self._room  = room
+        self._gaze  = _PersistentGaze()   # initialized once, never torn down per-query
 
     # ---- lifecycle ------------------------------------------------------
 
     async def on_enter(self) -> None:
-        import concurrent.futures
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gaze")
-        # Camera stream started later (after room connects) via start_camera_stream()
-        logger.info("[GazeRobotAgent] entered")
+        loop = asyncio.get_running_loop()
+
+        def on_state(state: str):
+            loop.call_soon_threadsafe(
+                lambda s=state: asyncio.ensure_future(
+                    _broadcast(self._room, {"type": "state", "state": s})
+                )
+            )
+
+        self._gaze.on_state_change = on_state
+        self._gaze.start()   # launches background thread; arm init happens there
+        logger.info("[GazeRobotAgent] persistent gaze engine started")
 
     def start_camera_stream(self) -> None:
-        asyncio.create_task(_stream_robot_camera(self._room, self._runner_ref))
+        asyncio.create_task(_stream_robot_camera(self._room, self._gaze))
 
     # ---- function tools -------------------------------------------------
 
     @function_tool()
-    async def gaze_robot(
-        self,
-        context: RunContext,
-        query: str,
-        approach: str = GAZE_APPROACH,
-    ) -> str:
+    async def gaze_robot(self, context: RunContext, query: str) -> str:
         """Command the SO-101 arm to find and grasp the named object.
 
-        Starts the gaze engine in the background and returns immediately.
-        The arm will search, approach, and grasp autonomously.
+        The gaze engine is always running in the background — this just
+        gives it a new target. No reload delay.
 
         Args:
             query: Natural-language object description, e.g. "red cube" or "blue block".
-            approach: How the gripper comes in — "angled" (default), "topdown", or "horizontal".
         """
-        if self._runner is not None and self._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-            return (
-                f"Arm is already running (state={self._runner.state}, query={self._runner.query!r}). "
-                "Call stop_robot first."
-            )
-
-        runner = _GazeRunner(query=query, approach_style=approach)
-        self._runner             = runner
-        self._runner_ref[0]      = runner
-
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(self._executor, runner.run_until_done)
-
-        return (
-            f"Gaze engine started — searching for {query!r} "
-            f"(approach={approach}). Call robot_status() to check progress."
-        )
+        ok = self._gaze.pick(query)
+        if not ok:
+            return f"Arm is busy (state={self._gaze.state}). Say stop first."
+        return f"Searching for {query!r}. Call robot_status() to track progress."
 
     @function_tool()
     async def stop_robot(self, context: RunContext) -> str:
-        """Stop the robot arm immediately and cancel the current gaze task."""
-        if self._runner is None:
-            return "Robot is already idle."
-        self._runner.stop()
-        state = self._runner.state
-        self._runner         = None
-        self._runner_ref[0]  = None
-        return f"Stop signal sent (was in state={state})."
+        """Stop the current gaze task. Arm stays connected and ready."""
+        self._gaze.stop_task()
+        return f"Stop sent (state was {self._gaze.state})."
 
     @function_tool()
     async def robot_status(self, context: RunContext) -> str:
-        """Return the current state of the gaze engine and recent log messages."""
-        if self._runner is None:
-            return "Robot is idle (no active task)."
-        r = self._runner
-        recent = "\n".join(r.log[-5:]) if r.log else "(no log yet)"
-        return (
-            f"Query: {r.query!r}\n"
-            f"State: {r.state}\n"
-            f"Final: {r.final_state or 'running'}\n"
-            f"Recent log:\n{recent}"
-        )
+        """Return the current gaze engine state and recent log."""
+        g = self._gaze
+        recent = "\n".join(g.log[-5:]) if g.log else "(no log yet)"
+        return f"Query: {g.query!r}\nState: {g.state}\nFinal: {g.final_state or 'running'}\n{recent}"
 
     @function_tool()
     async def look(self, context: RunContext, question: str = "What do you see?") -> str:
-        """Look through the robot's camera and answer a question about the scene.
-
-        Captures the current robot camera frame and asks Gemini Flash to describe it.
-        Use this when the user asks what the robot sees, what's on the table, where
-        an object is, or any question about the robot's point of view.
-
-        Args:
-            question: The question to answer about the robot's view.
-        """
+        """Look through the robot's camera and answer a question about the scene."""
         return await _look(self, question)
 
 
@@ -464,14 +474,14 @@ async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> 
     import cv2
 
     frame_bgr = None
-    runner = agent._runner
-    if runner is not None and runner._arm is not None:
+    arm = agent._gaze._arm
+    if arm is not None:
         try:
             if USE_MOCK:
-                obs = runner._arm.get_observation()
+                obs = arm.get_observation()
                 frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
             else:
-                frame_bgr = runner._arm.latest_left_bgr()
+                frame_bgr = arm.latest_left_bgr()
         except Exception:
             pass
 
@@ -484,7 +494,7 @@ async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> 
             return f"Could not capture frame: {e}"
 
     if frame_bgr is None:
-        return "Robot camera not active."
+        return "Robot camera not active — arm may still be initializing."
 
     _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     try:
@@ -578,22 +588,14 @@ async def _dispatch_text(
 
     # ── STOP ──
     if words & _STOP_WORDS:
-        if agent._runner:
-            agent._runner.stop()
-            agent._runner = None
-            agent._runner_ref[0] = None
-            await _say(session, room, "Stopping the arm.")
-        else:
-            await _say(session, room, "Arm is already idle.")
+        agent._gaze.stop_task()
+        await _say(session, room, "Stopping the arm.")
         return
 
     # ── STATUS ──
     if words & _STATUS_WORDS:
-        if agent._runner:
-            r = agent._runner
-            msg = f"State is {r.state}, query is {r.query}."
-        else:
-            msg = "Arm is idle, no active task."
+        g = agent._gaze
+        msg = f"State is {g.state}" + (f", query is {g.query!r}." if g.query else ".")
         await _say(session, room, msg)
         return
 
@@ -616,31 +618,13 @@ async def _dispatch_text(
     if not query or query == text.lower():
         query = text
 
-    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-        await _say(session, room, f"Already running — state is {agent._runner.state}. Say stop first.")
+    logger.info("[dispatch] gaze_robot query=%r", query)
+    ok = agent._gaze.pick(query)
+    if not ok:
+        await _say(session, room, f"Already busy (state={agent._gaze.state}). Say stop first.")
         return
 
-    logger.info("[dispatch] gaze_robot query=%r", query)
-    await _broadcast(room, {"type": "log", "text": f"Gaze engine starting: {query!r}"})
-    await _broadcast(room, {"type": "state", "state": "SEARCH"})
-
-    loop = asyncio.get_running_loop()
-
-    def on_state(state: str):
-        loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_broadcast(room, {"type": "state", "state": state}))
-        )
-
-    # Start gaze engine FIRST, then speak (so a crash in say() doesn't abort the engine)
-    runner = _GazeRunner(query=query, on_state_change=on_state)
-    agent._runner        = runner
-    agent._runner_ref[0] = runner
-
-    import concurrent.futures
-    executor = agent._executor or concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    agent._executor = executor
-    loop.run_in_executor(executor, runner.run_until_done)
-
+    await _broadcast(room, {"type": "log", "text": f"Gaze engine: {query!r}"})
     await _say(session, room, f"On it. Searching for {query}.")
 
 
