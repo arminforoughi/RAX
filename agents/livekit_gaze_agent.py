@@ -68,22 +68,23 @@ USE_RERUN        = os.environ.get("ROBOT_RERUN", "1").strip() in ("1", "true", "
 
 PERSONA = """You are a gaze-controlled robot arm assistant at the AI Engineer World's Fair Hackathon 2026.
 
-You see through the user's webcam. When they look at or describe an object on the table
-in front of the robot arm, you can command the arm to pick it up.
+You see through the user's webcam AND can look through the robot's own camera on demand.
+When the user asks what the robot sees, what's on the table, or where an object is — call look().
 
 Your tools:
+- look: capture the robot's camera and answer a question about what it sees.
 - gaze_robot: command the SO-101 arm to find and grasp a named object.
 - stop_robot: immediately stop the arm.
 - robot_status: ask what the arm is currently doing.
 
 Workflow:
-1. Watch the user's camera. If they point at or describe an object, ask to confirm.
-2. Call gaze_robot with the object name (e.g. "red cube", "blue block").
+1. If the user asks what you see → call look("what do you see?").
+2. If they describe or point at an object → confirm, then call gaze_robot("object name").
 3. Narrate the robot state as it searches → approaches → grasps.
-4. Celebrate when it succeeds or diagnose and retry if it fails.
+4. Celebrate success or diagnose failure.
 
 Keep responses short and energetic — this is a live hackathon demo.
-Never invent visual details you cannot actually see."""
+Never invent visual details you cannot actually see — use look() to check."""
 
 # ---------------------------------------------------------------------------
 # GazeRunner — manages GazeEngine in a background thread
@@ -414,6 +415,72 @@ class GazeRobotAgent(Agent):
             f"Recent log:\n{recent}"
         )
 
+    @function_tool()
+    async def look(self, context: RunContext, question: str = "What do you see?") -> str:
+        """Look through the robot's camera and answer a question about the scene.
+
+        Captures the current robot camera frame and asks Gemini Flash to describe it.
+        Use this when the user asks what the robot sees, what's on the table, where
+        an object is, or any question about the robot's point of view.
+
+        Args:
+            question: The question to answer about the robot's view.
+        """
+        import cv2
+        import base64
+        import numpy as np
+
+        # Grab a frame from the active runner or directly from mock arm
+        frame_bgr = None
+        runner = self._runner
+        if runner is not None and runner._arm is not None:
+            try:
+                if USE_MOCK:
+                    obs = runner._arm.get_observation()
+                    frame_bgr = obs.left
+                    if frame_bgr.shape[2] == 3:
+                        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)
+                else:
+                    frame_bgr = runner._arm.latest_left_bgr()
+            except Exception:
+                pass
+
+        if frame_bgr is None:
+            # Spin up a fresh mock arm just to get a frame
+            if USE_MOCK:
+                try:
+                    from manipulation.arms.mock_arm import MockArm
+                    _tmp = MockArm()
+                    obs = _tmp.get_observation()
+                    frame_bgr = obs.left
+                    if frame_bgr.ndim == 3 and frame_bgr.shape[2] == 3:
+                        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    return f"Could not capture robot camera frame: {e}"
+            else:
+                return "Robot camera not active — start the arm first or use ROBOT_MOCK=1."
+
+        # Encode as JPEG for the vision model
+        _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        b64 = base64.b64encode(buf.tobytes()).decode()
+
+        # Ask Gemini Flash to describe the scene
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+            client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+            resp = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-2.0-flash",
+                contents=[
+                    genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
+                    question,
+                ],
+            )
+            return resp.text.strip()
+        except Exception as e:
+            return f"Vision query failed: {e}"
+
 
 # ---------------------------------------------------------------------------
 # LiveKit session wiring
@@ -445,7 +512,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     await session.start(room=ctx.room, agent=robot_agent)
     await ctx.connect()
 
-    # Listen for text commands from the browser demo UI
+    # Listen for text messages from the browser demo UI
     @ctx.room.on("data_received")
     def on_data(payload: bytes, participant, kind, topic):
         try:
@@ -454,12 +521,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             return
         if msg.get("type") != "command":
             return
-        query = msg.get("text", "").strip()
-        if not query:
+        text = msg.get("text", "").strip()
+        if not text:
             return
-        logger.info("[entrypoint] text command: %r", query)
-        # Schedule gaze_robot on the event loop
-        asyncio.get_event_loop().create_task(_handle_text_command(robot_agent, ctx.room, query))
+        logger.info("[entrypoint] browser text: %r", text)
+        # Route to Gemini as a user turn — it decides whether to call a tool or just answer
+        asyncio.get_event_loop().create_task(
+            session.generate_reply(user_input=text)
+        )
 
     try:
         arm_desc = "mock arm (ROBOT_MOCK=1)" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
@@ -473,28 +542,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         logger.warning("[entrypoint] greeting failed: %s", exc)
 
 
-async def _handle_text_command(agent: "GazeRobotAgent", room: rtc.Room, query: str) -> None:
-    """Route a browser text command directly to the gaze engine."""
-    if agent._runner is not None and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-        msg = json.dumps({"type": "log", "text": f"Already running: {agent._runner.state}. Say stop first."}).encode()
-        await room.local_participant.publish_data(msg, reliable=True)
-        return
-
-    def on_state(state: str):
-        asyncio.get_event_loop().call_soon_threadsafe(
-            asyncio.get_event_loop().create_task,
-            _broadcast_state(room, state),
-        )
-
-    runner = _GazeRunner(query=query, on_state_change=on_state)
-    agent._runner            = runner
-    agent._runner_ref[0]     = runner
-
-    msg = json.dumps({"type": "log", "text": f"Starting gaze engine for: {query!r}"}).encode()
-    await room.local_participant.publish_data(msg, reliable=True)
-
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(agent._executor, runner.run_until_done)
 
 
 if __name__ == "__main__":
