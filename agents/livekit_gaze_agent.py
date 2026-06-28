@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-2.0-flash-live-001"
+REALTIME_MODEL   = "gemini-3.1-flash-live-preview"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
 GRIPPER_CAM_TF   = os.environ.get("GRIPPER_CAM_TF", "0.04,0,0.09,-0.2690,0.2824,-1.6014")
@@ -193,13 +193,27 @@ class _GazeRunner:
         stream = PointCloudStream()
         cloud  = CloudTracker(
             detector, mask_tracker, stereo, self.query,
-            detect_every=5, stream=stream,
+            detect_every=1,   # detect every tick (lerobot config: detect_every_n_ticks=1)
+            stream=stream,
         )
 
         cfg = GazeConfig(
             T_ee_cam=T_ee_cam,
             world_up=world_up,
             approach_style=self.approach_style,
+            # --- from lerobot/configs/gaze_engine_zmq.yaml ---
+            gaze_kp_pan=0.4,
+            gaze_kp_tilt=0.5,
+            approach_kp=1.8,
+            max_lin_vel_m_s=0.14,
+            max_joint_step_deg=7.0,
+            center_tol_px=80.0,
+            search_yaw_amp_deg=28.0,
+            search_period_s=12.0,
+            search_timeout_s=60.0,
+            pregrasp_standoff_m=0.10,
+            approach_close_m=0.125,
+            approach_close_step_m=0.010,
         )
         self._cloud  = cloud
         self._engine = GazeEngine(
@@ -522,6 +536,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice="Aoede",
+            api_version="v1alpha",
         ),
     )
 
