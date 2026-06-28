@@ -29,6 +29,7 @@ Run::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -63,25 +64,27 @@ GAZE_APPROACH    = os.environ.get("GAZE_APPROACH", "angled")
 GAZE_DETECTOR    = os.environ.get("GAZE_DETECTOR", "auto")
 GAZE_STEREO      = os.environ.get("GAZE_STEREO", "sgbm")
 USE_MOCK         = os.environ.get("ROBOT_MOCK", "0").strip() in ("1", "true", "yes")
+USE_RERUN        = os.environ.get("ROBOT_RERUN", "1").strip() in ("1", "true", "yes")
 
 PERSONA = """You are a gaze-controlled robot arm assistant at the AI Engineer World's Fair Hackathon 2026.
 
-You see through the user's webcam. When they look at or describe an object on the table
-in front of the robot arm, you can command the arm to pick it up.
+You see through the user's webcam AND can look through the robot's own camera on demand.
+When the user asks what the robot sees, what's on the table, or where an object is — call look().
 
 Your tools:
+- look: capture the robot's camera and answer a question about what it sees.
 - gaze_robot: command the SO-101 arm to find and grasp a named object.
 - stop_robot: immediately stop the arm.
 - robot_status: ask what the arm is currently doing.
 
 Workflow:
-1. Watch the user's camera. If they point at or describe an object, ask to confirm.
-2. Call gaze_robot with the object name (e.g. "red cube", "blue block").
+1. If the user asks what you see → call look("what do you see?").
+2. If they describe or point at an object → confirm, then call gaze_robot("object name").
 3. Narrate the robot state as it searches → approaches → grasps.
-4. Celebrate when it succeeds or diagnose and retry if it fails.
+4. Celebrate success or diagnose failure.
 
 Keep responses short and energetic — this is a live hackathon demo.
-Never invent visual details you cannot actually see."""
+Never invent visual details you cannot actually see — use look() to check."""
 
 # ---------------------------------------------------------------------------
 # GazeRunner — manages GazeEngine in a background thread
@@ -99,11 +102,13 @@ class _GazeRunner:
         approach_style: str = GAZE_APPROACH,
         max_ticks: int = 600,
         loop_hz: float = 20.0,
+        on_state_change: "callable | None" = None,
     ) -> None:
         self.query          = query
         self.approach_style = approach_style
         self.max_ticks      = max_ticks
         self.loop_hz        = loop_hz
+        self.on_state_change = on_state_change  # called(state) on each transition
 
         self.state       = "INIT"
         self.final_state: str | None = None
@@ -111,6 +116,7 @@ class _GazeRunner:
 
         self._stop = threading.Event()
         self._arm  = None   # set inside the thread
+        self._viz  = None   # RerunViz if available
 
     # -- public API -------------------------------------------------------
 
@@ -144,6 +150,9 @@ class _GazeRunner:
         from models.detection import make_detector, make_mask_tracker
         from perception.depth_cloud import CloudTracker, PointCloudStream
         from manipulation.arms.gaze_engine import GazeConfig, GazeEngine, DONE, FAILED
+        if USE_RERUN:
+            from perception.depth_cloud.rerun_viz import RerunViz
+            self._viz = RerunViz.try_create(session="rax_gaze_agent", spawn=True)
 
         self._note(f"opening arm  mock={USE_MOCK}  query={self.query!r}")
 
@@ -192,6 +201,7 @@ class _GazeRunner:
             world_up=world_up,
             approach_style=self.approach_style,
         )
+        self._cloud  = cloud
         self._engine = GazeEngine(
             self._arm, kin, cloud, cfg,
             cartesian=USE_MOCK,
@@ -207,6 +217,8 @@ class _GazeRunner:
             if self._stop.is_set():
                 self._note("stopped by user")
                 self.final_state = "STOPPED"
+                if self.on_state_change:
+                    self.on_state_change("STOPPED")
                 return
 
             prev = self.state
@@ -215,6 +227,18 @@ class _GazeRunner:
 
             if s != prev:
                 self._note(f"→ {s}")
+                if self.on_state_change:
+                    self.on_state_change(s)
+
+            # Stream to Rerun viewer
+            if self._viz is not None:
+                try:
+                    obs   = self._arm.get_observation()
+                    u_aim = getattr(engine, '_u_aim', None)
+                    v_aim = getattr(engine, '_v_aim', None)
+                    self._viz.log(obs, self._cloud, state=s, u_aim=u_aim, v_aim=v_aim)
+                except Exception:
+                    pass
 
             if s in (self._DONE, self._FAILED):
                 break
@@ -222,6 +246,8 @@ class _GazeRunner:
             time.sleep(dt)
 
         self.final_state = self.state
+        if self.on_state_change:
+            self.on_state_change(self.final_state)
         self._note(f"finished: {self.final_state}")
 
     def _teardown(self) -> None:
@@ -389,6 +415,67 @@ class GazeRobotAgent(Agent):
             f"Recent log:\n{recent}"
         )
 
+    @function_tool()
+    async def look(self, context: RunContext, question: str = "What do you see?") -> str:
+        """Look through the robot's camera and answer a question about the scene.
+
+        Captures the current robot camera frame and asks Gemini Flash to describe it.
+        Use this when the user asks what the robot sees, what's on the table, where
+        an object is, or any question about the robot's point of view.
+
+        Args:
+            question: The question to answer about the robot's view.
+        """
+        return await _look(self, question)
+
+
+# ---------------------------------------------------------------------------
+# Shared look() implementation (used by function tool AND direct text dispatch)
+# ---------------------------------------------------------------------------
+
+async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> str:
+    import cv2
+
+    frame_bgr = None
+    runner = agent._runner
+    if runner is not None and runner._arm is not None:
+        try:
+            if USE_MOCK:
+                obs = runner._arm.get_observation()
+                frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = runner._arm.latest_left_bgr()
+        except Exception:
+            pass
+
+    if frame_bgr is None and USE_MOCK:
+        try:
+            from manipulation.arms.mock_arm import MockArm
+            obs = MockArm().get_observation()
+            frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            return f"Could not capture frame: {e}"
+
+    if frame_bgr is None:
+        return "Robot camera not active."
+
+    _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash",
+            contents=[
+                genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
+                question,
+            ],
+        )
+        return resp.text.strip()
+    except Exception as e:
+        return f"Vision query failed: {e}"
+
 
 # ---------------------------------------------------------------------------
 # LiveKit session wiring
@@ -397,31 +484,154 @@ class GazeRobotAgent(Agent):
 server = AgentServer()
 
 
+async def _broadcast_state(room: rtc.Room, state: str) -> None:
+    """Push arm state to all browser participants as a JSON data message."""
+    try:
+        payload = json.dumps({"type": "state", "state": state}).encode()
+        await room.local_participant.publish_data(payload, reliable=True)
+    except Exception:
+        pass
+
+
 @server.rtc_session(agent_name="rax-gaze-agent")
 async def entrypoint(ctx: agents.JobContext) -> None:
+    logger.info("[entrypoint] job received, connecting…")
+    await ctx.connect()
+    logger.info("[entrypoint] connected to room: %s", ctx.room.name)
+
+    robot_agent = GazeRobotAgent(room=ctx.room)
+
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice="Aoede",
         ),
     )
+    await session.start(room=ctx.room, agent=robot_agent)
+    logger.info("[entrypoint] session started")
 
-    await session.start(
-        room=ctx.room,
-        agent=GazeRobotAgent(room=ctx.room),
-    )
-    await ctx.connect()
+    loop = asyncio.get_running_loop()
 
+    # ----------------------------------------------------------------
+    # Text commands from the browser demo UI
+    # ----------------------------------------------------------------
+    # Realtime (audio) models don't accept text injection via generate_reply,
+    # so we parse intent directly and dispatch to the arm + session.say().
+    # ----------------------------------------------------------------
+    @ctx.room.on("data_received")
+    def on_data(packet: rtc.DataPacket):
+        try:
+            raw = packet.data.decode()
+            msg = json.loads(raw)
+        except Exception:
+            return
+        if msg.get("type") != "command":
+            return
+        text = msg.get("text", "").strip()
+        if not text:
+            return
+        logger.info("[entrypoint] text command: %r", text)
+        loop.create_task(_dispatch_text(robot_agent, session, ctx.room, text))
+
+    # Greet on startup
     try:
-        arm_desc = "mock arm (ROBOT_MOCK=1)" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
-        await session.generate_reply(
-            instructions=(
-                f"Greet the user. Tell them you control a robot arm ({arm_desc}) "
-                "and can pick up objects they describe. Ask what they'd like you to grab."
-            )
+        arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
+        await session.say(
+            f"RAX gaze robot online. Running {arm_desc}. "
+            "Tell me what to pick up, or ask what I see."
         )
     except Exception as exc:
         logger.warning("[entrypoint] greeting failed: %s", exc)
+
+
+_PICK_WORDS  = {"pick", "grab", "get", "take", "grasp", "fetch", "lift"}
+_LOOK_WORDS  = {"see", "look", "what", "describe", "show", "view", "scene", "there", "visible"}
+_STOP_WORDS  = {"stop", "halt", "cancel", "freeze", "abort"}
+_STATUS_WORDS = {"status", "state", "doing", "happening", "progress"}
+
+
+async def _dispatch_text(
+    agent: "GazeRobotAgent",
+    session: "AgentSession",
+    room: rtc.Room,
+    text: str,
+) -> None:
+    """Parse a browser text command and dispatch to gaze engine or look()."""
+    words = set(text.lower().split())
+
+    # ── STOP ──
+    if words & _STOP_WORDS:
+        if agent._runner:
+            agent._runner.stop()
+            agent._runner = None
+            agent._runner_ref[0] = None
+            await session.say("Stopping the arm.")
+        else:
+            await session.say("Arm is already idle.")
+        return
+
+    # ── STATUS ──
+    if words & _STATUS_WORDS:
+        if agent._runner:
+            r = agent._runner
+            msg = f"State is {r.state}, query is {r.query}."
+        else:
+            msg = "Arm is idle, no active task."
+        await session.say(msg)
+        return
+
+    # ── LOOK / DESCRIBE ──
+    if words & _LOOK_WORDS and not (words & _PICK_WORDS):
+        await _broadcast(room, {"type": "log", "text": f"Looking… ({text})"})
+        result = await _look(agent, text)
+        await session.say(result)
+        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:120]}"})
+        return
+
+    # ── PICK UP / GRASP ──
+    # Extract object name: everything after pick/grab/get/… keyword
+    query = text
+    for w in sorted(_PICK_WORDS, key=len, reverse=True):
+        for phrase in (f"{w} up the ", f"{w} up a ", f"{w} up ", f"{w} the ", f"{w} a ", f"{w} "):
+            if phrase in text.lower():
+                query = text.lower().split(phrase, 1)[-1].strip()
+                break
+
+    if not query or query == text.lower():
+        # no keyword — treat whole input as the object description
+        query = text
+
+    logger.info("[dispatch] gaze_robot query=%r", query)
+    await _broadcast(room, {"type": "log", "text": f"Gaze engine starting: {query!r}"})
+    await _broadcast(room, {"type": "state", "state": "SEARCH"})
+
+    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
+        await session.say(f"Already running — state is {agent._runner.state}. Say stop first.")
+        return
+
+    await session.say(f"On it. Searching for {query}.")
+
+    def on_state(state: str):
+        asyncio.get_running_loop().call_soon_threadsafe(
+            lambda: asyncio.ensure_future(_broadcast(room, {"type": "state", "state": state}))
+        )
+
+    runner = _GazeRunner(query=query, on_state_change=on_state)
+    agent._runner        = runner
+    agent._runner_ref[0] = runner
+
+    executor = agent._executor or __import__('concurrent.futures').futures.ThreadPoolExecutor(1)
+    agent._executor = executor
+    asyncio.get_running_loop().run_in_executor(executor, runner.run_until_done)
+
+
+async def _broadcast(room: rtc.Room, msg: dict) -> None:
+    try:
+        await room.local_participant.publish_data(json.dumps(msg).encode(), reliable=True)
+    except Exception as e:
+        logger.debug("[broadcast] %s", e)
+
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAX — Gaze Robot Demo</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d0d0d; color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header {
+    padding: 10px 20px; background: #111;
+    border-bottom: 1px solid #222;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 15px; color: #fff; letter-spacing: 1px; }
+  #status {
+    font-size: 11px; padding: 3px 8px; border-radius: 4px;
+    background: #222; color: #888;
+  }
+  #status.connected { background: #1a3a1a; color: #4caf50; }
+  #status.error { background: #3a1a1a; color: #f44; }
+
+  main {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    flex: 1; overflow: hidden;
+  }
+
+  /* ── Video panel ── */
+  #video-panel {
+    position: relative; background: #000;
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    overflow: hidden;
+  }
+  .cam-slot {
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    border-bottom: 1px solid #111;
+    overflow: hidden;
+  }
+  .cam-slot:last-child { border-bottom: none; }
+  .cam-label {
+    position: absolute; top: 6px; left: 8px;
+    background: rgba(0,0,0,0.6); color: #888;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    letter-spacing: 0.5px; text-transform: uppercase;
+  }
+  #robot-eye, #top-view {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+  }
+  .no-cam {
+    color: #2a2a2a; font-size: 12px; text-align: center;
+  }
+  #arm-state {
+    position: absolute; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.7); border: 1px solid #333;
+    padding: 4px 10px; border-radius: 5px;
+    font-size: 12px; color: #4caf50; letter-spacing: 1px;
+    z-index: 10;
+  }
+
+  /* ── Side panel ── */
+  #side {
+    border-left: 1px solid #1e1e1e;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* audio */
+  #audio-container { display: none; }
+
+  /* log */
+  #log {
+    flex: 1; overflow-y: auto; padding: 10px 12px;
+    font-size: 11px; line-height: 1.7; color: #666;
+  }
+  #log .msg-agent { color: #4caf50; }
+  #log .msg-user  { color: #64b5f6; }
+  #log .msg-sys   { color: #555; font-style: italic; }
+  #log .msg-state { color: #ff9800; }
+
+  /* transcript */
+  #transcript-area {
+    border-top: 1px solid #1e1e1e;
+    padding: 8px 12px;
+    font-size: 11px; color: #555; min-height: 36px;
+    font-style: italic;
+  }
+
+  /* input */
+  #input-area {
+    border-top: 1px solid #1e1e1e;
+    padding: 10px 12px;
+    display: flex; gap: 8px;
+  }
+  #cmd {
+    flex: 1;
+    background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px;
+    color: #e0e0e0; padding: 8px 12px; font-size: 13px;
+    font-family: inherit; outline: none;
+  }
+  #cmd:focus { border-color: #4caf50; }
+  #cmd::placeholder { color: #444; }
+  #send-btn {
+    background: #1b4d2e; border: 1px solid #2a6b3e;
+    color: #4caf50; padding: 8px 14px; border-radius: 6px;
+    cursor: pointer; font-size: 13px; font-family: inherit;
+    white-space: nowrap;
+  }
+  #send-btn:hover { background: #1f5c36; }
+  #send-btn:disabled { opacity: 0.4; cursor: default; }
+
+  /* connect button */
+  #connect-btn {
+    background: #1b2d4d; border: 1px solid #2a4a7a;
+    color: #64b5f6; padding: 3px 10px; border-radius: 4px;
+    cursor: pointer; font-size: 11px; font-family: inherit;
+  }
+  #connect-btn:hover { background: #1f3a6b; }
+  #connect-btn:disabled { opacity: 0.4; cursor: default; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>RAX · Gaze Robot</h1>
+  <span id="status">disconnected</span>
+  <button id="connect-btn" onclick="connect()">Connect</button>
+</header>
+
+<main>
+  <div id="video-panel">
+    <!-- Top row: robot eye-in-hand camera (OAK-D / LiveKit track) -->
+    <div class="cam-slot" id="eye-slot">
+      <span class="cam-label">robot eye</span>
+      <div class="no-cam" id="no-eye">
+        connects when arm is active
+      </div>
+      <video id="robot-eye" autoplay playsinline muted style="display:none"></video>
+    </div>
+
+    <!-- Bottom row: top-view overhead camera (MJPEG from localhost:5000) -->
+    <div class="cam-slot" id="top-slot">
+      <span class="cam-label">top view</span>
+      <img id="top-view"
+           src="http://localhost:5000/view/0"
+           onerror="this.style.display='none'; document.getElementById('no-top').style.display='flex';"
+           onload="document.getElementById('no-top').style.display='none';">
+      <div class="no-cam" id="no-top" style="display:none">
+        top camera offline<br>
+        <span style="font-size:10px;color:#222">localhost:5000/view/0</span>
+      </div>
+    </div>
+
+    <div id="arm-state" style="display:none">IDLE</div>
+  </div>
+
+  <div id="audio-container"></div>
+
+  <div id="side">
+    <div id="log"></div>
+    <div id="transcript-area" id="transcript"></div>
+    <div id="input-area">
+      <input id="cmd" type="text" placeholder='pick up the red cube…' disabled
+             onkeydown="if(event.key==='Enter') sendCmd()">
+      <button id="send-btn" onclick="sendCmd()" disabled>Send</button>
+    </div>
+  </div>
+</main>
+
+<script>
+const { Room, RoomEvent, Track, DataPacket_Kind } = LivekitClient;
+
+let room = null;
+let connected = false;
+
+function log(text, cls='msg-sys') {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = cls;
+  const ts = new Date().toLocaleTimeString('en', {hour12:false});
+  d.textContent = `[${ts}] ${text}`;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, cls='') {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = cls;
+}
+
+async function connect() {
+  const btn = document.getElementById('connect-btn');
+  btn.disabled = true;
+  setStatus('connecting…');
+  log('fetching token from demo_server.py…');
+
+  let token, url, roomName;
+  try {
+    const res = await fetch('/token');
+    const data = await res.json();
+    token = data.token; url = data.url; roomName = data.room;
+  } catch(e) {
+    setStatus('token error', 'error');
+    log('Could not fetch token — is demo_server.py running? ' + e, 'msg-sys');
+    btn.disabled = false;
+    return;
+  }
+
+  room = new Room({
+    adaptiveStream: true,
+    dynacast: true,
+    videoCaptureDefaults: { resolution: { width: 640, height: 480 } },
+  });
+
+  room.on(RoomEvent.Connected, () => {
+    connected = true;
+    setStatus('connected', 'connected');
+    log(`joined room: ${roomName}`, 'msg-sys');
+    document.getElementById('cmd').disabled = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('cmd').focus();
+  });
+
+  room.on(RoomEvent.Disconnected, () => {
+    connected = false;
+    setStatus('disconnected', '');
+    log('disconnected', 'msg-sys');
+    document.getElementById('cmd').disabled = true;
+    document.getElementById('send-btn').disabled = true;
+    btn.disabled = false;
+    hideVideo();
+  });
+
+  room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+    if (track.kind === Track.Kind.Video && pub.trackName === 'robot-eye') {
+      log('robot-eye camera connected', 'msg-sys');
+      const video = document.getElementById('robot-eye');
+      track.attach(video);
+      video.style.display = 'block';
+      document.getElementById('no-eye').style.display = 'none';
+      document.getElementById('arm-state').style.display = 'block';
+    }
+    if (track.kind === Track.Kind.Audio) {
+      log('agent audio connected — you should hear Gemini', 'msg-sys');
+      const audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.id = 'agent-audio-' + pub.trackSid;
+      document.getElementById('audio-container').appendChild(audio);
+      track.attach(audio);
+    }
+  });
+
+  room.on(RoomEvent.TrackUnsubscribed, (track, pub) => {
+    if (pub.trackName === 'robot-eye') hideVideo();
+    if (track.kind === Track.Kind.Audio) {
+      const el = document.getElementById('agent-audio-' + pub.trackSid);
+      if (el) { track.detach(el); el.remove(); }
+    }
+  });
+
+  // Reload the MJPEG top-view if it drops (mjpeg streams reset on agent restart)
+  setInterval(() => {
+    const img = document.getElementById('top-view');
+    if (img && connected) {
+      const src = img.src.split('?')[0];
+      img.src = src + '?t=' + Date.now();
+    }
+  }, 10000);
+
+  // Receive text messages from the agent
+  room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+    try {
+      const text = new TextDecoder().decode(payload);
+      const msg = JSON.parse(text);
+      if (msg.type === 'state') {
+        document.getElementById('arm-state').textContent = msg.state;
+      } else if (msg.type === 'log') {
+        log(msg.text, 'msg-state');
+      } else if (msg.type === 'reply') {
+        log('Agent: ' + msg.text, 'msg-agent');
+      }
+    } catch(_) {
+      // plain text from agent
+      const text = new TextDecoder().decode(payload);
+      if (text) log('Agent: ' + text, 'msg-agent');
+    }
+  });
+
+  // Transcriptions (Gemini speech → text, and your speech → text)
+  room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+    const t = document.getElementById('transcript-area');
+    const isAgent = !participant?.isLocal;
+    const finals = segments.filter(s => s.final).map(s => s.text).join(' ');
+    if (finals) {
+      t.textContent = '';
+      log((isAgent ? 'Gemini: ' : 'You (voice): ') + finals,
+          isAgent ? 'msg-agent' : 'msg-user');
+    } else {
+      const partial = segments.map(s => s.text).join(' ');
+      t.textContent = (isAgent ? 'Gemini: ' : 'You: ') + partial + '…';
+    }
+  });
+
+  try {
+    await room.connect(url, token);
+  } catch(e) {
+    setStatus('connect failed', 'error');
+    log('Connection failed: ' + e, 'msg-sys');
+    btn.disabled = false;
+  }
+}
+
+async function sendCmd() {
+  const input = document.getElementById('cmd');
+  const text = input.value.trim();
+  if (!text || !connected) return;
+  input.value = '';
+  log('You: ' + text, 'msg-user');
+
+  // Send as text message into the room — agent listens for these
+  try {
+    const enc = new TextEncoder().encode(JSON.stringify({ type: 'command', text }));
+    await room.localParticipant.publishData(enc, { reliable: true });
+  } catch(e) {
+    log('send failed: ' + e, 'msg-sys');
+  }
+}
+
+function hideVideo() {
+  document.getElementById('robot-eye').style.display = 'none';
+  document.getElementById('no-eye').style.display = 'flex';
+  document.getElementById('arm-state').style.display = 'none';
+}
+
+// Auto-connect on load if token endpoint is reachable
+window.addEventListener('load', () => {
+  log('RAX gaze robot demo loaded', 'msg-sys');
+  log('Click Connect to join the LiveKit room', 'msg-sys');
+});
+</script>
+</body>
+</html>
