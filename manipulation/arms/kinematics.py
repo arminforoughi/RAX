@@ -62,7 +62,7 @@ class CartesianKinematics:
     """
 
     joint_names = ["x", "y", "z", "rx", "ry", "rz"]
-    urdf_dir: str | None = None  # no URDF — log_manipulation_sim3d skips mesh loading
+    # no urdf_dir — rerun_viz detects absence and uses fallback line-strip path
 
     def forward_kinematics(self, q_deg: np.ndarray) -> np.ndarray:
         return xyzrpy_to_pose(q_deg)
