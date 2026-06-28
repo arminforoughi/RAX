@@ -32,6 +32,78 @@ ROBOT_MOCK=1 ./run_livekit_gaze.sh dev
 
 **Docs:** [docs/livekit_gaze_agent.md](docs/livekit_gaze_agent.md) · [docs/gemini_livekit.md](docs/gemini_livekit.md) · [docs/manipulation_arms.md](docs/manipulation_arms.md)
 
+---
+
+## How LiveKit and Gemini Work Together
+
+### LiveKit: moving media around
+
+LiveKit is the WebRTC infrastructure layer. It handles real-time transport of audio,
+video, and data between your browser and the Python agent process — NAT traversal,
+track pub/sub, multi-participant rooms. It has no idea what's *in* the media; it just
+delivers it.
+
+```
+Your Browser                     Agent Process (Python)
+────────────────                 ──────────────────────────
+Webcam frames  ──── WebRTC ───►  livekit-agents receives video
+Mic audio      ──── WebRTC ───►  livekit-agents receives audio
+               ◄─── WebRTC ────  Gemini's voice response (audio track)
+               ◄─── WebRTC ────  robot-eye video (OAK-D camera, 15 fps)
+```
+
+### Gemini: understanding and deciding
+
+`livekit-plugins-google` connects LiveKit's media pipeline to the **Gemini Live API** —
+a persistent WebSocket that streams your audio and webcam into Gemini continuously and
+streams spoken audio back out. The `AgentSession` is the glue:
+
+1. Takes incoming audio/video from the LiveKit room
+2. Feeds it into Gemini Live in real time
+3. Runs VAD — detects when you stop talking
+4. When Gemini decides to call a tool → dispatches it to your Python function
+5. Takes Gemini's spoken response → publishes it back into the room as an audio track
+
+### The full flow
+
+```
+You speak: "grab the red cube"
+        │  WebRTC audio
+        ▼
+  LiveKit Cloud room
+        │  livekit-agents subscribes to your audio track
+        ▼
+  AgentSession → Gemini Live API (persistent WebSocket)
+        │  Gemini understands intent → calls tool
+        ▼
+  @function_tool: gaze_robot("red cube")   ← Python, in your process
+        │
+        ▼
+  GazeEngine thread: SEARCH → APPROACH → GRASP
+        │
+        │  Gemini narrates: "Searching for the red cube now..."
+        ▼
+  AgentSession → publishes Gemini audio as LiveKit track
+        │  WebRTC audio
+        ▼
+  Your browser plays it back
+```
+
+The robot's OAK-D camera travels the other direction in parallel — a background async
+task reads frames and publishes them as the `robot-eye` video track so you can watch
+the arm's point of view in the browser while it's working.
+
+### Division of responsibility
+
+| | LiveKit | Gemini |
+|---|---------|--------|
+| Knows about | Rooms, tracks, participants, WebRTC | Language, vision, audio, function calling |
+| Does | Transport, pub/sub, NAT traversal | Reasoning, speech, tool dispatch |
+| Does NOT do | Understand media content | Move media between endpoints |
+
+LiveKit is the **wire**. Gemini is the **brain**. `livekit-agents` is the thin layer
+connecting them — you never manually pipe audio bytes between the two.
+
 ## Documentation
 
 | Doc | Contents |
