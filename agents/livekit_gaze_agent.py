@@ -56,8 +56,7 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-2.5-flash-preview-native-audio-dialog"   # v1alpha
-# Fallback if above 404s: "gemini-2.0-flash-live-001" (v1alpha)
+REALTIME_MODEL   = "gemini-2.5-flash-native-audio-preview-12-2025"  # plugin default
 VISION_MODEL     = "gemini-2.5-flash"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
@@ -547,7 +546,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         llm=google.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice="Aoede",
-            api_version="v1alpha",
         ),
     )
 
