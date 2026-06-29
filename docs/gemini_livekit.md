@@ -2,6 +2,8 @@
 
 How Gemini 3.1 Flash Audio and LiveKit Agents 1.6.4 are wired together in RAX.
 
+![From Vision to Action: Giving Robots General Intelligence with Gemini Live](images/gemini_livekit_overview.png)
+
 ---
 
 ## Stack
