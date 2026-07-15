@@ -14,7 +14,7 @@
 #  * UI: second (room) camera proxied from camserv on :5000; overlays only show
 #    FRESH tracks (age < 0.7 s) so stale boxes don't wander; anchor shown as a
 #    circle.
-import math, os, sys, tempfile, threading, time
+import json, math, os, sys, tempfile, threading, time
 from collections import deque
 
 import cv2
@@ -48,6 +48,21 @@ VIEW = np.array([-6.7, 37.1, 48.1, -40.4, -28.4])
 HOME = np.array([-9.67, -102.022, 98.066, 32.879, 0.0])
 HAND_UV = (440.0, 394.0)   # measured via /caltip against the real black fingertip
 HAND_AREA_MIN = 9000.0
+# MEASURED FROM THE URDF + JAW MESH (2026-07-13), do not guess this:
+#   moving_jaw_so101_v1.stl, expressed in gripper_frame_link coords, spans
+#   X -38.1..-15.8, Y -23.9..+24.1, Z -84.7..+7.3 mm.
+# So the jaws hinge 75-85 mm BEHIND gripper_frame_link and the fingertips reach
+# only +7 mm past it: `gripper_frame_link` IS the fingertip / grasp centre (it is
+# a TCP frame, 98 mm out past gripper_link, the wrist). `kin.forward_kinematics`
+# therefore already returns the FINGERTIP, and `T_ee[:3,3]` is the right thing to
+# gate the approach on. lookat_engine's `gripper_tip_offset_m = 0.10` does NOT
+# transfer to this FK -- applying it pushed the "tip" 10 cm out into empty air
+# (TIP->cube read LARGER than grip->cube, which is what exposed the error).
+GRIP_TIP_OFFSET_M = 0.007
+# The camera sits BEHIND the fingertips on the gripper — measured on the real mount at
+# ~10 cm. The shipped hand-eye TF puts it at 20.2 cm, i.e. wrong by 2x in translation on
+# top of being ~370 px wrong in rotation. Used to seed/bound calibrate_handeye.
+CAM_TIP_M = 0.10
 FINAL_INCH_M = 0.006   # we arrive already touching the cube; don't shove it
 PLACE_DZ = 0.055
 PORT = 8484
@@ -66,13 +81,22 @@ JOINT_RATE_MAX = 35.0     # deg/s per joint hard clamp
 # IK, so it can't swing) then step straight down the line of sight, decreasing
 # the radius, toward the object's back-projected 3D point (radial-to-object —
 # descends ONTO the cube instead of hovering above it).
-Z_TABLE = 0.0             # base-frame height of the cube centre (ray→table locate)
+Z_TABLE = 0.02            # base-frame height of the cube CENTRE. THE sightline is
+                          # intersected with THIS plane to localize the cube, so it
+                          # must match the real cube-centre height. A 3 cm cube on
+                          # the table sits ~1.5–2 cm up; the old 0.05 was ~3 cm too
+                          # high, which put the cube too CLOSE + too HIGH (floating
+                          # inside the robot in the 3D view) and made the grasp
+                          # close ~3 cm ABOVE the cube (contact=False). >>> If the
+                          # grasp stops short/high, raise this a few mm; if it
+                          # drives into the table, lower it. <<<
 TARGET_SIZE_M = 0.03      # cube edge — pinhole range from bbox size (survives close range)
-GAZE_KP_PAN = 0.30        # shoulder_pan P-gain on horizontal pixel error (fraction/tick)
-GAZE_KP_TILT = 0.45       # wrist_flex  P-gain on vertical pixel error
-GAZE_MAX_PAN_DEG = 2.2    # per-tick clamp on the pan gaze step
-GAZE_MAX_TILT_DEG = 3.0   # per-tick clamp on the tilt gaze step
-GAZE_DEADBAND_PX = 10.0   # no gaze correction inside this — kills the limit cycle
+GAZE_KP_PAN = 0.18        # shoulder_pan P-gain on horizontal pixel error (fraction/tick)
+GAZE_KP_TILT = 0.30       # wrist_flex  P-gain on vertical pixel error
+GAZE_MAX_PAN_DEG = 1.3    # per-tick clamp on the pan gaze step (was 2.2 — too whippy)
+GAZE_MAX_TILT_DEG = 2.0   # per-tick clamp on the tilt gaze step
+GAZE_DEADBAND_PX = 18.0   # no gaze correction inside this — kills the limit cycle
+GAZE_LP = 0.6             # low-pass on the pixel error feeding pan/tilt (0=off)
 APPROACH_KP = 0.6         # P-gain on remaining range → forward step
 APPROACH_VMAX = 0.030     # m/s cap on the forward step
 APPROACH_CENTER_PX = 42.0 # only advance while horizontally centred (pan error small)
@@ -296,10 +320,51 @@ def find_green(rgb, T_base_cam=None):
 
 
 # ---------------- robot I/O ----------------
-def publish(rgb):
+def publish(rgb, joints=None):
     img = np.ascontiguousarray(rgb[:, :, ::-1])
     now = time.time()
+    # CYAN CROSS = HAND_UV, the fingertips as MEASURED in the image (/caltip).
     cv2.drawMarker(img, (int(HAND_UV[0]), int(HAND_UV[1])), (60, 200, 255), cv2.MARKER_CROSS, 26, 2)
+    # MAGENTA CIRCLE = the same fingertips as PREDICTED by FK + the hand-eye TF.
+    # These two must land on top of each other (see tip_pixel). The gap between
+    # them IS the hand-eye error, in pixels, live. Run Calib to close it.
+    if joints is not None and kin is not None and fx > 0:
+        try:
+            uv = tip_pixel(joints)
+        except Exception:
+            uv = None
+        if uv is not None:
+            u, v = int(round(uv[0])), int(round(uv[1]))
+            gap = math.hypot(uv[0] - HAND_UV[0], uv[1] - HAND_UV[1])
+            col = (255, 0, 255) if gap > 40 else (0, 255, 0)
+            if -200 < u < img.shape[1] + 200 and -200 < v < img.shape[0] + 200:
+                cv2.circle(img, (u, v), 9, col, 2)
+                cv2.line(img, (u, v), (int(HAND_UV[0]), int(HAND_UV[1])), col, 1)
+            cv2.putText(img, f"hand-eye err {gap:.0f}px", (10, img.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+    # YELLOW BOX = the LOCKED 3D cube point, projected BACK into the image.
+    # This is the only honest check on the localization. The logs cannot tell you it is
+    # wrong -- they are computed FROM the same broken transform, so they will cheerfully
+    # print "tip->cube=27mm" while the gripper is nowhere near the cube. But a 3D point
+    # reprojected onto the picture either lands on the red cube you can see, or it does
+    # not. If this box is not sitting on the cube, the LOCALIZATION is wrong and nothing
+    # downstream can save it. (Same trick as the pink line, applied to the target.)
+    if joints is not None and kin is not None and fx > 0:
+        with lock:
+            p3 = state.get("obj3d")
+        if p3 is not None:
+            try:
+                T_ee = np.asarray(kin.forward_kinematics(np.asarray(joints, np.float64)))
+                uvc = project_base(np.asarray(p3, np.float64), T_ee @ T_ee_cam)
+            except Exception:
+                uvc = None
+            if uvc is not None:
+                u, v = int(round(uvc[0])), int(round(uvc[1]))
+                if -300 < u < img.shape[1] + 300 and -300 < v < img.shape[0] + 300:
+                    cv2.rectangle(img, (u - 16, v - 16), (u + 16, v + 16), (0, 235, 255), 2)
+                    cv2.drawMarker(img, (u, v), (0, 235, 255), cv2.MARKER_TILTED_CROSS, 12, 1)
+                    cv2.putText(img, "3D lock", (u - 18, v - 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 235, 255), 1)
     for tk, color, name in ((red_tracker, (0, 0, 255), "red"), (green_tracker, (0, 200, 0), "green")):
         tr = tk.last
         if tr is not None and now - tr.t < 0.7:   # fresh only — no wandering stale boxes
@@ -333,7 +398,7 @@ def observe(overlay=True):
         state["gripper"] = round(float(obs.get("gripper.pos", -1)), 1)
         latest_rgb[0] = rgb
     if overlay:
-        publish(rgb)
+        publish(rgb, joints)
     return joints, rgb, obs
 
 
@@ -391,6 +456,36 @@ def locate_3d(uv, z_m, T_base_cam):
     y = (uv[1] - cy0) / fy * z_m
     p_cam = np.array([x, y, z_m, 1.0])
     return (T_base_cam @ p_cam)[:3]
+
+
+def project_base(p_base, T_base_cam):
+    """Base-frame point -> pixel. The inverse of locate_3d; the ground truth test
+    for the hand-eye TF."""
+    pc = np.linalg.inv(np.asarray(T_base_cam, np.float64)) @ np.append(
+        np.asarray(p_base, np.float64), 1.0)
+    if pc[2] <= 1e-4:
+        return None                      # behind the camera
+    return (float(fx * pc[0] / pc[2] + cx0), float(fy * pc[1] / pc[2] + cy0))
+
+
+def tip_pixel(joints):
+    """Where the hand-eye TF SAYS the fingertip appears in the FPV.
+
+    The camera is bolted to the gripper, so the fingertip (= the ee frame origin,
+    see GRIP_TIP_OFFSET_M) has exactly ONE pixel, the same in every pose. We also
+    MEASURED that pixel directly, with /caltip: it is HAND_UV. So these two numbers
+    are the same number computed two ways, and they MUST agree.
+
+    They did not. The TF put the fingertip at ~(335, 71) -- the top of the frame --
+    while the fingers really sit at HAND_UV=(440, 394), low and right. 330 px apart
+    in a 640x480 image, and in the wrong HALF: no intrinsics fix that (you would need
+    cy ~ 563 in a 480-tall frame). The TF's camera is pitched ~40 deg too far DOWN, so
+    every sightline we back-project is TOO STEEP, so it hits the table TOO SOON, so
+    every cube is reported NEARER than it is -- the user's "it should be further out",
+    arrived at independently. calibrate_handeye() re-fits the TF to kill this.
+    """
+    T = np.asarray(kin.forward_kinematics(np.asarray(joints, np.float64)))
+    return project_base(T[:3, 3], T @ T_ee_cam)
 
 
 def locate_object(finder, tracker, label, tries=6):
@@ -624,97 +719,6 @@ def triangulate(finder, tracker, label):
     return p
 
 
-def servo_pick(finder, tracker, label):
-    """Smooth straight-line descend to the in-hand pixel."""
-    set_phase(f"APPROACH {label}", "continuous visual servo")
-    send_joints(observe()[0], gripper=95.0)
-    time.sleep(0.6)
-    lost = [0]
-    dbg_t = [0.0]
-
-    def step(joints, rgb, dt):
-        T = T_cam_of(joints)
-        tr = finder(rgb, T)
-        if tr is None:
-            lost[0] += 1
-            if lost[0] > 55:
-                raise Abort(f"{label}: lost during approach")
-            # FK coast: servo on the anchor's predicted pixel while the blob is
-            # shaded/blurred — the object is static, the camera pose is known.
-            pred = tracker.predict_uv(T)
-            if pred is None or time.time() - tracker.anchor_t > 3.0:
-                return None
-            z = float(np.linalg.norm(tracker.p_anchor - T[:3, 3]))
-            du, dv = pred[0] - HAND_UV[0], pred[1] - HAND_UV[1]
-            dv = 0.0 if abs(dv) < DEADBAND_PX else dv
-            pan = 0.0 if abs(du) < 22 else float(np.clip(
-                0.14 * math.degrees(math.atan2(du, fx)), -8.0, 8.0))
-            vy = np.clip(K_LAT * dv * z / fy, -V_LAT_MAX, V_LAT_MAX)
-            vz = 0.5 * V_FWD_MAX if z > 0.07 else 0.0   # slower while blind
-            return np.array([0.0, vy, vz, pan])
-        lost[0] = 0
-        du, dv = tr.uv[0] - HAND_UV[0], tr.uv[1] - HAND_UV[1]
-        z = 0.14 * math.sqrt(max(0.15, HAND_AREA_MIN / max(400.0, tr.area_px)))
-        tracker.update_anchor(tr.uv, z, T, time.time())
-        with lock:
-            state["dist_mm"] = round(z * 1e3)
-        # HORIZONTAL CENTERING VIA BASE ROTATION (fixes the "lands left of the
-        # cube" + singularity): rotate shoulder_pan to bring the cube onto the
-        # fingertip column, instead of translating the wrist sideways.
-        vx = 0.0
-        pan = 0.0 if abs(du) < 22 else float(np.clip(
-            0.14 * math.degrees(math.atan2(du, fx)), -8.0, 8.0))
-        z_ee = float(np.asarray(kin.forward_kinematics(joints))[2, 3])
-        # EYE-IN-HAND GRASP GEOMETRY (the key correction):
-        #  dv<0 → cube is ABOVE the fingertip line in the image. A table cube
-        #  can't be brought DOWN the frame by descending (that just rams the
-        #  table) — it comes down by moving the gripper FORWARD so the fingers
-        #  slide over it. So: descend only while high; once near the deck,
-        #  stop descending and ADVANCE to walk the fingers onto the cube.
-        # gate forward advance on being horizontally centered — don't drive the
-        # fingers onto the cube while it's still off to the side.
-        centered = abs(du) < 45
-        if z_ee > 0.020:
-            # still above the table: lower toward it AND creep forward
-            dv_c = 0.0 if abs(dv) < DEADBAND_PX else dv
-            vy = np.clip(K_LAT * dv_c * z / fy, -V_LAT_MAX, V_LAT_MAX)
-            vz = 0.4 * V_FWD_MAX if centered else 0.0
-        else:
-            # on the deck: no more down — advance to bring the cube to the
-            # fingertip line (dv→0); the more it's above, the faster we push.
-            vy = 0.0
-            vz = (V_FWD_MAX * float(np.clip(-dv / 160.0, 0.30, 1.0))
-                  if (dv < -30 and centered) else 0.0)
-        if time.time() - dbg_t[0] > 1.0:
-            dbg_t[0] = time.time()
-            say(f"servo: err=({du:+.0f},{dv:+.0f})px area={tr.area_px} z_ee={z_ee*1e3:+.0f}mm "
-                f"pan={pan:+.0f}deg/s vz={vz*1e3:+.0f}mm/s")
-        return np.array([vx, vy, vz, pan])
-
-    def done(joints, rgb):
-        tr = tracker.last
-        if tr is None or time.time() - tr.t > 0.4:
-            return False
-        du, dv = tr.uv[0] - HAND_UV[0], tr.uv[1] - HAND_UV[1]
-        bottom = tr.bbox_xyxy[3] >= 477
-        # cube reached the fingertip line, tightly centred → grasp pose
-        return abs(du) < 28 and (abs(dv) < 45 or bottom)
-
-    def stall_ok(joints):
-        # arrival: at the deck, horizontally CENTRED on the fingertip, cube
-        # filling the near view — the arm stalled because the fingers reached
-        # the cube. Tight du gate so we don't grab an off-centre edge.
-        tr = tracker.last
-        if tr is None or time.time() - tr.t > 0.6:
-            return False
-        z_ee = float(np.asarray(kin.forward_kinematics(joints))[2, 3])
-        du = tr.uv[0] - HAND_UV[0]
-        return z_ee < -0.010 and abs(du) < 30 and tr.area_px > 17000
-
-    servo_loop(step, done, timeout_s=140.0, label=f"approach {label}", stall_ok=stall_ok)
-    say(f"{label} at hand position")
-
-
 def close_with_current(step=4.0, delay=0.1):
     """Close the gripper in small increments, watching the servo current, and
     stop the instant it rises (torque change = fingers on the object). Smaller
@@ -756,28 +760,98 @@ def ee_move_rel(d_base, step=1.4, settle=0.5):
 
 
 # ---------------- polar bearing-lock localize + approach ----------------
-def ray_to_table(uv, T_base_cam):
-    """Intersect the pixel's back-projected sightline with the table plane
-    z=Z_TABLE (the cube sits on the table). Returns the base-frame 3D point or
-    None. This is single-shot metric localization straight from the FPV — no
-    stereo depth (blind at close range) and no multi-vantage swinging."""
+# The table plane the sightline is intersected with. Starts at the Z_TABLE guess
+# and is MEASURED at every LOCATE (see locate_on_table) — do not trust the guess.
+TABLE_Z = [Z_TABLE]
+
+# RADIAL LOCALIZATION CORRECTION (metres). The camera sits ~10 cm BEHIND the
+# fingertips, so the back-projected sightline reads every object TOO CLOSE to the
+# base (a too-steep ray hits the table too soon). The user measured the miss at a
+# consistent ~10 cm too near, and the arm dived straight down at a point basically
+# under itself instead of reaching out to the cube. So AFTER localizing, push the
+# point radially OUTWARD (away from the base) by this much. Live-tunable via /pushout
+# (a number box in the UI) so it can be dialled against the 3D view without a restart.
+PUSH_OUT = [0.10]
+
+
+def push_out_radial(p):
+    """Move a base-frame point radially OUTWARD (away from base z-axis) by PUSH_OUT[0].
+    Applied to EVERY localization (initial lock AND every approach refine) so the
+    correction is consistent — otherwise a raw re-measure would drag the target back
+    inward and undo the push. See PUSH_OUT."""
+    p = np.asarray(p, np.float64).copy()
+    r = float(np.hypot(p[0], p[1]))
+    push = float(PUSH_OUT[0])
+    if r > 1e-3 and push != 0.0:
+        p[0] += p[0] / r * push
+        p[1] += p[1] / r * push
+    return p
+
+
+def ray_to_table(uv, T_base_cam, z_plane=None):
+    """Intersect the pixel's back-projected sightline with the table plane. The
+    plane height is TABLE_Z[0], which locate_on_table MEASURES from the bbox
+    pinhole range rather than assuming."""
     o = T_base_cam[:3, 3]
+    z = TABLE_Z[0] if z_plane is None else float(z_plane)
     d_cam = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
     d = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
     if abs(d[2]) < 1e-6:
         return None
-    t = (Z_TABLE - o[2]) / d[2]
+    t = (z - o[2]) / d[2]
     if t <= 0:
         return None
     return o + t * d
 
 
+TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise:
+                   # "everything is on the same table and height as the base")
+
+
+def solve_on_table(tr, T_base_cam):
+    """Range to the cube WITHOUT assuming its size or guessing a plane height.
+
+    Two facts we actually know:
+      (a) the cube sits ON THE TABLE, i.e. its centre is at TABLE_Z0 + S/2,
+      (b) apparent size gives range: S = d * w_px / fx   (pinhole).
+    Substituting (b) into (a) along the sightline p(d) = o + d*dir leaves ONE
+    unknown:
+          o_z + d*dir_z = TABLE_Z0 + d*w/(2*fx)
+      =>  d = (o_z - TABLE_Z0) / ( w/(2*fx) - dir_z )
+    dir_z < 0 (the camera looks down), so the denominator is positive and d is
+    well defined. Returns (point_base, implied_cube_edge_m).
+
+    Why this replaces the old code: range used to be `fx * TARGET_SIZE_M / w`
+    with TARGET_SIZE_M HARD-CODED to 0.03. If the real cube is bigger, every
+    range comes out SHORT, and because the sightline points down-forward a short
+    range lands the cube too NEAR and too HIGH — the last run reported the cube
+    centre at z=+4.0cm, which is impossible for a cube resting on the table. That
+    is exactly the "it should be further out" error. Here the size falls out of
+    the solve instead of being assumed, so it is self-correcting.
+    """
+    x1, y1, x2, y2 = tr.bbox_xyxy
+    w = float(max(4.0, x2 - x1))          # horizontal extent ~ the cube edge
+    o = T_base_cam[:3, 3]
+    d_cam = np.array([(tr.uv[0] - cx0) / fx, (tr.uv[1] - cy0) / fy, 1.0])
+    dirv = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
+    den = w / (2.0 * fx) - float(dirv[2])
+    if den <= 1e-6:
+        return None, None
+    d = (float(o[2]) - TABLE_Z0) / den
+    if not (0.03 < d < 0.80):
+        return None, None
+    p = o + d * dirv
+    S = d * w / fx                        # the cube edge this implies
+    return p, float(S)
+
+
 def locate_on_table(finder, tracker, label):
-    """Compute the target's radius & angle from the base by intersecting its
-    sightline with the table. One steady pose, a few reads, median — the
-    approach servo refines it visually every tick after this."""
-    set_phase(f"LOCATE {label}", "measuring bearing + range from the gripper view")
-    pts = []
+    """Locate the cube by solving range + size together against the table plane.
+    See solve_on_table. Median over several reads; the implied cube edge is logged
+    as a sanity check (a sane red cube is ~3-5 cm — if this prints something wild,
+    the hand-eye TF is the suspect, not the detector)."""
+    set_phase(f"LOCATE {label}", "solving range + size against the table")
+    pts, sizes = [], []
     for _ in range(9):
         checkpoint()
         joints, rgb, _ = observe()
@@ -786,16 +860,189 @@ def locate_on_table(finder, tracker, label):
         if tr is None:
             time.sleep(0.05)
             continue
-        p = ray_to_table(tr.uv, T)
-        if p is not None and 0.06 < np.hypot(p[0], p[1]) < 0.45:
+        p, S = solve_on_table(tr, T)
+        if p is not None and 0.06 < float(np.hypot(p[0], p[1])) < 0.45:
             pts.append(p)
+            sizes.append(S)
         time.sleep(0.03)
     if len(pts) < 3:
-        raise Abort(f"{label}: could not localize on the table ({len(pts)} good reads)")
+        raise Abort(f"{label}: could not localize ({len(pts)} good reads)")
     p = np.median(np.array(pts), axis=0)
+    S = float(np.median(sizes))
+    TABLE_Z[0] = TABLE_Z0 + 0.5 * S       # keep the hop refiner on the same plane
+
+    r_raw = float(np.hypot(p[0], p[1]))
+    p = push_out_radial(p)                  # camera-behind-gripper correction (see PUSH_OUT)
+    r_final = float(np.hypot(p[0], p[1]))
+    say(f"{label} located: r={r_final*100:.1f}cm "
+        f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm "
+        f"| raw r={r_raw*100:.1f}cm + pushed out {PUSH_OUT[0]*100:.0f}cm "
+        f"| cube edge solved={S*100:.1f}cm")
     tracker.p_anchor = p.copy()
     tracker.anchor_t = time.time()
     return p
+
+
+# ---------------- hand-eye self-calibration ----------------
+TF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handeye_tf.json")
+
+
+def load_tf_override():
+    """A TF we FITTED beats the TF we were handed. Written by calibrate_handeye()."""
+    global T_ee_cam
+    try:
+        with open(TF_FILE) as f:
+            d = json.load(f)
+        T_ee_cam = parse_tf_string(d["tf"])
+        return d
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        say(f"hand-eye: ignoring bad {os.path.basename(TF_FILE)} ({e})")
+        return None
+
+
+def calibrate_handeye(finder, n_target=14):
+    """Fit the gripper->camera transform FROM THE ROBOT'S OWN MOTION. No chessboard,
+    no tape measure, ~30 s.
+
+    WHY THIS EXISTS. The shipped TF is wrong by ~40 deg in camera pitch, and that one
+    error produced most of the symptoms chased for two days. Proof, no fitting needed:
+    the camera is bolted to the gripper, so the fingertip (the ee origin) projects to
+    ONE fixed pixel in every pose. The TF puts it at ~(335, 71). We MEASURED it with
+    /caltip at HAND_UV=(440, 394). 330 px apart, and in the wrong HALF of the frame --
+    no intrinsics can reconcile that. A camera that thinks it is pitched further down
+    than it is back-projects every sightline TOO STEEPLY, so the ray hits the table TOO
+    SOON, so every object is reported NEARER than it is. That is exactly the standing
+    complaint that the cube "should be further out", derived from the other end.
+
+    TWO INDEPENDENT FACTS PIN THE TF DOWN:
+      (A) THE FINGERTIP IS IN THE PICTURE.  project(FK_tip) must equal HAND_UV.
+          2 equations. Nails the camera's POINTING DIRECTION -- the broken part.
+      (B) A STATIC CUBE LOOKS THE SAME FROM EVERYWHERE.  Park the arm in N poses that
+          all keep the cube in view; every sightline must pass through ONE point, and
+          that point sits on the table. 2 equations per pose. Nails the camera's
+          POSITION on the gripper, which (A) alone cannot see.
+
+    Unknowns: TF translation (3) + TF rotvec (3) + the cube (3, z bounded to the table).
+    Residuals: 2 + 2N. Seeded from the current TF, so a good TF stays put.
+    """
+    global T_ee_cam
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+
+    set_phase("CALIB", "hand-eye: sampling the cube from several poses")
+    q0 = observe()[0].astype(np.float64)
+    tr0 = detect_now(finder, tries=25)
+    if tr0 is None:
+        raise Abort("hand-eye: no cube in view — put the cube in the gripper view first")
+
+    # Poses that keep the cube in frame but move the camera in genuinely different
+    # ways: pan rotates the camera about base z, wrist_flex rotates it about the
+    # pitch axis, lift/elbow TRANSLATE it. Rotation observes the TF's rotation;
+    # translation observes the TF's translation. We need both or the fit is degenerate.
+    deltas = []
+    for dpan in (-9.0, -4.5, 0.0, 4.5, 9.0):
+        deltas.append(np.array([dpan, 0.0, 0.0, 0.0, 0.0]))
+    for dwf in (-9.0, -4.0, 4.0, 9.0):
+        deltas.append(np.array([0.0, 0.0, 0.0, dwf, 0.0]))
+    for dl, de in ((-6.0, 6.0), (6.0, -6.0), (-4.0, 10.0), (4.0, -10.0), (-8.0, 4.0)):
+        deltas.append(np.array([0.0, dl, de, 0.0, 0.0]))
+
+    samples = []          # (joints, cube_uv)
+    for d in deltas:
+        checkpoint()
+        q = q0 + d
+        goto_smooth(q, settle=0.25, step=1.5)
+        j = observe()[0].astype(np.float64)
+        tr = detect_now(finder, tries=6)
+        if tr is None:
+            continue
+        samples.append((j, np.array(tr.uv, np.float64)))
+        if len(samples) >= n_target:
+            break
+    goto_smooth(q0, settle=0.3, step=1.5)
+
+    if len(samples) < 6:
+        raise Abort(f"hand-eye: only {len(samples)} usable views (need 6) — "
+                    "keep the cube in the gripper view for the whole sweep")
+
+    T_ee = [np.asarray(kin.forward_kinematics(j)) for j, _ in samples]
+    uvs = [uv for _, uv in samples]
+    # The fingertip anchor is pose-independent (the camera is rigid to the ee), so it
+    # is ONE constraint however many poses we took. Weight it like sqrt(N) samples so
+    # it is not drowned out by the noisier cube pixels.
+    w_tip = math.sqrt(len(samples))
+
+    def unpack(x):
+        tf = np.eye(4)
+        tf[:3, 3] = x[:3]
+        tf[:3, :3] = Rotation.from_rotvec(x[3:6]).as_matrix()
+        return tf, np.array(x[6:9])
+
+    def resid(x):
+        tf, p = unpack(x)
+        r = []
+        for T, uv in zip(T_ee, uvs):
+            pu = project_base(p, T @ tf)
+            r += [400.0, 400.0] if pu is None else [pu[0] - uv[0], pu[1] - uv[1]]
+        pt = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)      # the fingertip anchor
+        r += ([400.0, 400.0] if pt is None else
+              [w_tip * (pt[0] - HAND_UV[0]), w_tip * (pt[1] - HAND_UV[1])])
+        return r
+
+    p_seed = _measure_point(tr0, T_ee[0] @ T_ee_cam)
+    if p_seed is None:
+        p_seed = np.array([0.18, 0.0, 0.02])
+
+    # SEED THE TRANSLATION AT THE MEASURED MOUNT DISTANCE, not at the old TF's value.
+    # The old TF puts the camera 20.2 cm from the fingertip; the mount was measured at
+    # ~10 cm. Starting a nonlinear fit 2x off in translation invites a bad local minimum,
+    # so keep the old direction (the mount geometry is roughly right) and rescale it, and
+    # bound |t| to something a camera bolted to this gripper can physically be.
+    t_old = np.asarray(T_ee_cam[:3, 3], np.float64)
+    t_seed = t_old / max(1e-6, np.linalg.norm(t_old)) * CAM_TIP_M
+    x0 = np.concatenate([t_seed,
+                         Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(),
+                         np.asarray(p_seed, np.float64)])
+    lo = np.array([-0.16, -0.16, -0.16, -4.0, -4.0, -4.0, -0.45, -0.45, 0.005])
+    hi = np.array([0.16, 0.16, 0.16, 4.0, 4.0, 4.0, 0.45, 0.45, 0.050])
+    x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
+
+    def rms(x):
+        r = np.array(resid(x))[: 2 * len(samples)]
+        return float(np.sqrt((r ** 2).reshape(-1, 2).sum(1).mean()))
+
+    def tipgap(x):
+        tf, _ = unpack(x)
+        pu = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)
+        return 999.0 if pu is None else math.hypot(pu[0] - HAND_UV[0], pu[1] - HAND_UV[1])
+
+    say(f"hand-eye BEFORE: cube reprojection RMS={rms(x0):.0f}px  "
+        f"fingertip off by {tipgap(x0):.0f}px  ({len(samples)} views)")
+
+    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
+                        max_nfev=4000, ftol=1e-10, xtol=1e-10)
+    tf, p = unpack(sol.x)
+    say(f"hand-eye AFTER:  cube reprojection RMS={rms(sol.x):.0f}px  "
+        f"fingertip off by {tipgap(sol.x):.0f}px")
+
+    if rms(sol.x) > 25.0 or tipgap(sol.x) > 40.0:
+        raise Abort(f"hand-eye: fit did not converge (RMS {rms(sol.x):.0f}px, "
+                    f"tip {tipgap(sol.x):.0f}px) — TF NOT changed. More pose spread needed.")
+
+    rv = Rotation.from_matrix(tf[:3, :3]).as_rotvec()
+    tf_str = ",".join(f"{v:.4f}" for v in list(tf[:3, 3]) + list(rv))
+    with open(TF_FILE, "w") as f:
+        json.dump({"tf": tf_str, "rms_px": rms(sol.x), "tip_px": tipgap(sol.x),
+                   "views": len(samples), "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+    T_ee_cam = tf
+    say(f"hand-eye CALIBRATED -> {tf_str}")
+    say(f"  (saved to {os.path.basename(TF_FILE)}; loaded automatically on every restart)")
+    say(f"  cube now solves to r={np.hypot(p[0], p[1])*100:.1f}cm "
+        f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm")
+    set_phase("CALIB", f"hand-eye fixed — reprojection {rms(sol.x):.0f}px")
+    return tf
 
 
 def bbox_range_m(tr):
@@ -810,115 +1057,216 @@ def bbox_range_m(tr):
     return float(np.clip(d, 0.02, 0.60))
 
 
-def gaze_approach(finder, tracker, label):
-    """Approach that moves toward the object while keeping it in view — the trick
-    the user asked for, and it's verified to converge in kinematic sim.
+def _measure_point(tr, T_cam):
+    """Best single-frame base-frame coordinate for a detection: the TABLE-RAY
+    (sightline ∩ table plane). NOT stereo depth — stereo gave garbage here
+    (z ≈ -1 m), and a bad far range washes out the lateral bearing so the target
+    lands straight ahead instead of where the cube is. Table-ray pins z to the
+    table, so the bearing is always right. Bbox pinhole is the last-ditch."""
+    p_tab = ray_to_table(tr.uv, T_cam)
+    if p_tab is not None and 0.05 < float(np.hypot(p_tab[0], p_tab[1])) < 0.45:
+        return p_tab
+    return locate_3d(tr.uv, bbox_range_m(tr), T_cam)
 
-    Every tick:
-      1. Understand the object's 3D coordinate from the first-person view: a
-         stable base-frame EMA anchor (the cube is static, so averaging the noisy
-         per-frame back-projections gives a *confident* point — this also feeds
-         the 3D view).
-      2. Move the whole camera+gripper a step along the CAMERA→OBJECT direction
-         (position-only IK). This is the key fix: the camera is mounted ~20 cm
-         off the gripper origin, so stepping the *gripper* toward the object made
-         the camera→object range GROW and stall — stepping along camera→object
-         shrinks the range monotonically.
-      3. Keep the target centred with light pan (shoulder_pan → horizontal) and
-         wrist_flex (→ vertical). These don't fight the translation because the
-         translation is orientation-free.
 
-    Range = camera→anchor distance; done at STANDOFF (fingers lead ~9 cm)."""
-    set_phase(f"APPROACH {label}", "moving toward the target, keeping it centred")
+def tip_base(T_ee):
+    """Fingertip position in base frame: the ee frame origin pushed out along the
+    hand (+Z of gripper_frame_link). Mirrors lookat_engine._gripper_tip_base on
+    the identical urdf + ee_frame. `T_ee[:3,3]` is the WRIST, not the fingers."""
+    T = np.asarray(T_ee, np.float64)
+    return T[:3, 3] + T[:3, :3] @ np.array([0.0, 0.0, GRIP_TIP_OFFSET_M])
+
+
+# ---- FIRST-PERSON APPROACH ------------------------------------------------
+# The camera is the head of the snake: it rides on the gripper, so every move
+# changes the view, and the closer we get the WORSE the detector behaves (it
+# hallucinates, then stops recognising the cube at all once the cube fills the
+# frame and slides under the fingers). So we do NOT servo on pixels all the way
+# in. We look from a distance where the detector is honest, LOCK the cube's 3D
+# point, and run the last leg on the lock -- the cube is static, so a remembered
+# coordinate beats a close-range guess.
+STANDOFF_H = 0.05        # m, fingertip parks this far ABOVE the cube, then descends
+COMMIT_M = 0.10          # m, closer than this we STOP believing the detector
+HOP_M = 0.030            # m, max Cartesian step per hop
+# Candidate grasp pitches, tried in this order. Constrained by the REAL joint limits,
+# which is what the last attempt got wrong. Measured achievable pitch at z=2cm:
+#     r=10cm -> 85..95 only     r=15cm -> 65..95     r=20cm -> 45..95
+# So a close cube can ONLY be grasped nearly straight down; there is no choice about
+# it. We try steep-first and let the (now limit-aware) IK veto what it cannot hold.
+GRASP_PITCH = (75.0, 80.0, 70.0, 85.0, 90.0, 65.0, 60.0, 55.0)
+
+
+def plan_grasp_pitch(p_obj, q_seed):
+    """Choose the gripper pitch to grasp with, and PROVE the arm can get there.
+    Returns (pitch_deg, worst_ik_residual_m), or (None, best_residual) if nothing works.
+
+    THE GEOMETRY THAT WAS BEING IGNORED (measured 2026-07-13). The fingertip is 98 mm
+    out in FRONT of the wrist. So putting the fingertip on a cube at r=15cm, z=2cm with
+    the hand HORIZONTAL demands the WRIST sit at r=52mm, z=20mm -- inside the robot's
+    own base column. Physically impossible:
+
+        hand elevation  ->  where the WRIST must then be
+              0 deg           r= 52 mm  z= 20 mm   <- inside the base. impossible.
+            -40 deg           r= 75 mm  z= 83 mm
+            -60 deg           r=101 mm  z=105 mm
+            -90 deg           r=150 mm  z=118 mm   <- comfortable
+
+    The old code asked for the impossible one; the old solver had no way to say "no";
+    its half-solved answer crept the arm out and up. That IS the "it just grabs at air"
+    run. You grab a cube off a table from ABOVE -- point the hand down.
+
+    Steeper is kinematically safer too: pitch 40-60 at r=10-15cm is a genuine elbow-flip
+    DEAD BAND where no seed converges (mapped 2026-07-13). The old code clamped pitch to
+    [-10, 55] -- it aimed straight into the dead band. At 70-90 the whole 10-28cm working
+    range solves to under 0.3 mm.
+    """
+    p_above = np.array([p_obj[0], p_obj[1], p_obj[2] + STANDOFF_H])
+    best = None
+    for pitch in GRASP_PITCH:
+        _, e_hi = _ik_hold_pitch(q_seed, p_above, pitch, float(q_seed[4]), ret_err=True)
+        _, e_lo = _ik_hold_pitch(q_seed, p_obj, pitch, float(q_seed[4]), ret_err=True)
+        worst = max(float(e_hi), float(e_lo))
+        if worst < 0.004:
+            return pitch, worst
+        if best is None or worst < best[1]:
+            best = (pitch, worst)
+    return None, best[1]
+
+
+def approach_over_the_top(finder, tracker, label):
+    """LOCK the cube, then fly the fingertip to a waypoint directly ABOVE it.
+    Returns (p_obj, grasp_pitch).
+
+    Every Cartesian target is checked for reachability BEFORE the arm is told to move.
+    An unreachable target is a fact to REPORT, not a pose to drive to -- driving to
+    half-solved IK poses is exactly what made the arm wander outward for 30 hops while
+    reporting it was a steady 93 mm from the cube.
+    """
+    set_phase(f"APPROACH {label}", "locking the cube, then over the top of it")
     send_joints(observe()[0], gripper=95.0)
-    time.sleep(0.4)
-    fk = lambda q: np.asarray(kin.forward_kinematics(q))
-    STANDOFF = 0.09
-    anchor = None
-    lost = 0
-    dbg_t = 0.0
-    t_end = time.time() + 90.0
+    time.sleep(0.35)
 
-    while time.time() < t_end:
-        t0 = time.time()
+    p_obj = np.asarray(locate_on_table(finder, tracker, label), np.float64)
+    q0 = observe()[0].astype(np.float64)
+    pitch, e = plan_grasp_pitch(p_obj, q0)
+    if pitch is None:
+        raise Abort(f"{label}: the arm cannot reach that cube at ANY grasp pitch "
+                    f"(best IK residual {e * 1e3:.0f}mm; cube at "
+                    f"r={np.hypot(p_obj[0], p_obj[1]) * 100:.0f}cm). Move it closer.")
+    say(f"{label}: grasping with the hand {pitch:.0f}deg DOWN (IK residual "
+        f"{e * 1e3:.1f}mm) — a horizontal hand would need the wrist inside the base, "
+        f"which is why every previous run closed on air")
+
+    pitch0 = float(q0[1] + q0[2] + q0[3])
+    tip0 = np.asarray(kin.forward_kinematics(q0))[:3, 3]
+    d0 = max(0.05, float(np.linalg.norm(p_obj - tip0)))
+
+    for hop in range(24):
         checkpoint()
-        joints, rgb, _ = observe()
-        joints = joints.astype(np.float64)
-        T_ee = fk(joints)
-        T_cam = T_ee @ T_ee_cam
-        tr = finder(rgb, T_cam)
-        if tr is None:
-            lost += 1
-            if lost > 40:
-                raise Abort(f"{label}: lost during approach")
-            send_joints(joints, gripper=95.0)   # hold, keep looking
-            time.sleep(max(0.0, LOOP_DT - (time.time() - t0)))
-            continue
-        lost = 0
-
-        # ---- 1. object coordinate: stable base-frame anchor (EMA) ----
-        d = bbox_range_m(tr)
-        p_new = locate_3d(tr.uv, d, T_cam)
-        if anchor is None:
-            anchor = p_new
-        elif float(np.linalg.norm(p_new - anchor)) < 0.10:   # reject wild jumps
-            anchor = 0.82 * anchor + 0.18 * p_new
-        anchor[2] = max(anchor[2], OBJ_FLOOR_Z)
-        tracker.p_anchor = anchor.copy()
-        tracker.anchor_t = time.time()
-
-        cam_pos = T_cam[:3, 3]
-        grip = T_ee[:3, 3]
-        d_cam = float(np.linalg.norm(anchor - cam_pos))     # camera→object range
-        r = float(np.hypot(anchor[0], anchor[1]))
-        ang = float(math.degrees(math.atan2(anchor[1], anchor[0])))
-        du = tr.uv[0] - cx0
-        dv = tr.uv[1] - cy0
+        q = observe()[0].astype(np.float64)
+        tip = np.asarray(kin.forward_kinematics(q))[:3, 3]
+        p_above = np.array([p_obj[0], p_obj[1], p_obj[2] + STANDOFF_H])
+        d_way = float(np.linalg.norm(p_above - tip))
+        d_cube = float(np.linalg.norm(p_obj - tip))
+        r_obj = float(np.hypot(p_obj[0], p_obj[1]))
+        ang = float(math.degrees(math.atan2(p_obj[1], p_obj[0])))
         with lock:
-            state["dist_mm"] = round(d_cam * 1e3)
-            state["target_polar"] = [round(r * 100, 1), round(ang, 1), round(float(anchor[2]) * 100, 1)]
-            state["obj3d"] = [float(v) for v in anchor]
+            state["dist_mm"] = round(d_cube * 1e3)
+            state["target_polar"] = [round(r_obj * 100, 1), round(ang, 1),
+                                     round(float(p_obj[2]) * 100, 1)]
+            state["obj3d"] = [float(v) for v in p_obj]
             state["obj3d_label"] = label.lower()
+        say(f"approach {hop}: tip->waypoint={d_way * 1e3:.0f}mm tip->cube={d_cube * 1e3:.0f}mm "
+            f"| cube r={r_obj * 100:.1f}cm ang={ang:+.0f}deg z={p_obj[2] * 100:.1f}cm "
+            f"| pitch={float(q[1] + q[2] + q[3]):.0f}deg")
 
-        q_cmd = joints.copy()
+        if d_way <= 0.012:
+            say(f"{label}: at the waypoint, {STANDOFF_H * 100:.0f}cm above the cube")
+            break
+        # Don't back away from the cube to reach a waypoint we are already past. That
+        # retreat is what looked like "goes forward 12cm then goes back". If we are
+        # already above the cube and close, just descend.
+        if tip[2] >= p_obj[2] + 0.015 and float(np.hypot(*(tip[:2] - p_obj[:2]))) <= 0.020:
+            say(f"{label}: already over the cube — descending from here")
+            break
 
-        # ---- 2. approach: translate camera+gripper along CAMERA→object ----
-        #     gated on being roughly centred so we never drive off toward an edge.
-        if abs(du) < 120 and d_cam > STANDOFF:
-            dirv = anchor - cam_pos
-            n = float(np.linalg.norm(dirv))
-            if n > 1e-6:
-                grip_goal = grip + (dirv / n) * min(APPROACH_VMAX * LOOP_DT, n)
-                grip_goal[2] = max(grip_goal[2], OBJ_FLOOR_Z)
-                T_goal = T_ee.copy()
-                T_goal[:3, 3] = grip_goal
-                q_ik = kin.inverse_kinematics(joints, T_goal, position_weight=2.0, orientation_weight=0.0)
-                q_cmd = joints + np.clip(np.asarray(q_ik) - joints, -3.0, 3.0)
+        # Refine the lock ONLY while the detector is still honest. Inside COMMIT_M the
+        # cube is half out of frame and sliding under the fingers -- its opinion there is
+        # worthless, and believing it is what used to drag the target around.
+        if d_cube > COMMIT_M:
+            tr = detect_now(finder, tries=6)
+            if tr is not None:
+                p_new = _measure_point(tr, T_cam_of(observe()[0]))
+                if p_new is not None:
+                    p_new = push_out_radial(p_new)     # same correction as the lock, or
+                    # the raw (too-close) re-measure would drag the target back inward
+                    if float(np.linalg.norm(p_new - p_obj)) < 0.06:
+                        p_obj = 0.65 * p_obj + 0.35 * np.asarray(p_new, np.float64)
+                        p_obj[2] = float(np.clip(p_obj[2], 0.005, 0.050))
+                        tracker.p_anchor = p_obj.copy()
+                        tracker.anchor_t = time.time()
 
-        # ---- 3. keep it centred: pan (horizontal) + wrist tilt (vertical) ----
-        if abs(du) > GAZE_DEADBAND_PX:
-            q_cmd[0] += float(np.clip(GAZE_KP_PAN * math.degrees(math.atan2(du, fx)),
-                                      -GAZE_MAX_PAN_DEG, GAZE_MAX_PAN_DEG))
-        if abs(dv) > GAZE_DEADBAND_PX:
-            q_cmd[3] += float(np.clip(GAZE_KP_TILT * math.degrees(math.atan2(dv, fy)),
-                                      -GAZE_MAX_TILT_DEG, GAZE_MAX_TILT_DEG))
+        # Ramp the pitch toward the grasp pitch as we close in rather than snapping the
+        # camera down: keeps the cube in view longer, and keeps the motion smooth.
+        prog = float(np.clip(1.0 - d_cube / d0, 0.0, 1.0))
+        pitch_i = float(pitch0 + (pitch - pitch0) * min(1.0, 1.6 * prog))
 
-        q_cmd = joints + np.clip(q_cmd - joints, -3.5, 3.5)
-        send_joints(q_cmd, gripper=95.0)
-        with lock:
-            state["joints"] = [round(float(v), 1) for v in q_cmd]
+        step = p_above - tip
+        n = float(np.linalg.norm(step))
+        if n < 1e-6:
+            break
+        p_tgt = tip + step / n * min(HOP_M, n)
+        q_tgt, e = _ik_hold_pitch(q, p_tgt, pitch_i, float(q[4]), ret_err=True)
+        if e > 0.006:      # try going straight to the grasp pitch instead of the ramp
+            q_tgt, e = _ik_hold_pitch(q, p_tgt, pitch, float(q[4]), ret_err=True)
+        if e > 0.006:
+            raise Abort(f"{label}: waypoint unreachable (IK residual {e * 1e3:.0f}mm). "
+                        f"Refusing to drive to a half-solved pose.")
+        goto_smooth(q_tgt, settle=0.12, step=1.5)
+    else:
+        say(f"{label}: ran out of hops — descending from here")
 
-        if time.time() - dbg_t > 1.0:
-            dbg_t = time.time()
-            say(f"approach: err=({du:+.0f},{dv:+.0f})px  range={d_cam*1e3:.0f}mm  "
-                f"radius={r*100:.1f}cm  angle={ang:+.0f}deg  area={tr.area_px}")
+    return p_obj.copy(), pitch
 
-        # ---- done: camera within standoff and roughly centred → grasp ----
-        if d_cam <= STANDOFF and abs(du) < 45:
-            say(f"{label} at standoff {d_cam*1e3:.0f}mm (du={du:+.0f}) — grasping")
-            return anchor.copy()
-        time.sleep(max(0.0, LOOP_DT - (time.time() - t0)))
-    raise Abort(f"{label}: approach timed out")
+
+def descend_and_close(p_obj, pitch, label):
+    """Straight down the last few cm onto the LOCKED point, hand pointing down.
+
+    DELIBERATELY NO PIXELS HERE. The old descent exited on `bbox_bottom >= 477` -- the
+    cube touching the bottom of the frame -- but a down-looking camera puts the cube at
+    the image bottom while the hand is still ~2 cm ABOVE it, so the fingers closed on air
+    every run (z_ee=+39mm with cube_z=+20mm). We already know where the cube is; go there.
+    Descending vertically also means the fingers arrive around the cube's SIDES instead of
+    shoving it away.
+    """
+    set_phase(f"GRASP {label}", "descending onto the cube")
+    send_joints(observe()[0].astype(np.float64), gripper=95.0)   # fingers OPEN first
+    time.sleep(0.35)
+
+    p_grip = p_obj.copy()
+    p_grip[2] = max(float(p_obj[2]), OBJ_FLOOR_Z)
+
+    for i in range(14):
+        checkpoint()
+        q = observe()[0].astype(np.float64)
+        tip = np.asarray(kin.forward_kinematics(q))[:3, 3]
+        d = p_grip - tip
+        n = float(np.linalg.norm(d))
+        say(f"descend {i}: tip->cube={n * 1e3:.0f}mm  "
+            f"tip=({tip[0] * 1e3:+.0f},{tip[1] * 1e3:+.0f},{tip[2] * 1e3:+.0f}) "
+            f"cube=({p_grip[0] * 1e3:+.0f},{p_grip[1] * 1e3:+.0f},{p_grip[2] * 1e3:+.0f})mm")
+        if n <= 0.008:
+            say(f"{label}: fingertip on the cube ({n * 1e3:.0f}mm) — closing")
+            return True
+        p_tgt = tip + d / n * min(0.015, n)
+        q_tgt, e = _ik_hold_pitch(q, p_tgt, pitch, float(q[4]), ret_err=True)
+        if e > 0.005:
+            say(f"{label}: descend blocked — IK residual {e * 1e3:.0f}mm. Refusing to "
+                f"drive to a half-solved pose (that is what made the arm wander).")
+            return False
+        goto_smooth(q_tgt, settle=0.10, step=1.0)
+    say(f"{label}: descend ran out of steps")
+    return False
 
 
 def detect_now(finder, tries=12):
@@ -991,17 +1339,13 @@ def run_mission():
                 red_tracker.reset()
                 if detect_now(find_red, tries=10) is None:
                     gentle_scan(find_red, "RED")
-            p_obj = gaze_approach(find_red, red_tracker, "RED")   # sets APPROACH phase
-            set_phase("GRASP", "final inch onto the cube + slow close")
-            # drive the last measured gap STRAIGHT at the object so the gripper
-            # descends onto the cube instead of stopping on top of it.
-            joints = observe()[0]
-            grip = np.asarray(kin.forward_kinematics(joints))[:3, 3]
-            dirv = p_obj - grip
-            n = float(np.linalg.norm(dirv))
-            if n > 1e-6:
-                inch = float(np.clip(n - 0.02, 0.0, 0.08))   # fingers lead the frame ~2 cm
-                ee_move_rel((dirv / n) * inch, step=1.0, settle=0.4)
+            # LOCK the cube from a distance (where the detector is honest), fly the
+            # fingertip to a waypoint ABOVE it with the hand pitched DOWN (so the wrist
+            # has somewhere legal to be), then descend straight onto the locked point.
+            p_obj, pitch = approach_over_the_top(find_red, red_tracker, "RED")
+            if not descend_and_close(p_obj, pitch, "RED"):
+                say("descend did not reach the cube — closing anyway to see what happens")
+            set_phase("GRASP", "slow torque-sensed close")
             contact, i_idle = close_with_current(step=3.0, delay=0.16)
             say(f"close: contact={contact}")
 
@@ -1129,6 +1473,10 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <button id="b-home" onclick="fetch('/reset',{method:'POST'})">Reset pose</button>
     <button id="b-home" onclick="fetch('/locate',{method:'POST'})">Locate object</button>
     <button id="b-home" onclick="fetch('/caltip',{method:'POST'})">Calibrate fingertip</button>
+    <button id="b-calib" onclick="fetch('/calib',{method:'POST'})"
+      title="Put the cube in the gripper view, then press. Fits the gripper→camera
+transform from the robot's own motion (~30s). Watch the FPV: the magenta circle
+should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</button>
   </div>
   <div class="jog">
     <p class="lbl">FPV polar · drag sticks, or W/S radius · A/D base · R/F height · T/G tilt · Q/E roll · space grip <span id="jogmsg"></span></p>
@@ -1158,6 +1506,14 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
       <button id="q-set" onclick="setQuery()">Set</button>
     </div>
   </div>
+  <div class="qbox">
+    <p class="lbl">push target outward (cm) — the camera sits behind the gripper, so
+      the cube reads too close. Raise until the yellow "3D lock" box sits on the cube.</p>
+    <div class="qrow">
+      <input id="pushout" type="number" value="10" step="1" min="-5" max="30" style="width:5em">
+      <button id="p-set" onclick="setPush()">Apply + re-locate</button>
+    </div>
+  </div>
   <pre id="log"></pre>
 </div></main><script>
 // ---- self-contained robot + object 3D viewer (no deps) --------------------
@@ -1169,15 +1525,76 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
   function resize(){ const r = cv.getBoundingClientRect(); const dpr = window.devicePixelRatio||1;
     cv.width = Math.round(r.width*dpr); cv.height = Math.round(r.height*dpr); ctx.setTransform(dpr,0,0,dpr,0,0); }
   window.addEventListener('resize', resize); resize();
-  // rotate: base-frame point -> screen. z is up.
+  // The REAL URDF meshes (so101_new_calib.urdf -> assets/*.stl), fetched once in
+  // link-local coords; /geom streams a 4x4 per link. This used to draw a bare
+  // polyline through the link ORIGINS, which is why the arm looked like a stick
+  // figure and its size/reach couldn't be judged against the cube.
+  let mesh = null;
+  fetch('/urdf').then(r=>r.json()).then(d=>{
+    mesh = (d.links||[]).map(L=>({name:L.name, v:Float32Array.from(L.v), f:Int32Array.from(L.f)}));
+    if(!mesh.length) mesh = null;
+    draw();
+  }).catch(()=>{});
+  const LINKCOL = {base_link:[122,134,152], shoulder_link:[100,140,200],
+    upper_arm_link:[120,160,215], lower_arm_link:[100,140,200],
+    wrist_link:[130,170,220], gripper_link:[190,200,214],
+    moving_jaw_so101_v1_link:[225,232,241]};
+  // rotate: base-frame point -> screen. z is up. also returns view depth.
   function proj(p){ const ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
     const rx = -p[0]*sa + p[1]*ca;            // screen right
     const dep =  p[0]*ca + p[1]*sa;           // into-screen (before tilt)
     const uy =  p[2]*ce - dep*se;             // screen up
     const W = cv.clientWidth, H = cv.clientHeight, s = Math.min(W,H)/0.60;
-    return [W*0.5 + s*rx, H*0.62 - s*uy]; }
+    return [W*0.5 + s*rx, H*0.62 - s*uy, dep*ce + p[2]*se]; }
   function line(a,b,col,w){ const p=proj(a), q=proj(b); ctx.strokeStyle=col; ctx.lineWidth=w||1;
     ctx.beginPath(); ctx.moveTo(p[0],p[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); }
+  function drawMeshes(){
+    const xf = geom.xf || {}; const tris = [];
+    // View direction (into the screen) in BASE coords — depth = dot(p, vd).
+    const ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
+    const vdx=ca*ce, vdy=sa*ce, vdz=se;
+    for(const L of mesh){
+      const T = xf[L.name]; if(!T) continue;
+      const nv = L.v.length/3, sx=new Float64Array(nv), sy=new Float64Array(nv), sd=new Float64Array(nv);
+      const bx=new Float64Array(nv), by=new Float64Array(nv), bz=new Float64Array(nv);
+      for(let i=0;i<nv;i++){
+        const x=L.v[3*i], y=L.v[3*i+1], z=L.v[3*i+2];
+        const X = T[0]*x+T[1]*y+T[2]*z+T[3];      // row-major 4x4
+        const Y = T[4]*x+T[5]*y+T[6]*z+T[7];
+        const Z = T[8]*x+T[9]*y+T[10]*z+T[11];
+        bx[i]=X; by[i]=Y; bz[i]=Z;
+        const s = proj([X,Y,Z]); sx[i]=s[0]; sy[i]=s[1]; sd[i]=s[2];
+      }
+      const c = LINKCOL[L.name] || [140,160,190];
+      for(let t=0;t<L.f.length;t+=3){
+        const a=L.f[t], b=L.f[t+1], q=L.f[t+2];
+        // backface/shade from the base-frame normal; cheap lambert
+        const ux=bx[b]-bx[a], uy2=by[b]-by[a], uz=bz[b]-bz[a];
+        const vx=bx[q]-bx[a], vy=by[q]-by[a], vz=bz[q]-bz[a];
+        let nx=uy2*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy2*vx;
+        const nl=Math.hypot(nx,ny,nz)||1; nx/=nl; ny/=nl; nz/=nl;
+        // BACKFACE CULL. Winding is preserved through decimation now, so the
+        // normal is a real outward normal. Drawing both sides (what it did before)
+        // paints the INSIDE of the arm on top of the outside — that is what made
+        // it look transparent/x-ray, not the triangle budget. Skip faces pointing
+        // away from the viewer and only the outer skin remains.
+        if(nx*vdx + ny*vdy + nz*vdz >= 0) continue;
+        const lam = Math.max(0.34, Math.min(1, 0.42 + 0.58*(0.35*nx - 0.45*ny + 0.82*nz)));
+        tris.push([(sd[a]+sd[b]+sd[q])/3, sx[a],sy[a],sx[b],sy[b],sx[q],sy[q],
+                   `rgb(${Math.round(c[0]*lam)},${Math.round(c[1]*lam)},${Math.round(c[2]*lam)})`]);
+      }
+    }
+    tris.sort((p,q)=>q[0]-p[0]);                 // painter's: far first
+    ctx.lineJoin='round';
+    for(const t of tris){
+      ctx.fillStyle = t[7]; ctx.strokeStyle = t[7]; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(t[1],t[2]); ctx.lineTo(t[3],t[4]); ctx.lineTo(t[5],t[6]); ctx.closePath();
+      ctx.fill();
+      ctx.stroke();   // seal the sub-pixel seams between fills — un-stroked
+                      // canvas triangles leave hairline gaps that show the dark
+                      // background through and make the arm look transparent.
+    }
+  }
   function draw(){
     const W=cv.clientWidth, H=cv.clientHeight; ctx.clearRect(0,0,W,H);
     // ground grid at z=0
@@ -1187,10 +1604,14 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     ctx.globalAlpha=1;
     // base axes
     line([0,0,0],[0.08,0,0],'#c9524a',2); line([0,0,0],[0,0.08,0],'#4a93c9',2); line([0,0,0],[0,0,0.08],'#4ac275',2);
-    // arm chain
-    const L=geom.links||[];
-    for(let i=0;i+1<L.length;i++) line(L[i],L[i+1],'#7f9fd8',4);
-    for(const p of L){ const s=proj(p); ctx.fillStyle='#b9c9ea'; ctx.beginPath(); ctx.arc(s[0],s[1],3.5,0,7); ctx.fill(); }
+    if(mesh && geom.xf){
+      drawMeshes();
+    } else {
+      // fallback: link-origin polyline (what this viewer used to be)
+      const L=geom.links||[];
+      for(let i=0;i+1<L.length;i++) line(L[i],L[i+1],'#7f9fd8',4);
+      for(const p of L){ const s=proj(p); ctx.fillStyle='#b9c9ea'; ctx.beginPath(); ctx.arc(s[0],s[1],3.5,0,7); ctx.fill(); }
+    }
     if(geom.ee){ const s=proj(geom.ee); ctx.fillStyle='#e6ecf1'; ctx.beginPath(); ctx.arc(s[0],s[1],4.5,0,7); ctx.fill(); }
     // object cube
     if(geom.obj){ const o=geom.obj, h=(geom.obj_size||0.03)/2;
@@ -1220,6 +1641,16 @@ async function setQuery(){
   setTimeout(()=>document.getElementById('q-set').textContent='Set', 1200);
 }
 document.getElementById('query').addEventListener('keydown', e => { if(e.key==='Enter') setQuery(); });
+async function setPush(){
+  const cm = parseFloat(document.getElementById('pushout').value);
+  const btn = document.getElementById('p-set'); btn.textContent = '…';
+  try{ await fetch('/pushout',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({cm})});
+    await fetch('/relocate',{method:'POST'});   // re-locate so the 3D lock box moves now
+    btn.textContent = 'Applied ✓'; }
+  catch(e){ btn.textContent = 'Apply + re-locate'; }
+  setTimeout(()=>{ document.getElementById('p-set').textContent='Apply + re-locate'; }, 1400);
+}
 async function press(d){ try{ const r = await (await fetch(`/jogpress?dir=${d}`,{method:'POST'})).json();
   if(!r.ok) jmsg('✗ '+r.reason); else if(r.grip) jmsg(r.grip); }catch(e){} }
 async function release(d){ try{ await fetch(`/jogrelease?dir=${d}`,{method:'POST'}); }catch(e){} }
@@ -1334,26 +1765,96 @@ def status():
     return jsonify(s)
 
 
+def _decimate(V, F, voxel):
+    """Voxel-cluster a dense STL down to something a browser can draw. Snaps verts
+    to a `voxel`-sized grid, drops the triangles that collapse, dedupes. Keeps the
+    true silhouette (and the gap between the jaws) — unlike a convex hull."""
+    key = np.floor(V / voxel).astype(np.int64)
+    _uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    n = len(_uniq)
+    Vn = np.zeros((n, 3), np.float64)
+    cnt = np.zeros(n, np.float64)
+    np.add.at(Vn, inv, V)
+    np.add.at(cnt, inv, 1.0)
+    Vn /= np.maximum(cnt, 1.0)[:, None]
+    Fn = inv[F]
+    ok = (Fn[:, 0] != Fn[:, 1]) & (Fn[:, 1] != Fn[:, 2]) & (Fn[:, 0] != Fn[:, 2])
+    Fn = Fn[ok]
+    # Dedupe WITHOUT destroying winding. Sorting the 3 indices inside a face (the
+    # obvious way to dedupe) scrambles its orientation, so half the normals end up
+    # pointing inward and the shading goes random light/dark — that is what made
+    # the robot look like transparent shattered glass. Rotate each face so its
+    # smallest index leads: that is canonical for dedupe AND preserves cyclic order.
+    roll = np.argmin(Fn, axis=1)
+    idx = (np.arange(3)[None, :] + roll[:, None]) % 3
+    Fn = np.unique(np.take_along_axis(Fn, idx, axis=1), axis=0)
+    return Vn, Fn
+
+
+# The moving jaw is NOT part of the FK chain to gripper_frame_link, so its pose
+# must be composed by hand: URDF joint `gripper`, parent gripper_link,
+# origin xyz="0.0202 0.0188 -0.0234" rpy="1.5708 0 0".
+_c, _s = math.cos(1.5708), math.sin(1.5708)
+JAW_T = np.array([[1, 0, 0, 0.0202],
+                  [0, _c, -_s, 0.0188],
+                  [0, _s, _c, -0.0234],
+                  [0, 0, 0, 1.0]], dtype=np.float64)
+
+_urdf_payload = [None]
+
+
+@app.route("/urdf")
+def urdf_route():
+    """The ACTUAL lerobot URDF visual meshes (SO101/so101_new_calib.urdf ->
+    assets/*.stl), decimated once and sent to the browser in LINK-LOCAL coords.
+    /geom then streams a 4x4 per link, so the page draws the real robot instead
+    of the stick figure it used to draw from bare link origins."""
+    if _urdf_payload[0] is None:
+        try:
+            from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
+            meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+            out = []
+            for name, (V, F) in meshes.items():
+                Vd, Fd = _decimate(np.asarray(V, np.float64), np.asarray(F, np.int64), 0.006)
+                out.append({"name": name,
+                            "v": [round(float(x), 4) for x in Vd.ravel()],
+                            "f": [int(i) for i in Fd.ravel()]})
+            _urdf_payload[0] = out
+            say(f"URDF viewer meshes: {sum(len(l['f']) // 3 for l in out)} tris "
+                f"across {len(out)} links")
+        except Exception as e:
+            say(f"URDF viewer meshes failed: {type(e).__name__}: {e}")
+            _urdf_payload[0] = []
+    return jsonify(links=_urdf_payload[0])
+
+
 @app.route("/geom")
 def geom():
-    """Live 3D geometry for the self-contained robot+object viewer: the arm link
-    origins (base→gripper) and the tracked object, all in the robot base frame."""
+    """Live 3D geometry: a 4x4 pose per URDF link (so the browser can pose the
+    real meshes), plus the link origins (legacy stick-figure fallback), the EE,
+    and the tracked object — all in the robot base frame."""
     with lock:
         jlist = state.get("joints")
         obj = state.get("obj3d")
         olbl = state.get("obj3d_label", "target")
-    links, ee = [], None
+    links, ee, xf = [], None, {}
     if jlist and kin is not None:
         try:
             q = np.array(jlist, dtype=np.float64)
             chain = kin.get_link_transforms_chain(q)
             links = [[round(float(T[0, 3]), 4), round(float(T[1, 3]), 4),
                       round(float(T[2, 3]), 4)] for _n, T in chain]
+            for _n, T in chain:
+                xf[_n] = [round(float(v), 5) for v in np.asarray(T, np.float64).ravel()]
+            Tg = dict(chain).get("gripper_link")
+            if Tg is not None:
+                xf["moving_jaw_so101_v1_link"] = [
+                    round(float(v), 5) for v in (np.asarray(Tg, np.float64) @ JAW_T).ravel()]
             Tee = np.asarray(kin.forward_kinematics(q))
             ee = [round(float(Tee[i, 3]), 4) for i in range(3)]
         except Exception:
             pass
-    return jsonify(links=links, ee=ee, obj=obj, obj_label=olbl, obj_size=0.03)
+    return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl, obj_size=0.03)
 
 
 @app.route("/stream")
@@ -1440,7 +1941,15 @@ JOG_VEC_TTL = 0.30
 # => to hold the gripper angle we algebraically slave wrist_flex:
 #        j3 = pitch_target - j1 - j2
 # This is exact — no IK convergence needed — so the angle never drifts.
-WFLEX_MIN, WFLEX_MAX = -100.0, 100.0     # wrist_flex safe range (deg)
+# THE REAL JOINT LIMITS, read from so101_new_calib.urdf. An IK that does not know
+# these is not an IK, it is a wish: it returns elbow_flex=+162 deg on a joint that
+# stops at +96.8, the servo silently clamps, the arm parks at the stop, and the
+# solver reports a 0.2 mm residual on a pose the robot cannot hold. That is exactly
+# what froze the approach for 21 identical hops at pitch 65 while being commanded
+# to 80 (2026-07-13). CLAMP EVERY ITERATION AND SCORE THE CLAMPED POSE.
+J_LO = np.array([-110.0, -100.0, -96.8, -95.0, -157.2])
+J_HI = np.array([+110.0, +100.0, +96.8, +95.0, +162.8])
+WFLEX_MIN, WFLEX_MAX = float(J_LO[3]), float(J_HI[3])   # wrist_flex safe range (deg)
 
 
 def _gripper_pitch(T):
@@ -1452,28 +1961,68 @@ def _slave_wflex(j1, j2, pitch_tgt):
     return float(np.clip(pitch_tgt - j1 - j2, WFLEX_MIN, WFLEX_MAX))
 
 
-def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=10):
+def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=80, tol=2e-3,
+                   ret_err=False, _retry=True):
     """Position IK on servos 1-3 (pan, lift, elbow) with wrist_flex (servo 4)
-    ALGEBRAICALLY SLAVED to hold the gripper pitch, and wrist_roll (servo 5)
-    fixed. Holding pitch is exact; only the 3-DOF position is solved."""
+    ALGEBRAICALLY SLAVED to hold the gripper pitch, and wrist_roll (servo 5) fixed.
+
+    THIS SOLVER USED TO SILENTLY NOT CONVERGE, and that was the "the arm grabs at
+    air / just moves out" bug (fixed 2026-07-13). It ran a FIXED 10 iterations with
+    a +-4 deg/iter clamp -- a total travel budget of 40 deg -- while a perfectly
+    ordinary reach like tip -> (0.15, 0, 0.02) needs 80-160 deg of elbow. Measured
+    residual for that exact target with the old code: 107 mm at pitch 0, 93 mm at
+    pitch 20, 35 mm at pitch 60 -- for a point THIS code hits to 0.2 mm. It returned
+    a half-solved pose, goto_smooth faithfully drove to it, the next hop re-seeded
+    from there, and the fingertip crept outward and UPWARD forever
+    (`descend: tip_z +61mm -> +114mm` while being commanded DOWN to +15mm).
+
+    Why 10 iterations: FK here costs 790 us and a fresh numeric Jacobian is 3 more
+    FK, so 10 iters was already 32 ms -- near the 70 ms jog tick. Fix is to stop
+    rebuilding J every step: over a <=3 cm step it barely rotates, so reuse it for
+    8 iterations. That buys convergence AND is faster than before (16 ms worst case,
+    9 ms for a jog-sized step).
+
+    It now RETURNS THE RESIDUAL (ret_err=True). Callers MUST check it: a target the
+    arm cannot reach is a fact to report, not a pose to drive to.
+    """
     q = np.array(q_seed, dtype=np.float64)
-    q[4] = j5_fixed
+    q[4] = float(np.clip(j5_fixed, J_LO[4], J_HI[4]))
     q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    for _ in range(iters):
+    J = None
+    for it in range(iters):
         T = np.asarray(kin.forward_kinematics(q))
         err = p_tgt - T[:3, 3]
         if np.linalg.norm(err) < 3e-4:
             break
-        J = np.zeros((3, 3))
-        for c, ji in enumerate((0, 1, 2)):
-            dq = q.copy(); dq[ji] += 0.5
-            if ji in (1, 2):                          # keep pitch held while
-                dq[3] = _slave_wflex(dq[1], dq[2], pitch_tgt)   # perturbing
-            J[:, c] = (np.asarray(kin.forward_kinematics(dq))[:3, 3] - T[:3, 3]) / 0.5
-        dth = np.clip(J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(3), err), -4.0, 4.0)
-        q[0] += dth[0]; q[1] += dth[1]; q[2] += dth[2]
+        if J is None or it % 8 == 0:
+            J = np.empty((3, 3))
+            for c, ji in enumerate((0, 1, 2)):
+                dq = q.copy()
+                dq[ji] = float(np.clip(dq[ji] + 0.5, J_LO[ji], J_HI[ji]))
+                if ji in (1, 2):                      # keep pitch held while
+                    dq[3] = _slave_wflex(dq[1], dq[2], pitch_tgt)   # perturbing
+                J[:, c] = (np.asarray(kin.forward_kinematics(dq))[:3, 3] - T[:3, 3]) / 0.5
+        dth = np.clip(J.T @ np.linalg.solve(J @ J.T + 1e-6 * np.eye(3), err), -8.0, 8.0)
+        q[:3] = np.clip(q[:3] + dth, J_LO[:3], J_HI[:3])   # <-- STAY INSIDE THE ROBOT
         q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    return q
+    # Score the CLAMPED pose, and only call the pitch "held" if wrist_flex did not
+    # saturate -- otherwise we are reporting success on a pose the servos will not hold.
+    e = float(np.linalg.norm(p_tgt - np.asarray(kin.forward_kinematics(q))[:3, 3]))
+    if abs((q[1] + q[2] + q[3]) - pitch_tgt) > 2.0:
+        e = max(e, 0.05)          # pitch could not be held here: treat as unreachable
+    if e > tol and _retry:
+        # Wrong IK branch. There is a genuine elbow-flip dead band (mapped 2026-07-13):
+        # at r=10-15cm the arm simply cannot hold a shallow pitch at all. Re-seed.
+        for alt in ([q_seed[0], -95.0, 90.0, 30.0, j5_fixed],
+                    [q_seed[0], -30.0, 50.0, 60.0, j5_fixed],
+                    [q_seed[0], -60.0, 20.0, 80.0, j5_fixed]):
+            q2, e2 = _ik_hold_pitch(np.array(alt, np.float64), p_tgt, pitch_tgt,
+                                    j5_fixed, iters, tol, ret_err=True, _retry=False)
+            if e2 < e:
+                q, e = q2, e2
+            if e <= tol:
+                break
+    return (q, e) if ret_err else q
 
 
 def jog_loop():
@@ -1664,6 +2213,87 @@ def debugdepth():
         except Exception as e:
             say(f"debugdepth error: {type(e).__name__}: {e}")
     threading.Thread(target=_dbg, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/pushout", methods=["POST"])
+def pushout():
+    """Live-set the radial localization correction (cm), no restart. See PUSH_OUT.
+    POST {cm: N}. Re-locate to see it move the target in the 3D view."""
+    try:
+        cm = float((request.get_json(silent=True) or {}).get("cm", request.args.get("cm", 10)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    cm = float(np.clip(cm, -5.0, 30.0))
+    PUSH_OUT[0] = cm / 100.0
+    say(f"localization push-out set to {cm:.0f}cm — re-locate to apply")
+    return jsonify(ok=True, cm=cm)
+
+
+@app.route("/relocate", methods=["POST"])
+def relocate():
+    """Locate the RED cube the SAME WAY the mission does (table-ray + push-out) WITHOUT
+    moving the arm, and publish it as the 3D lock so the yellow FPV box and the 3D view
+    both update. This is the honest localization check: if the yellow box is not on the
+    cube, the number to change is the push-out (or the hand-eye)."""
+    with lock:
+        busy = state["running"]
+    if busy:
+        return jsonify(ok=False, reason="mission running — stop first")
+
+    def _rl():
+        try:
+            stop_flag.clear()
+            red_tracker.reset()
+            if detect_now(find_red, tries=15) is None:
+                set_phase("IDLE", "RED not in the gripper view — point the camera at it")
+                return
+            p = locate_on_table(find_red, red_tracker, "RED")
+            with lock:
+                state["obj3d"] = [float(v) for v in p]
+                state["obj3d_label"] = "red"
+                state["target_polar"] = [round(float(np.hypot(p[0], p[1])) * 100, 1),
+                                         round(math.degrees(math.atan2(p[1], p[0])), 1),
+                                         round(float(p[2]) * 100, 1)]
+            set_phase("IDLE", "RED lock updated — check the yellow box sits on the cube")
+        except Abort as e:
+            set_phase("IDLE", f"could not locate ({e})")
+        except Exception as e:
+            set_phase("ERROR", f"relocate: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_rl, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/calib", methods=["POST"])
+def calib():
+    """Re-fit the hand-eye TF from the robot's own motion. Put the cube in the
+    gripper view, press this once, done — it persists across restarts.
+    Watch the FPV: the magenta circle (TF's idea of the fingertip) should snap
+    onto the cyan cross (the real fingertip). See calibrate_handeye."""
+    with lock:
+        busy = state["running"]
+    if busy:
+        return jsonify(ok=False, reason="mission running — stop first")
+
+    def _cal():
+        try:
+            stop_flag.clear()
+            with lock:
+                state["running"] = True
+            red_tracker.reset()
+            calibrate_handeye(find_red)
+        except Abort as e:
+            say(f"[CALIB FAILED] {e}")
+            set_phase("IDLE", "hand-eye unchanged")
+        except Exception as e:
+            say(f"[CALIB ERROR] {type(e).__name__}: {e}")
+            set_phase("IDLE", "hand-eye unchanged")
+        finally:
+            with lock:
+                state["running"] = False
+
+    threading.Thread(target=_cal, daemon=True).start()
     return jsonify(ok=True)
 
 
@@ -1926,7 +2556,27 @@ def rerun_thread():
     except Exception as e:
         say(f"Rerun 3D disabled (sim3d import): {e}")
         return
+
+    # URDF MESH SELF-CHECK. log_manipulation_sim3d silently falls back to a blue
+    # stick-figure (`sim3d/robot/arm_chain`, LineStrips3D) whenever no chain link
+    # matches a loaded mesh — and this thread used to swallow every exception with
+    # a bare `except: pass`, so a mesh failure was invisible. Say it out loud once.
+    try:
+        from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
+        _meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+        _chain = [n for n, _ in (kin.get_link_transforms_chain(np.zeros(len(ARM_MOTORS))) or [])]
+        _hit = [n for n in _chain if n in _meshes]
+        if _hit:
+            say(f"Rerun 3D: URDF meshes OK — {len(_hit)}/{len(_chain)} links "
+                f"({kin.urdf_dir}): {', '.join(_hit)}")
+        else:
+            say(f"Rerun 3D: NO URDF meshes matched — falling back to stick figure. "
+                f"urdf_dir={kin.urdf_dir} meshes={list(_meshes)} chain={_chain}")
+    except Exception as e:
+        say(f"Rerun 3D: mesh self-check failed: {type(e).__name__}: {e}")
+
     frame = 0
+    warned = [False]
     while True:
         try:
             with lock:
@@ -1947,8 +2597,10 @@ def rerun_thread():
                     focus_object_index=0 if centers is not None else None,
                     ground_plane_z_m=0.0)
                 frame += 1
-        except Exception:
-            pass
+        except Exception as e:
+            if not warned[0]:                      # was `pass` — that hid the bug
+                warned[0] = True
+                say(f"Rerun 3D log error: {type(e).__name__}: {e}")
         time.sleep(0.12)
 
 
@@ -1989,6 +2641,29 @@ def main():
         except Exception:
             pass
     fx, fy, cx0, cy0 = (float(intr[k]) for k in ("fx", "fy", "cx", "cy"))
+
+    # A hand-eye TF we FITTED (see calibrate_handeye) overrides the constant.
+    _tfd = load_tf_override()
+    if _tfd:
+        say(f"hand-eye: using CALIBRATED TF from {_tfd.get('fitted','?')} "
+            f"(reprojection {_tfd.get('rms_px',0):.0f}px) -> {_tfd['tf']}")
+    # Sanity gate that costs nothing and would have caught this two days ago: the
+    # camera is bolted to the gripper, so the fingertip has ONE fixed pixel, and we
+    # measured it (HAND_UV). If the TF disagrees, every back-projected ray is wrong
+    # and every range is wrong with it — say so loudly instead of quietly missing.
+    try:
+        _uv = tip_pixel(np.array(HOME, np.float64))
+        _gap = 1e9 if _uv is None else math.hypot(_uv[0] - HAND_UV[0], _uv[1] - HAND_UV[1])
+        if _gap > 40.0:
+            say(f"*** HAND-EYE TF IS BAD: it puts the fingertip at "
+                f"({_uv[0]:.0f},{_uv[1]:.0f}) but the fingers are really at "
+                f"({HAND_UV[0]:.0f},{HAND_UV[1]:.0f}) — {_gap:.0f}px off. Every range "
+                f"will be short. Put the cube in view and press CALIB. ***")
+        else:
+            say(f"hand-eye check: fingertip reprojects {_gap:.0f}px from HAND_UV — OK")
+    except Exception as e:
+        say(f"hand-eye check skipped: {type(e).__name__}: {e}")
+
     say("loading YOLO (parallel validation thread)…")
     detector = YoloWorldDetector(LEROBOT + r"\yolov8s-worldv2.pt", conf=0.10, imgsz=320,
                                  color_filter_min_frac=0.15)
