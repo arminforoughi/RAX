@@ -1822,10 +1822,15 @@ def _center_on_cube(finder, gp, j5):
     # Small, slow probe moves so the measurement is clean and the arm does not jerk.
     PAN_PROBE = 2.0      # deg
     RAD_PROBE = 0.010    # m
-    CENTER_STEP = 0.8    # deg/s per goto_smooth tick
-    CENTER_SETTLE = 0.45 # s
-    MAX_PAN_STEP = 3.5   # deg per iteration
-    MAX_RAD_STEP = 0.015 # m per iteration
+    # Speed is scaled by estimated cube range so the arm slows down as it gets close.
+    # The BASE is the main source of jerk, so its max step scales the most.
+    r_m = _cube_range_m(tr)
+    close = r_m < 0.12          # within ~12 cm -> slow/close mode
+    speed = 0.45 if close else 1.0
+    CENTER_STEP = 0.8 * speed   # deg per goto_smooth tick
+    CENTER_SETTLE = 0.6 if close else 0.45  # s
+    MAX_PAN_STEP = (1.5 if close else 3.5)  # deg per iteration
+    MAX_RAD_STEP = (0.008 if close else 0.015)  # m per iteration
 
     # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
     qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
@@ -2030,10 +2035,15 @@ def run_mission():
             with lock:
                 state["obj3d"] = [float(xy[0]), float(xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
+            d_xy = float(np.linalg.norm(np.array([xy[0], xy[1]]) - tip[:2]))
+            close = d_xy < 0.12
             set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
-                              f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
+                              f"-> x={wx*100:.0f} y={wy*100:.0f} cm "
+                              f"({'close' if close else 'far'})")
+            step = 0.3 if close else 0.5
+            settle = 0.7 if close else 0.55
             if _move_tip(np.array([wx, wy, PICK_HOVER_Z]), pitch, j5,
-                         settle=0.55, step=0.5) is None:
+                         settle=settle, step=step) is None:
                 raise Abort(f"IK cannot reach x={wx*100:.0f} y={wy*100:.0f}")
 
             # CHECKPOINT: look again from the new vantage and refine the target
@@ -2110,9 +2120,12 @@ def run_mission():
         for f in (0.4, 0.75, 1.0):
             checkpoint()
             z = float(z0 + (PICK_GRASP_Z - z0) * f)
+            last = (f == 1.0)
             set_phase("PICK", f"descending to z={z*100:.1f}cm")
+            step = 0.2 if last else 0.4
+            settle = 0.8 if last else 0.6
             if _move_tip(np.array([gx, gy, z]), gp, j5,
-                         settle=0.5, step=0.5) is None:
+                         settle=settle, step=step) is None:
                 say("could not reach that height - closing from here")
                 break
 
