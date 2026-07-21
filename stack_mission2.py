@@ -845,25 +845,31 @@ W2D = {"objs": {}, "next": 1}
 w2d_lock = threading.Lock()
 
 
-def obj_xy_2d(bbox, T_cam):
+def obj_xy_2d(bbox, T_cam, z_m=None):
     """Where the cube is, base-frame (x, y).
 
-    RANGE COMES FROM APPARENT SIZE, not from intersecting the table plane:
+    RANGE COMES FROM STEREO DEPTH when it is available and sane; otherwise it
+    falls back to apparent size:
 
         range = focal * real_cube_edge / bbox_width_px
 
-    which needs only the lens and the cube's real size. The old table-plane
-    intersection inherited the whole camera-mount error and read 50cm for a cube
-    that its own apparent size said was 30cm away. Only the DIRECTION now comes
-    from the mount, and bearing is far less sensitive to it than range was.
+    The apparent-size method needs only the lens and the cube's real size, but
+    it is sensitive to CUBE_EDGE_M being wrong. Stereo depth is independent of
+    the object's size, so it anchors the range and kills the random jumps.
     """
     x1, y1, x2, y2 = bbox
     w, h = x2 - x1, y2 - y1
     if w < 4 or h < 4:
         return None, float("nan"), CUBE_EDGE_M
-    rng = float(fx * CUBE_EDGE_M / float(w))
-    if not (0.05 < rng < 1.20):
-        return None, float("nan"), CUBE_EDGE_M
+
+    # Prefer stereo depth if the caller passed a valid metric range.
+    if z_m is not None and 0.03 < z_m < 1.20:
+        rng = float(z_m)
+    else:
+        rng = float(fx * CUBE_EDGE_M / float(w))
+        if not (0.05 < rng < 1.20):
+            return None, float("nan"), CUBE_EDGE_M
+
     u = (x1 + x2) / 2.0
     v = (y1 + y2) / 2.0
     d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
@@ -933,7 +939,8 @@ def sense_2d(joints=None, rgb=None):
     for finder, label in ((find_red, "red cube"), (find_green, "green cube")):
         tr = finder(rgb, T)
         if tr is not None and not tr.clipped:
-            xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T)
+            z = read_depth_m(tr.uv)
+            xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=z)
             if xy is not None:
                 world2d_update(label, xy, st, sz)
 
@@ -2057,7 +2064,8 @@ def run_mission():
             trf = _cube_track(finder, tries=3)
             if trf is not None and not trf.clipped:
                 jf, _rgbf, _ = observe()
-                xyf, _rngf, _szf = obj_xy_2d(trf.bbox_xyxy, T_cam_of(jf))
+                zf = read_depth_m(trf.uv)
+                xyf, _rngf, _szf = obj_xy_2d(trf.bbox_xyxy, T_cam_of(jf), z_m=zf)
                 if xyf is not None:
                     xy2 = xyf
             if xy2 is None:
@@ -2294,6 +2302,11 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
       <label>steps</label>
       <input id="tune-steps" type="number" step="1" value="4" title="Number of staged approach waypoints.">
       <button onclick="setTune('steps','/setsteps?n=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>cube cm</label>
+      <input id="tune-cube" type="number" step="0.5" value="5.08" title="Real cube edge in cm. Used for apparent-size range fallback.">
+      <button onclick="setTune('cube','/setcubesize?cm=')">Set</button>
     </div>
   </div>
   <pre id="log"></pre>
@@ -2580,6 +2593,8 @@ async function tick(){
       if(tt && document.activeElement !== tt) tt.value = s.tune.right_trim_cm;
       const ts = document.getElementById('tune-steps');
       if(ts && document.activeElement !== ts) ts.value = s.tune.approach_steps;
+      const tc = document.getElementById('tune-cube');
+      if(tc && document.activeElement !== tc) tc.value = s.tune.cube_edge_cm;
     }
   }catch(e){}
   setTimeout(tick, 700);
@@ -2649,6 +2664,7 @@ def status():
         "aim_du": round(AIM_DU, 1),
         "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
         "approach_steps": APPROACH_STEPS,
+        "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
     }
     return jsonify(s)
 
@@ -2750,8 +2766,8 @@ def geom():
     # every mapped object (2D map) as a table-resting cube for the 3D viewer
     objs2d = [{"x": o["x"], "y": o["y"], "s": o["size"], "label": o["label"], "tag": o["tag"]}
               for o in world2d_snapshot()]
-    return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl, obj_size=0.03,
-                   objs2d=objs2d)
+    return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl,
+                   obj_size=round(float(CUBE_EDGE_M), 3), objs2d=objs2d)
 
 
 @app.route("/stream")
@@ -3239,6 +3255,22 @@ def setsteps():
     APPROACH_STEPS = int(np.clip(n, 1, 12))
     say(f"approach steps set to {APPROACH_STEPS}")
     return jsonify(ok=True, n=APPROACH_STEPS)
+
+
+@app.route("/setcubesize", methods=["POST"])
+def setcubesize():
+    """Live-tune the assumed cube edge size (cm). Used by the 2D map apparent-size
+    fallback. If the 3D lock / map cubes look too close/far or the wrong size,
+    adjust this to the real cube edge."""
+    try:
+        cm = float(request.args.get("cm", request.form.get("cm", 5.08)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    global CUBE_EDGE_M
+    cm = float(np.clip(cm, 1.0, 30.0))
+    CUBE_EDGE_M = cm / 100.0
+    say(f"cube edge size set to {cm:.2f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/relocate", methods=["POST"])
