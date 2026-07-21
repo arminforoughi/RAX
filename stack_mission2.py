@@ -14,7 +14,7 @@
 #  * UI: second (room) camera proxied from camserv on :5000; overlays only show
 #    FRESH tracks (age < 0.7 s) so stale boxes don't wander; anchor shown as a
 #    circle.
-import json, math, os, sys, tempfile, threading, time
+import json, math, os, subprocess, sys, tempfile, threading, time
 from collections import deque
 
 import cv2
@@ -44,8 +44,20 @@ LEROBOT = r"C:\Users\labot\Documents\lerobot"
 OUT = os.path.join(tempfile.gettempdir(), "rax_stack_mission")  # debug-image dumps
 os.makedirs(OUT, exist_ok=True)
 TF = "-0.0503,0.0906,-0.1730,-0.2921,1.0770,-2.1688"
-VIEW = np.array([-6.7, 37.1, 48.1, -40.4, -28.4])
-HOME = np.array([-9.67, -102.022, 98.066, 32.879, 0.0])
+# [shoulder_pan, shoulder_lift, elbow, wrist_flex, wrist_roll]
+# pan  -6.7 -> +5.0 : turn the whole robot a few degrees LEFT, so the view swings RIGHT
+# roll -28.4 -> 90  : twist the wrist 90deg so the jaws are square to the cube
+GRASP_ROLL = 90.0
+# Display-only: degrees added to wrist_roll before drawing the URDF, because the
+# URDF's roll zero is rotated from the servo's zero. If the rendered gripper is now
+# twisted the OTHER way, flip this sign.
+WRIST_RENDER_OFFSET = 90.0
+# Same story for the base: the arm sits physically straight while shoulder_pan
+# reads about -14deg, so the drawn robot looks swung round. Display only.
+BASE_RENDER_OFFSET = 14.1
+VIEW = np.array([5.0, 37.1, 48.1, -40.4, GRASP_ROLL])
+# New home: captured from the physically-correct folded pose (2026-07-20).
+HOME = np.array([-14.1, -99.1, 90.8, 33.2, -4.7])
 HAND_UV = (440.0, 394.0)   # measured via /caltip against the real black fingertip
 HAND_AREA_MIN = 9000.0
 # MEASURED FROM THE URDF + JAW MESH (2026-07-13), do not guess this:
@@ -370,7 +382,13 @@ def publish(rgb, joints=None):
         if tr is not None and now - tr.t < 0.7:   # fresh only — no wandering stale boxes
             x1, y1, x2, y2 = (int(v) for v in tr.bbox_xyxy)
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(img, name, (x1, max(14, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # label with the DISTANCE, from apparent size: range = f * edge / width.
+            # Needs only the lens focal length and the cube's real size, so it stays
+            # honest regardless of the camera-mount numbers.
+            w_px = float(max(4, x2 - x1))
+            rng_cm = fx * CUBE_EDGE_M / w_px * 100.0
+            cv2.putText(img, f"{name} {rng_cm:.0f}cm", (x1, max(14, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     with lock:
         cv2.putText(img, state["phase"], (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80, 255, 120), 2)
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
@@ -771,7 +789,10 @@ TABLE_Z = [Z_TABLE]
 # under itself instead of reaching out to the cube. So AFTER localizing, push the
 # point radially OUTWARD (away from the base) by this much. Live-tunable via /pushout
 # (a number box in the UI) so it can be dialled against the 3D view without a restart.
-PUSH_OUT = [0.10]
+# DEFAULT 0: once the hand-eye TF is CALIBRATED, the 10 cm camera-behind-gripper
+# offset lives in the TF translation, so this fudge double-counts and pushes the
+# cube OUT OF REACH (seen live: raw r=34.6cm + 10cm = 44.6cm -> "cannot reach").
+PUSH_OUT = [0.0]
 
 
 def push_out_radial(p):
@@ -806,6 +827,173 @@ def ray_to_table(uv, T_base_cam, z_plane=None):
 
 TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise:
                    # "everything is on the same table and height as the base")
+
+
+# ================= 2D BEV object map (top-down, base X-Y plane) =================
+# A simple bird's-eye map of the table. Each detection's sightline is cast onto
+# the table plane (inverse perspective mapping) through the CAD-calibrated camera
+# -> object (x, y). One running-mean entry per object; click a dot in the UI to
+# fly the gripper on top. Each entry also carries the STEREO range next to the
+# IPM range, so the two can be compared (if they disagree, the hand-eye distance
+# is off; if they agree, the object really is that far).
+W2D_MERGE = 0.18          # detections of the same label within this = same object.
+                          # Wider than one cube because the current hand-eye TF
+                          # spreads a single cube's localization ~15cm across pan
+                          # angles; re-fitting the TF (Calib) shrinks this and the
+                          # merge can come back down.
+W2D = {"objs": {}, "next": 1}
+w2d_lock = threading.Lock()
+
+
+def obj_xy_2d(bbox, T_cam):
+    """Where the cube is, base-frame (x, y).
+
+    RANGE COMES FROM APPARENT SIZE, not from intersecting the table plane:
+
+        range = focal * real_cube_edge / bbox_width_px
+
+    which needs only the lens and the cube's real size. The old table-plane
+    intersection inherited the whole camera-mount error and read 50cm for a cube
+    that its own apparent size said was 30cm away. Only the DIRECTION now comes
+    from the mount, and bearing is far less sensitive to it than range was.
+    """
+    x1, y1, x2, y2 = bbox
+    w, h = x2 - x1, y2 - y1
+    if w < 4 or h < 4:
+        return None, float("nan"), CUBE_EDGE_M
+    rng = float(fx * CUBE_EDGE_M / float(w))
+    if not (0.05 < rng < 1.20):
+        return None, float("nan"), CUBE_EDGE_M
+    u = (x1 + x2) / 2.0
+    v = (y1 + y2) / 2.0
+    d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
+    d /= np.linalg.norm(d)
+    p = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
+    xy = p[:2]
+    if not (0.05 < float(np.hypot(*xy)) < 0.95):
+        return None, float("nan"), CUBE_EDGE_M
+    return xy, float(rng), CUBE_EDGE_M
+
+
+def _consolidate_2d():
+    """Merge same-label objects whose centres are within W2D_MERGE — collapses the
+    duplicate 'ghost' tags that a jittery localization spawns for ONE physical cube
+    (the overlapping-predictions the user saw). Weighted by observation count.
+    Caller holds w2d_lock."""
+    objs = W2D["objs"]
+    changed = True
+    while changed:
+        changed = False
+        items = list(objs.items())
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                ta, a = items[i]
+                tb, b = items[j]
+                if ta not in objs or tb not in objs or a["label"] != b["label"]:
+                    continue
+                if float(np.hypot(*(a["xy"] - b["xy"]))) < W2D_MERGE:
+                    keep, drop = (ta, tb) if a["n"] >= b["n"] else (tb, ta)
+                    ko, do = objs[keep], objs[drop]
+                    wsum = ko["n"] + do["n"]
+                    ko["xy"] = (ko["n"] * ko["xy"] + do["n"] * do["xy"]) / wsum
+                    ko["size"] = max(ko.get("size", 0.03), do.get("size", 0.03))
+                    ko["n"] = wsum
+                    ko["t"] = max(ko["t"], do["t"])
+                    del objs[drop]
+                    changed = True
+                    break
+            if changed:
+                break
+
+
+def world2d_update(label, xy, stereo, size=0.03):
+    with w2d_lock:
+        best, bd = None, W2D_MERGE
+        for t, o in W2D["objs"].items():
+            if o["label"] == label and float(np.hypot(*(o["xy"] - xy))) < bd:
+                best, bd = t, float(np.hypot(*(o["xy"] - xy)))
+        if best is None:
+            t = W2D["next"]; W2D["next"] += 1
+            W2D["objs"][t] = {"label": label, "xy": np.asarray(xy, float),
+                              "size": float(size), "n": 1, "stereo": stereo, "t": time.time()}
+        else:
+            o = W2D["objs"][best]
+            o["xy"] = 0.7 * o["xy"] + 0.3 * np.asarray(xy, float)
+            o["size"] = 0.8 * o.get("size", size) + 0.2 * float(size)
+            o["n"] += 1
+            o["stereo"] = stereo
+            o["t"] = time.time()
+        _consolidate_2d()
+
+
+def sense_2d(joints=None, rgb=None):
+    if joints is None:
+        joints, rgb, _ = observe()
+    T = T_cam_of(joints)
+    for finder, label in ((find_red, "red cube"), (find_green, "green cube")):
+        tr = finder(rgb, T)
+        if tr is not None and not tr.clipped:
+            xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T)
+            if xy is not None:
+                world2d_update(label, xy, st, sz)
+
+
+def world2d_snapshot():
+    now = time.time()
+    with w2d_lock:
+        return [{"tag": t, "label": o["label"],
+                 "x": round(float(o["xy"][0]), 3), "y": round(float(o["xy"][1]), 3),
+                 "size": round(float(o.get("size", 0.03)), 3),
+                 "r_cm": round(float(np.hypot(*o["xy"])) * 100, 1),
+                 "ang": round(math.degrees(math.atan2(o["xy"][1], o["xy"][0]))),
+                 "stereo_cm": (round(o["stereo"] * 100) if o["stereo"] == o["stereo"] else None),
+                 "n": o["n"], "age": round(now - o["t"], 1)}
+                for t, o in W2D["objs"].items()]
+
+
+def scan_2d():
+    """Pan the base smoothly across the front arc, sensing into the 2D map."""
+    set_phase("SCAN2D", "sweeping the table into the 2D map")
+    start = float(observe()[0][0])
+    for target in (start - 45.0, start + 45.0, start):
+        target = float(np.clip(target, -110.0, 110.0))
+        cur = float(observe()[0][0])
+        n = 0
+        while abs(cur - target) > 1.0:
+            checkpoint()
+            cur += float(np.clip(target - cur, -0.6, 0.6))     # smooth fine step
+            q = observe(overlay=True)[0].astype(np.float64)
+            q[0] = cur
+            send_joints(q)
+            if n % 4 == 0:
+                sense_2d()
+            n += 1
+            time.sleep(0.033)
+    set_phase("IDLE", f"2D map: {len(world2d_snapshot())} object(s)")
+
+
+def goto_2d(tag):
+    """Fly the gripper on top of a mapped object (hover ~6 cm above its (x,y))."""
+    with w2d_lock:
+        o = W2D["objs"].get(tag)
+    if o is None:
+        raise Abort(f"tag {tag} not in the 2D map")
+    xy, label = o["xy"], o["label"]
+    set_phase("GOTO2D", f"{label} #{tag} @ ({xy[0]*100:.0f},{xy[1]*100:.0f})cm")
+    j = observe()[0].astype(np.float64)
+    pitch, e = plan_grasp_pitch(np.array([xy[0], xy[1], 0.02]), j)
+    if pitch is None:
+        raise Abort(f"{label} #{tag}: out of reach (best IK {e*1e3:.0f}mm, "
+                    f"r={np.hypot(*xy)*100:.0f}cm)")
+    q, err = _ik_hold_pitch(observe()[0], np.array([xy[0], xy[1], 0.06]), pitch,
+                            float(j[4]), ret_err=True)
+    if err > 0.008:
+        raise Abort(f"hover pose unreachable (IK {err*1e3:.0f}mm)")
+    goto_smooth(q, settle=0.6)
+    with lock:
+        state["obj3d"] = [float(xy[0]), float(xy[1]), 0.02]
+        state["obj3d_label"] = label.split()[0]
+    set_phase("GOTO2D", f"on top of {label} #{tag}")
 
 
 def solve_on_table(tr, T_base_cam):
@@ -900,6 +1088,123 @@ def load_tf_override():
     except Exception as e:
         say(f"hand-eye: ignoring bad {os.path.basename(TF_FILE)} ({e})")
         return None
+
+
+def calibrate_mount_multiview(finder, label="red", n_pan=5):
+    """Pin the camera mount by MULTI-VIEW CONSISTENCY.
+
+    A stationary cube on the table must map to the SAME (x, y) no matter which pose
+    the arm views it from. That is the honest objective, and it pins the mount
+    orientation properly.
+
+    Why the previous attempts failed:
+      * Fitting the cube's blob reprojection has a ~55-80px noise floor, so the fit
+        wandered and the acceptance gate threw away good solutions.
+      * Constraining only the FINGERTIP pixel gives 2 equations for 3 rotation
+        angles -- roll about the tip ray is unobservable, so a single-pose fix held
+        near that pose and drifted everywhere else (map went from r=34cm to r=53cm).
+    Here every extra viewpoint adds constraints, and the fingertip term is kept as
+    an anchor so the solution cannot slide off into a mirrored/degenerate pose.
+    """
+    global T_ee_cam
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+    set_phase("CALIB", "multi-view mount calibration: sampling the cube")
+    q0 = observe()[0].astype(np.float64)
+    samples = []
+    for dpan in np.linspace(-16.0, 16.0, n_pan):
+        for dlift in (0.0, -7.0):
+            checkpoint()
+            q = q0.copy()
+            q[0] = float(np.clip(q[0] + dpan, -100, 100))
+            q[1] = float(np.clip(q[1] + dlift, -95, 95))
+            try:
+                goto_smooth(q, settle=0.35)
+            except Exception:
+                continue
+            j, rgb, _ = observe()
+            tr = finder(rgb, T_cam_of(j))
+            if tr is None or tr.clipped:
+                continue
+            T_ee = np.asarray(kin.forward_kinematics(np.asarray(j, np.float64)))
+            samples.append((T_ee, np.array(tr.uv, np.float64)))
+    goto_smooth(q0, settle=0.5)
+    say(f"multi-view: {len(samples)} usable views of the {label} cube")
+    if len(samples) < 5:
+        raise Abort(f"only {len(samples)} views - need at least 5. "
+                    f"Keep the cube visible while the arm pans.")
+
+    t0 = T_ee_cam[:3, 3].copy()
+
+    def unpack(x):
+        T = np.eye(4)
+        T[:3, :3] = Rotation.from_rotvec(x[:3]).as_matrix()
+        T[:3, 3] = x[3:6]
+        return T
+
+    def table_pts(T_cam_ee):
+        pts = []
+        for T_ee, uv in samples:
+            T = T_ee @ T_cam_ee
+            o = T[:3, 3]
+            d = T[:3, :3] @ np.array([(uv[0]-cx0)/fx, (uv[1]-cy0)/fy, 1.0])
+            if d[2] >= -1e-3:
+                return None
+            t = (TABLE_Z0 - o[2]) / d[2]
+            if not (0.02 < t < 2.0):
+                return None
+            pts.append((o + t*d)[:2])
+        return np.array(pts) if pts else None
+
+    def resid(x):
+        T = unpack(x)
+        pts = table_pts(T)
+        if pts is None:
+            return np.full(2*len(samples) + 2, 10.0)
+        spread = (pts - pts.mean(axis=0)).ravel() * 40.0      # metres -> weighted
+        # fingertip anchor: it must still reproject to its measured pixel
+        T_ee, _ = samples[0]
+        tip = T_ee[:3, 3] + T_ee[:3, :3] @ np.array([0, 0, GRIP_TIP_OFFSET_M])
+        Tbc = T_ee @ T
+        pc = np.linalg.inv(Tbc) @ np.append(tip, 1.0)
+        if pc[2] <= 1e-6:
+            anchor = np.array([10.0, 10.0])
+        else:
+            u = fx*pc[0]/pc[2] + cx0
+            v = fy*pc[1]/pc[2] + cy0
+            anchor = np.array([u - HAND_UV[0], v - HAND_UV[1]]) * 0.02
+        return np.concatenate([spread, anchor])
+
+    x0 = np.concatenate([Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(), t0])
+    lo = np.concatenate([x0[:3] - 1.2, t0 - 0.06])
+    hi = np.concatenate([x0[:3] + 1.2, t0 + 0.06])
+    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
+                        max_nfev=3000, ftol=1e-10, xtol=1e-10)
+
+    def spread_cm(x):
+        pts = table_pts(unpack(x))
+        if pts is None:
+            return 999.0
+        return float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).mean() * 100)
+
+    before, after = spread_cm(x0), spread_cm(sol.x)
+    say(f"multi-view spread: {before:.1f}cm -> {after:.1f}cm "
+        f"(how much the same cube moves between viewpoints)")
+    if after > before or after > 4.0:
+        raise Abort(f"multi-view calibration did not converge "
+                    f"(spread {after:.1f}cm) - mount NOT changed")
+    T_new = unpack(sol.x)
+    rv = Rotation.from_matrix(T_new[:3, :3]).as_rotvec()
+    tf_str = ",".join(f"{v:.4f}" for v in list(T_new[:3, 3]) + list(rv))
+    T_ee_cam = T_new
+    with open(TF_FILE, "w") as f:
+        json.dump({"tf": tf_str, "rms_px": 0, "tip_px": 0,
+                   "spread_cm": after, "views": len(samples),
+                   "source": "multi-view consistency", "fitted": time.strftime("%Y-%m-%d %H:%M:%S")},
+                  f, indent=2)
+    say(f"mount CALIBRATED (multi-view) -> {tf_str}")
+    set_phase("IDLE", f"mount calibrated - same cube now agrees to {after:.1f}cm across views")
+
 
 
 def calibrate_handeye(finder, n_target=14):
@@ -1027,7 +1332,13 @@ def calibrate_handeye(finder, n_target=14):
     say(f"hand-eye AFTER:  cube reprojection RMS={rms(sol.x):.0f}px  "
         f"fingertip off by {tipgap(sol.x):.0f}px")
 
-    if rms(sol.x) > 25.0 or tipgap(sol.x) > 40.0:
+    # Gate on the FINGERTIP gap — a HARD geometric constraint (the camera is bolted
+    # to the gripper, so FK's fingertip must reproject to the measured HAND_UV), which
+    # locks to ~0px on a good fit. Do NOT gate tightly on the cube RMS: a colour-blob
+    # centroid has a ~50-80px noise floor that MORE poses do not lower, so a 25px bar
+    # rejected a GOOD fit (tip 0px, rms 49px) and kept the broken CAD TF. Accept when
+    # the fingertip nails it and the cube RMS is merely sane.
+    if tipgap(sol.x) > 12.0 or rms(sol.x) > 100.0:
         raise Abort(f"hand-eye: fit did not converge (RMS {rms(sol.x):.0f}px, "
                     f"tip {tipgap(sol.x):.0f}px) — TF NOT changed. More pose spread needed.")
 
@@ -1093,7 +1404,20 @@ HOP_M = 0.030            # m, max Cartesian step per hop
 #     r=10cm -> 85..95 only     r=15cm -> 65..95     r=20cm -> 45..95
 # So a close cube can ONLY be grasped nearly straight down; there is no choice about
 # it. We try steep-first and let the (now limit-aware) IK veto what it cannot hold.
-GRASP_PITCH = (75.0, 80.0, 70.0, 85.0, 90.0, 65.0, 60.0, 55.0)
+# Steep first (best grip on a table cube), then progressively SHALLOWER as
+# fallbacks. Reach depends strongly on this angle — measured from the URDF:
+#   90deg -> 30.8cm | 70deg -> 36.4cm | 60deg -> 39.8cm
+#   50deg -> 42.7cm | 40deg -> 45.2cm | 30deg -> 46.2cm
+#   20deg -> 47.0cm | 10deg -> 47.5cm |  0deg -> 47.8cm
+# Stopping the list at 55deg capped the arm at ~41cm, so anything further out was
+# declared unreachable and the approach died short. The shallow entries let the
+# arm actually GET THERE; the loop still returns the steepest angle that solves,
+# so near cubes are unaffected. Real reach depends on the target height and pose;
+# the arm can exceed 52 cm in favourable configurations, so the edge tolerance is
+# relaxed rather than hard-capping the range.
+GRASP_PITCH = (75.0, 80.0, 70.0, 85.0, 90.0, 65.0, 60.0, 55.0,
+               50.0, 45.0, 40.0, 35.0, 30.0, 25.0, 20.0, 15.0,
+               10.0, 5.0, 0.0)
 
 
 def plan_grasp_pitch(p_obj, q_seed):
@@ -1126,10 +1450,18 @@ def plan_grasp_pitch(p_obj, q_seed):
         _, e_hi = _ik_hold_pitch(q_seed, p_above, pitch, float(q_seed[4]), ret_err=True)
         _, e_lo = _ik_hold_pitch(q_seed, p_obj, pitch, float(q_seed[4]), ret_err=True)
         worst = max(float(e_hi), float(e_lo))
-        if worst < 0.004:
+        # At the workspace edge (shallow pitch / far reach) the IK residual can be a
+        # few mm larger and still be a valid pose. Use a sliding tolerance so we do
+        # not throw away the arm's real reach; the visual centering pass then fine-tunes.
+        tol = 0.025 if pitch <= 15.0 else 0.004
+        if worst <= tol:
             return pitch, worst
         if best is None or worst < best[1]:
             best = (pitch, worst)
+    # Last resort: if nothing solved tightly but the best residual is still usable,
+    # return it rather than declaring the cube unreachable at the edge of reach.
+    if best is not None and best[1] <= 0.030:
+        return best
     return None, best[1]
 
 
@@ -1308,81 +1640,500 @@ def gentle_scan(finder, label, span_deg=70.0):
 
 
 # ---------------- mission ----------------
+# ================= CLEAN PICK (the Start button) ===========================
+# Everything the pick needs is in ONE gripper-camera frame: the cube and the
+# fingertips are both visible. So the whole algorithm is four honest steps:
+#   1. SEE the cube, cast its ground-contact pixels onto the table -> (x, y)
+#      (the exact same math the 2D map already uses)
+#   2. IK the fingertip ON TOP of (x, y), hand pointing straight down
+#   3. DESCEND straight down onto (x, y, table)
+#   4. CLOSE on torque, then LIFT
+# No stereo, no push-out fudge, no multi-vantage triangulation, no gaze servo,
+# no camera self-calibration in the loop. If it lands off, we SEE by how much and
+# trim — we do not guess.
+PICK_HOVER_Z = 0.06        # hover this far above the table before descending
+PICK_GRASP_Z = 0.015       # descend to here (grab the cube's lower body)
+PICK_LIFT_M = 0.10
+
+
+def _target_finder():
+    """(finder, tracker, label) for the colour named in the detection query.
+
+    Use whichever colour is named FIRST. A plain `"green" in query` test picked
+    GREEN out of the default "red cube, green cube" — so the arm dutifully drove at
+    the green cube while the user was waiting for it to grab the red one."""
+    q = (state.get("query") or "red").lower()
+    ir, ig = q.find("red"), q.find("green")
+    if ig != -1 and (ir == -1 or ig < ir):
+        return find_green, green_tracker, "green"
+    return find_red, red_tracker, "red"
+
+
+def locate_target_xy(finder, tries=8):
+    """Where the cube sits on the table, base-frame (x, y): cast its ground-contact
+    pixels onto the table plane and take the median over a few reads. This is the
+    SAME localisation the 2D map uses. None if the cube isn't clearly in view."""
+    pts = []
+    for _ in range(tries):
+        checkpoint()
+        j, rgb, _ = observe()
+        tr = finder(rgb, T_cam_of(j))
+        if tr is None or tr.clipped:
+            time.sleep(0.05)
+            continue
+        xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T_cam_of(j))
+        if xy is not None:
+            pts.append(xy)
+        time.sleep(0.03)
+    if len(pts) < 3:
+        return None
+    return np.median(np.array(pts), axis=0)
+
+
+# ---- uncalibrated visual servo -------------------------------------------
+# We never trust where the camera is bolted. Instead the arm MEASURES its own
+# image response: move the fingertip a known 2 cm in base X, watch which way the
+# cube's pixel slides; same for Y. That 2x2 "pixels per metre" matrix replaces the
+# camera-mount transform completely. Then we simply drive the cube's pixel onto
+# the fingertip pixel (both are in the same picture), descending as we go. The
+# DESCENT is pure kinematics (joint angles + URDF), which is always trustworthy.
+SERVO_TOL_PX = 26.0        # cube pixel this close to the fingertip pixel = aligned
+SERVO_MAX_STEP = 0.030     # m of horizontal correction per iteration
+SERVO_PROBE = 0.020        # m probe step used to MEASURE the pixel response
+SERVO_DESC = 0.015         # m descend per iteration once roughly centred
+SERVO_DESC_GATE_PX = 120.0 # only descend while the cube is at least this centred
+CUBE_EDGE_M = 0.0508       # the cube's real edge: 2 inches. Back-solved from a
+                           # known 26cm sighting (edge = range*bbox_px/fx). At 1in
+                           # it read 12cm for a cube really 26cm out, and the
+                           # under-read range also squashed the cubes together — turns apparent size into
+                           # a range. If your cube isn't 4cm, change THIS number.
+# Lateral aim trim, in pixels, applied to the fingertip aim point. The gripper was
+# consistently ending up LEFT of the cube. Moving the aim point LEFT (negative)
+# makes the arm travel FURTHER RIGHT before it thinks it is lined up, because
+# swinging the camera right slides the cube left in the picture. If it now
+# overshoots to the right, make this less negative; if still left, more negative.
+# Shift the visual centering aim point ~5 cm to the LEFT of the crosshair so the
+# robot ends up on the RIGHT side of the cube.
+AIM_DU = -90.0
+AIM_DV = 0.0
+# Damping. Taking the FULL Jacobian step overshoots and the arm hunts back and
+# forth. Move a fraction of the computed correction each step, and shrink the step
+# as the error shrinks, so it eases in instead of shaking.
+SERVO_GAIN = 0.55
+SERVO_DESC_RANGE = 0.12    # do NOT descend until the cube is actually this close.
+                           # Pixel alignment alone is not proximity.
+SERVO_WORK_Z = 0.07        # hold the fingertip at THIS height (absolute) while
+                           # approaching. Commanding only relative height changes let
+                           # per-step error accumulate upward — measured live, the tip
+                           # climbed 7cm -> 22cm and "converged" in mid-air.
+MAX_SERVO_ITERS = 26       # short steps now, so allow more of them
+
+
+def _cube_track(finder, tries=4):
+    """The cube's detection right now (pixel + bbox), or None."""
+    for _ in range(tries):
+        checkpoint()
+        j, rgb, _ = observe()
+        tr = finder(rgb, T_cam_of(j))
+        if tr is not None:
+            return tr
+        time.sleep(0.05)
+    return None
+
+
+def _cube_uv(finder, tries=4):
+    tr = _cube_track(finder, tries)
+    return None if tr is None else np.array(tr.uv, np.float64)
+
+
+def _cube_range_m(tr):
+    """How far away the cube is, from how BIG IT LOOKS.
+
+        range = focal_length * real_edge / apparent_width_px      (pinhole)
+
+    This needs only the lens focal length and the cube's real size — no camera-mount
+    transform — so it stays honest even while the mount numbers are wrong. It is the
+    signal that tells us whether we are actually NEAR the cube, as opposed to merely
+    lined up with it in the picture (a cube 40cm away can sit exactly on the
+    fingertip pixel, which is why descending on pixel-alignment alone landed the
+    gripper on bare board half way out)."""
+    w = float(max(4.0, tr.bbox_xyxy[2] - tr.bbox_xyxy[0]))
+    return float(fx * CUBE_EDGE_M / w)
+
+
+def _tip(q):
+    return np.asarray(kin.forward_kinematics(np.asarray(q, np.float64)))[:3, 3]
+
+
+def _move_tip(p_tgt, pitch, j5, settle=0.25, step=1.5):
+    """Move the FINGERTIP to a base-frame POSITION. Returns the pitch used, or None.
+
+    Demanding ONE exact wrist pitch is why the arm sat still: measured live, it was
+    commanded 3cm and achieved 0.0cm over and over at r=21cm — nowhere near a reach
+    limit. Holding a single pitch simply has no IK solution in much of this
+    workspace. Getting the fingertip to the POSITION is what matters; the precise
+    wrist angle does not until the final grasp. So try the requested pitch, then
+    sweep outward and take the first angle that actually solves.
+    """
+    q = observe()[0].astype(np.float64)
+    p_tgt = np.asarray(p_tgt, np.float64)
+    cands = [float(pitch)]
+    for dp in (-8, 8, -16, 16, -25, 25, -35, 35, -45, 45, -55, 55, -65, -75):
+        pc = float(pitch) + dp
+        if 0.0 <= pc <= 88.0:
+            cands.append(pc)
+    for pc in cands:
+        q_t, e = _ik_hold_pitch(q, p_tgt, pc, j5, ret_err=True)
+        # Match the sliding tolerance in plan_grasp_pitch so shallow / far-reach
+        # poses that were accepted there are not rejected here.
+        tol = 0.012 if pc <= 15.0 else 0.008
+        if e <= tol:
+            goto_smooth(q_t, settle=settle, step=step)
+            return pc
+    return None
+
+
+ALIGN_TOL_PX = 34.0        # cube this close to the gripper pixel = aligned
+ALIGN_ITERS = 8
+ALIGN_PROBE_M = 0.02       # metres to probe when measuring the image response
+ALIGN_CAP_M = 0.025        # max lateral correction per iteration
+
+
+def _center_on_cube(finder, gp, j5):
+    """Center the cube under the jaws with DECOUPLED single-DOF servos:
+
+      * horizontal pixel error  ->  rotate the BASE (shoulder_pan)
+      * vertical pixel error    ->  reach RADIALLY in/out
+
+    Each axis is one joint and monotonic, so the sign is trivial to measure and the
+    loop is stable. The previous 2D-Cartesian Jacobian oscillated (109->96->119px)
+    because base rotation, reach and an auto-swept wrist pitch all mixed into it.
+    Pitch is held FIXED here. Returns the final (x, y), or None."""
+    tgt_u = HAND_UV[0] + AIM_DU
+    tgt_v = HAND_UV[1] + AIM_DV
+    tr = _cube_track(finder, tries=5)
+    if tr is None:
+        say("center: cube not in view")
+        return None
+    uv0 = np.array(tr.uv, np.float64)
+    q0 = observe()[0].astype(np.float64)
+    p0 = _tip(q0)
+
+    # Small, slow probe moves so the measurement is clean and the arm does not jerk.
+    PAN_PROBE = 2.0      # deg
+    RAD_PROBE = 0.010    # m
+    CENTER_STEP = 0.8    # deg/s per goto_smooth tick
+    CENTER_SETTLE = 0.45 # s
+    MAX_PAN_STEP = 3.5   # deg per iteration
+    MAX_RAD_STEP = 0.015 # m per iteration
+
+    # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
+    qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
+    goto_smooth(qp, settle=CENTER_SETTLE, step=CENTER_STEP)
+    trp = _cube_track(finder, tries=4)
+    goto_smooth(q0, settle=CENTER_SETTLE, step=CENTER_STEP)
+    if trp is None or abs(float(qp[0] - q0[0])) < 0.5:
+        say("center: horizontal probe failed")
+        return _tip(observe()[0])[:2]
+    du_dpan = (float(trp.uv[0]) - uv0[0]) / (qp[0] - q0[0])       # px per deg
+    if abs(du_dpan) < 3.0:
+        say("center: base rotation barely moves the cube")
+        return _tip(observe()[0])[:2]
+
+    # --- probe the VERTICAL sign: cube_v change per +RAD_PROBE radial reach ---
+    r0 = float(np.hypot(p0[0], p0[1])); uo = np.array([p0[0], p0[1]]) / max(r0, 1e-6)
+    dv_dr = None
+    if _move_tip(np.array([p0[0] + uo[0]*RAD_PROBE, p0[1] + uo[1]*RAD_PROBE, p0[2]]),
+                 gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
+        trr = _cube_track(finder, tries=4)
+        _move_tip(np.array([p0[0], p0[1], p0[2]]), gp, j5,
+                  settle=CENTER_SETTLE, step=CENTER_STEP)
+        if trr is not None:
+            dv_dr = (float(trr.uv[1]) - uv0[1]) / RAD_PROBE        # px per metre
+    say(f"center: du/dpan={du_dpan:.1f}px/deg" +
+        (f", dv/dr={dv_dr:.0f}px/m" if dv_dr else ", (no vertical probe)"))
+
+    for it in range(ALIGN_ITERS):
+        checkpoint()
+        tr = _cube_track(finder, tries=3)
+        if tr is None:
+            say("center: cube gone (likely under the jaws) - stopping")
+            break
+        du = float(tr.uv[0]) - tgt_u
+        dv = float(tr.uv[1]) - tgt_v
+        say(f"center {it}: {abs(du):.0f}px {'right' if du > 0 else 'left'}, "
+            f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the jaws")
+        if abs(du) < ALIGN_TOL_PX and abs(dv) < ALIGN_TOL_PX * 1.3:
+            say("centered on the cube")
+            break
+        moved = False
+        q = observe()[0].astype(np.float64)
+        if abs(du) >= ALIGN_TOL_PX:                # horizontal via base rotation
+            dpan = float(np.clip(-du / du_dpan, -MAX_PAN_STEP, MAX_PAN_STEP))
+            q[0] = float(np.clip(q[0] + dpan, -100, 100))
+            goto_smooth(q, settle=CENTER_SETTLE, step=CENTER_STEP); moved = True
+        if dv_dr and abs(dv) >= ALIGN_TOL_PX * 1.3:   # vertical via radial reach
+            p = _tip(observe()[0]); r = float(np.hypot(p[0], p[1]))
+            uo = np.array([p[0], p[1]]) / max(r, 1e-6)
+            dr = float(np.clip(-dv / dv_dr, -MAX_RAD_STEP, MAX_RAD_STEP))
+            if _move_tip(np.array([p[0] + uo[0]*dr, p[1] + uo[1]*dr, p[2]]),
+                         gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
+                moved = True
+        if not moved:
+            break
+    tip = _tip(observe()[0])
+    return np.array([tip[0], tip[1]], np.float64)
+
+
+def _step_tip(p_from, delta, pitch, j5):
+    """Move as far along `delta` as the arm can ACTUALLY reach.
+
+    Bailing out the moment the full step is unreachable is what made the approach
+    "go forward a little and give up": one 3 cm request fails IK and the whole
+    servo stops. Instead, shorten the step (and, as a last resort, flatten the hand
+    a little — a shallower pitch reaches further forward) until something is
+    reachable.
+
+    Returns the pitch ACTUALLY used (the fallback may flatten the hand), or None if
+    nothing was reachable. The caller must adopt the returned pitch — otherwise the
+    next move snaps the wrist back to the old angle, the wrist oscillates, and the
+    camera swings off the cube.
+    """
+    # Smaller commanded moves get a gentler servo rate and a longer settle, so the
+    # final centimetres glide in instead of snapping and ringing.
+    n = float(np.linalg.norm(delta))
+    fine = n < 0.012
+    settle = 0.45 if fine else 0.25
+    rate = 0.8 if fine else 1.5
+    for scale in (1.0, 0.7, 0.45, 0.3, 0.18, 0.1):
+        used = _move_tip(p_from + delta * scale, pitch, j5, settle=settle, step=rate)
+        if used is not None:
+            return used
+    return None
+
+
+def _measure_pixel_response(finder, pitch, j5):
+    """Probe the arm against its own camera: step the fingertip in base X, then Y,
+    and watch the cube's pixel move. Returns the 2x2 matrix (px per metre)."""
+    uv0 = _cube_uv(finder)
+    if uv0 is None:
+        return None
+    p0 = _tip(observe()[0])
+    J = np.zeros((2, 2))
+    for c, d in enumerate((np.array([SERVO_PROBE, 0.0, 0.0]),
+                           np.array([0.0, SERVO_PROBE, 0.0]))):
+        if _move_tip(p0 + d, pitch, j5) is None:
+            _move_tip(p0, pitch, j5)
+            return None
+        # VERIFY THE ARM ACTUALLY MOVED. If it didn't, the pixel difference we are
+        # about to divide by is pure detector noise, and the resulting direction
+        # matrix sends the arm confidently the WRONG WAY (seen live: it drove
+        # backwards, away from the cube, every step).
+        moved = float(np.linalg.norm(_tip(observe()[0]) - p0))
+        uv1 = _cube_uv(finder)
+        _move_tip(p0, pitch, j5)                  # always return to the start
+        if uv1 is None:
+            return None
+        if moved < 0.5 * SERVO_PROBE:
+            say(f"probe {'X' if c == 0 else 'Y'}: asked for {SERVO_PROBE*100:.0f}cm "
+                f"but the arm moved {moved*100:.1f}cm — cannot measure direction here")
+            return None
+        J[:, c] = (uv1 - uv0) / moved             # divide by what REALLY happened
+    if abs(float(np.linalg.det(J))) < 1e3:        # probe produced no usable motion
+        return None
+    return J
+
+
+def _mapped_xy(label):
+    """The mapped (x, y) of the best-supported object of this colour, or None."""
+    want = label.split()[0].lower()
+    best = None
+    with w2d_lock:
+        for o in W2D["objs"].values():
+            if want in o["label"].lower():
+                if best is None or o["n"] > best["n"]:
+                    best = o
+        return None if best is None else np.array(best["xy"], float)
+
+
+STANDOFF_BACK = 0.045       # aim this far SHORT of the cube while approaching
+STANDOFF_RIGHT = 0.000      # (lateral centring is done by _visual_align now)
+GRASP_RIGHT_TRIM = 0.000    # (superseded by _visual_align)  the gripper lands LEFT, so
+                            # shift the FINAL target this far to the cube's right.
+                            # More positive = further right; negative = left.
+TARGET_RIGHT_TRIM_M = 0.030 # shift the APPROACH target this far to the cube's RIGHT
+                            # from the start, because the arm consistently lands LEFT.
+                            # This bias is applied before the staged approach and the
+                            # visual centering servos then refine on the real cube.
+APPROACH_STEPS = 2          # waypoints in; each closes part of the REMAINING
+                            # gap, so steps shrink automatically near the end
+
+
 def run_mission():
+    """Close on the mapped cube in smooth stages, re-checking the map at every
+    stage, then descend gradually and grip.
+
+    One long move to the target is a dive: if the mapped position is a little off,
+    nothing notices until the gripper is already there. Instead cover the distance
+    in stages -- each one closes part of the remaining gap, then looks again and
+    refines the target. Errors get corrected while there is still room to correct
+    them, and the motion rates are low enough not to jerk.
+    """
+    def _shift_right(p, d):
+        r = float(np.hypot(*p))
+        if r < 1e-6 or d == 0.0:
+            return np.array(p, dtype=np.float64)
+        u = np.array(p, dtype=np.float64) / r
+        perp = np.array([u[1], -u[0]])          # to the cube's right
+        return np.array(p, dtype=np.float64) + perp * d
+
     try:
         stop_flag.clear()
         with lock:
             state["running"] = True
             state["t0"] = time.time()
-        # ---- LOOK (first-person view only): do NOT move first. If the cube is
-        #      already in the gripper view, go straight to gaze-center+approach.
-        #      Only slow-scan (and, if truly blind, raise to a table view) when
-        #      it isn't visible. No blind pan-sweep, no pre-dive. ----
-        set_phase("LOOK", "checking the gripper view for the RED cube")
-        red_tracker.reset()
-        if detect_now(find_red, tries=12) is None:
-            set_phase("SEARCH", "not in view — raising to a table view")
-            goto_smooth(VIEW, settle=0.6)
-            if detect_now(find_red, tries=8) is None:
-                gentle_scan(find_red, "RED")
+        finder, tracker, label = _target_finder()
 
-        # ---- APPROACH: gaze centers it (points the camera at it) AND closes
-        #      the radius in one continuous loop. GRASP with a slow torque-sensed
-        #      close. Retry up to 3×. ----
-        held_vis = False
-        for attempt in range(3):
-            if attempt:
-                say(f"grasp retry {attempt + 1}/3")
-                send_joints(observe()[0], gripper=95.0)
-                time.sleep(0.4)
-                ee_move_rel([0, 0, 0.05], settle=0.5)   # small lift to re-see
-                red_tracker.reset()
-                if detect_now(find_red, tries=10) is None:
-                    gentle_scan(find_red, "RED")
-            # LOCK the cube from a distance (where the detector is honest), fly the
-            # fingertip to a waypoint ABOVE it with the hand pitched DOWN (so the wrist
-            # has somewhere legal to be), then descend straight onto the locked point.
-            p_obj, pitch = approach_over_the_top(find_red, red_tracker, "RED")
-            if not descend_and_close(p_obj, pitch, "RED"):
-                say("descend did not reach the cube — closing anyway to see what happens")
-            set_phase("GRASP", "slow torque-sensed close")
-            contact, i_idle = close_with_current(step=3.0, delay=0.16)
-            say(f"close: contact={contact}")
+        xy = _mapped_xy(label)
+        if xy is None:
+            raise Abort(f"{label} cube is not on the 2D map - press 'Scan -> 2D map' first")
+        # The arm consistently lands LEFT of the cube, so bias the whole approach
+        # target to the cube's RIGHT from the start. Visual centering then refines.
+        xy = _shift_right(xy, TARGET_RIGHT_TRIM_M)
+        say(f"{label} cube mapped at x={xy[0]*100:.1f} y={xy[1]*100:.1f} cm "
+            f"(r={np.hypot(*xy)*100:.1f}cm, biased right {TARGET_RIGHT_TRIM_M*100:.0f}mm) "
+            f"- approaching in {APPROACH_STEPS} stages")
+        send_joints(observe()[0], gripper=95.0)
 
-            set_phase("LIFT")
-            ee_move_rel([0, 0, 0.10], settle=0.6)
-            hold = [abs(c - i_idle) for c in (gripper_current() for _ in range(12)) if c is not None]
-            hold_di = float(np.mean(hold)) if hold else 0.0
-            joints, rgb, _ = observe()
-            trh = find_red(rgb, T_cam_of(joints))
-            held_vis = (trh is not None and trh.area_px > 6000
-                        and math.hypot(trh.uv[0] - HAND_UV[0], trh.uv[1] - HAND_UV[1]) < 110)
-            say(f"lifted: hold ΔI={hold_di:.1f} in-hand-visual={held_vis}")
-            if held_vis or hold_di >= 3.0:
-                break
+        # ---- approach in stages, looking again at each checkpoint ----
+        for i in range(APPROACH_STEPS):
+            checkpoint()
+            q = observe()[0].astype(np.float64)
+            j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
+            tip = _tip(q)
+            last = (i == APPROACH_STEPS - 1)
+            frac = 1.0 if last else 0.45
+            # ALWAYS stop a little SHORT of the cube (radially), even on the last
+            # stage, so the cube stays in the camera view for the centring servo.
+            # The old last-stage lunge to the exact map point pushed the cube out of
+            # frame ("cube not in view") and then descended blind.
+            aim = np.array(xy, dtype=np.float64)
+            r_a = float(np.hypot(*aim))
+            if r_a > 1e-6:
+                aim = aim - (aim / r_a) * STANDOFF_BACK
+            wx = float(tip[0] + (aim[0] - tip[0]) * frac)
+            wy = float(tip[1] + (aim[1] - tip[1]) * frac)
+            pitch, e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
+            if pitch is None:
+                raise Abort(f"r={np.hypot(*xy)*100:.0f}cm is out of reach "
+                            f"(best IK {e*1e3:.0f}mm)")
+            with lock:
+                state["obj3d"] = [float(xy[0]), float(xy[1]), PICK_GRASP_Z]
+                state["obj3d_label"] = label
+            set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
+                              f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
+            if _move_tip(np.array([wx, wy, PICK_HOVER_Z]), pitch, j5,
+                         settle=0.55, step=0.5) is None:
+                raise Abort(f"IK cannot reach x={wx*100:.0f} y={wy*100:.0f}")
+
+            # CHECKPOINT: look again from the new vantage and refine the target
+            time.sleep(0.25)
+            sense_2d()
+            # Prefer a FRESH single-frame measurement over the running map average.
+            # world2d_update blends 0.7*old + 0.3*new, so by the time we are close the
+            # average is dominated by early sightings taken from far away - the least
+            # accurate ones. Up close, this frame beats that history.
+            xy2 = None
+            trf = _cube_track(finder, tries=3)
+            if trf is not None and not trf.clipped:
+                jf, _rgbf, _ = observe()
+                xyf, _rngf, _szf = obj_xy_2d(trf.bbox_xyxy, T_cam_of(jf))
+                if xyf is not None:
+                    xy2 = xyf
+            if xy2 is None:
+                xy2 = _mapped_xy(label)
+            if xy2 is not None:
+                adj = float(np.linalg.norm(xy2 - xy))
+                t2 = _tip(observe()[0])
+                # Where does the cube actually sit in frame? The goal is to bring it
+                # to the gripper pixel (bottom centre). This number is the honest
+                # measure of whether the approach is converging.
+                trc = _cube_track(finder, tries=2)
+                if trc is not None:
+                    du = trc.uv[0] - HAND_UV[0]
+                    dv = trc.uv[1] - HAND_UV[1]
+                    off = f" | cube is {abs(du):.0f}px {'right' if du > 0 else 'left'}, "                           f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the gripper"
+                else:
+                    off = " | cube not in frame"
+                say(f"check {i+1}/{APPROACH_STEPS}: tip x={t2[0]*100:.1f} y={t2[1]*100:.1f} | "
+                    f"cube x={xy2[0]*100:.1f} y={xy2[1]*100:.1f} (adjusted {adj*100:.1f}cm)" + off)
+                xy = xy2
+            else:
+                say(f"check {i+1}/{APPROACH_STEPS}: cube not in view - keeping last position")
+
+            # EARLY CENTERING: visually centre the cube under the jaws BEFORE the
+            # final lunge. This corrects map drift while there is still room to adjust,
+            # instead of discovering the misalignment only at the end when the cube may
+            # already be partially out of frame. Run after stage 1, stage 2 and halfway.
+            if i == 0 or i == 1 or i == APPROACH_STEPS // 2:
+                if i == 0:
+                    stage = "first step"
+                elif i == 1:
+                    stage = "stage 2"
+                else:
+                    stage = "halfway"
+                say(f"starting {stage} visual centering ({i+1}/{APPROACH_STEPS})")
+                q = observe()[0].astype(np.float64)
+                gp_mid, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
+                gp_mid = gp_mid if gp_mid else 70.0
+                set_phase("PICK", f"{stage} centering ({i+1}/{APPROACH_STEPS})")
+                aligned = _center_on_cube(finder, gp_mid, float(q[4]))
+                if aligned is not None:
+                    xy = np.array([float(aligned[0]), float(aligned[1])])
+                    say(f"{stage} centered: x={xy[0]*100:.1f} y={xy[1]*100:.1f} cm")
+                else:
+                    say(f"{stage} centering skipped / no usable cube in view")
+
+        # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
+        q = observe()[0].astype(np.float64)
+        j5 = float(q[4])             # no wrist twist
+        gp, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
+        gp = gp if gp else 70.0
+        set_phase("PICK", "centering the cube under the jaws")
+        aligned = _center_on_cube(finder, gp, j5)
+        if aligned is not None:
+            gx, gy = float(aligned[0]), float(aligned[1])
         else:
-            raise Abort("grasp failed after 3 attempts — red never held")
+            gx, gy = float(xy[0]), float(xy[1])
+        q = observe()[0].astype(np.float64)
+        z0 = float(_tip(q)[2])
+        for f in (0.4, 0.75, 1.0):
+            checkpoint()
+            z = float(z0 + (PICK_GRASP_Z - z0) * f)
+            set_phase("PICK", f"descending to z={z*100:.1f}cm")
+            if _move_tip(np.array([gx, gy, z]), gp, j5,
+                         settle=0.5, step=0.5) is None:
+                say("could not reach that height - closing from here")
+                break
 
-        set_phase("DONE", "RED cube picked and lifted")
+        set_phase("PICK", "closing the gripper")
+        held, _i = close_with_current(step=3.0, delay=0.16)
+        set_phase("PICK", "lifting")
+        ee_move_rel([0, 0, PICK_LIFT_M], settle=0.6)
+        set_phase("DONE" if held else "PICK",
+                  f"{label} cube {'picked' if held else 'missed - closed on air'}")
+
     except Abort as e:
         set_phase("ABORTED", str(e))
-        try:
-            goto_smooth(VIEW, settle=0.5)
-        except Exception:
-            pass
     except Exception as e:
         set_phase("ERROR", f"{type(e).__name__}: {e}")
     finally:
-        # Never park the gripper stalled: if it isn't holding anything at the
-        # end (aborted / missed), relax it so the servo doesn't overload.
         try:
-            g = None
             with lock:
                 g = state.get("gripper")
             if g is not None and g < 15.0:
-                hold = [abs(c) for c in (gripper_current(),) if c is not None]
-                # keep the grip only if it's actually carrying load
-                if not hold or hold[0] < 4.0:
+                c = gripper_current()
+                if c is None or abs(c) < 4.0:      # not carrying load -> relax
                     send_joints(observe(overlay=False)[0], gripper=40.0)
         except Exception:
             pass
@@ -1424,9 +2175,11 @@ font:600 14px "Segoe UI";cursor:pointer;touch-action:manipulation;user-select:no
 .stp{grid-column:1/-1;display:flex;align-items:center;gap:8px;color:#93a1ae;font-size:12px;margin-top:4px}
 .stp input{flex:1}
 .qbox{margin-top:14px}
-.qrow{display:flex;gap:8px;margin-top:6px}
+.qrow{display:flex;gap:8px;margin-top:6px;align-items:center}
 .qrow input{flex:1;padding:10px;background:#10161c;border:1px solid #37454f;border-radius:6px;
 color:#e6ecf1;font:14px "Segoe UI"}
+.qrow input[type=number]{max-width:90px}
+.qrow label{color:#93a1ae;font-size:12px;white-space:nowrap;min-width:70px}
 .qrow button{padding:10px 18px;background:#2e6ea5;color:#fff;border:0;border-radius:6px;
 font:600 13px "Segoe UI";cursor:pointer}
 .sticks{display:flex;gap:18px;justify-content:center;align-items:center;margin:8px 0 8px;flex-wrap:wrap}
@@ -1460,6 +2213,17 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <canvas id="v3d"
        style="width:100%;height:340px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
   </div>
+  <div class="phone-hide">
+    <p class="lbl">2D map (top-down · base frame) · click a dot / row to go on top</p>
+    <canvas id="v2d"
+       style="width:100%;height:300px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+    <table id="map2dtab" style="margin-top:6px"><tbody></tbody></table>
+    <div class="btns">
+      <button class="dim" id="b-scan2d" onclick="fetch('/scan2d',{method:'POST'})"
+        style="background:#2e6ea5;color:#fff">Scan → 2D map</button>
+      <button class="dim" onclick="fetch('/clearmap2d',{method:'POST'})">Clear 2D map</button>
+    </div>
+  </div>
 </div>
 <div class="panel">
   <div class="phase" id="phase">—</div><div class="detail" id="detail"></div>
@@ -1471,12 +2235,6 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
   </div>
   <div class="btns">
     <button id="b-home" onclick="fetch('/reset',{method:'POST'})">Reset pose</button>
-    <button id="b-home" onclick="fetch('/locate',{method:'POST'})">Locate object</button>
-    <button id="b-home" onclick="fetch('/caltip',{method:'POST'})">Calibrate fingertip</button>
-    <button id="b-calib" onclick="fetch('/calib',{method:'POST'})"
-      title="Put the cube in the gripper view, then press. Fits the gripper→camera
-transform from the robot's own motion (~30s). Watch the FPV: the magenta circle
-should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</button>
   </div>
   <div class="jog">
     <p class="lbl">FPV polar · drag sticks, or W/S radius · A/D base · R/F height · T/G tilt · Q/E roll · space grip <span id="jogmsg"></span></p>
@@ -1504,14 +2262,25 @@ should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</
     <div class="qrow">
       <input id="query" type="text" placeholder="e.g. red cube, toy block">
       <button id="q-set" onclick="setQuery()">Set</button>
+      <button id="q-run" onclick="runYoloApproach()">Run YOLO Approach</button>
     </div>
   </div>
   <div class="qbox">
-    <p class="lbl">push target outward (cm) — the camera sits behind the gripper, so
-      the cube reads too close. Raise until the yellow "3D lock" box sits on the cube.</p>
+    <p class="lbl">approach tuning · change while IDLE, takes effect on next Start</p>
     <div class="qrow">
-      <input id="pushout" type="number" value="10" step="1" min="-5" max="30" style="width:5em">
-      <button id="p-set" onclick="setPush()">Apply + re-locate</button>
+      <label>aim px</label>
+      <input id="tune-aim" type="number" step="5" value="-90" title="Lateral aim offset (px). More negative = aim further LEFT in image = robot moves RIGHT.">
+      <button onclick="setTune('aim','/setaimdu?px=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>right trim cm</label>
+      <input id="tune-trim" type="number" step="0.5" value="3.0" title="Approach target shifted this many cm to the cube's RIGHT.">
+      <button onclick="setTune('trim','/settrim?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>steps</label>
+      <input id="tune-steps" type="number" step="1" value="4" title="Number of staged approach waypoints.">
+      <button onclick="setTune('steps','/setsteps?n=')">Set</button>
     </div>
   </div>
   <pre id="log"></pre>
@@ -1521,7 +2290,22 @@ should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</
   const a = document.getElementById('r3d-link'); if(a) a.href = `http://${location.hostname}:9090`;
   const cv = document.getElementById('v3d'); if(!cv) return;
   const ctx = cv.getContext('2d');
-  let az = -1.05, el = 0.62, geom = {links:[], ee:null, obj:null};
+  // az 0 = look straight down the robot's forward axis from behind. It was -1.05
+  // (-60deg), an off-axis orbit that makes a straight base look turned and a
+  // straight wrist look sideways. Drag still rotates; this is only the default.
+  let az = 0.0, el = 0.62, geom = {links:[], ee:null, obj:null};
+  // Turn the robot 30° left ON the table: yaw the robot + objects about the base
+  // vertical (z) axis while the ground grid stays fixed. (Orbiting the camera via
+  // `az` rotates the whole scene together, so the robot never turns on the table.)
+  // YAW was 0.524 (30deg) to "turn the robot on the table". It rotates the robot
+  // AND the object markers, so a cube straight ahead got drawn 30deg to the left
+  // and the wrist looked twisted when wrist_roll was actually 0. That made the 3D
+  // view disagree with the camera and the map. Back to 0 so the view is truthful.
+  // Scene yaw = the base-zero error (shoulder_pan reads ~-14deg while the arm is
+  // physically straight). Rotating the WHOLE scene keeps the robot and the object
+  // markers consistent with each other; offsetting only the arm pulled them apart.
+  const YAW = 0.246, YC = Math.cos(YAW), YS = Math.sin(YAW);
+  function yz(p){ return [p[0]*YC - p[1]*YS, p[0]*YS + p[1]*YC, p[2]]; }
   function resize(){ const r = cv.getBoundingClientRect(); const dpr = window.devicePixelRatio||1;
     cv.width = Math.round(r.width*dpr); cv.height = Math.round(r.height*dpr); ctx.setTransform(dpr,0,0,dpr,0,0); }
   window.addEventListener('resize', resize); resize();
@@ -1552,16 +2336,18 @@ should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</
     const xf = geom.xf || {}; const tris = [];
     // View direction (into the screen) in BASE coords — depth = dot(p, vd).
     const ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
-    const vdx=ca*ce, vdy=sa*ce, vdz=se;
+    // yaw the view direction WITH the geometry so backface culling stays correct
+    const vd0x=ca*ce, vd0y=sa*ce; const vdx=vd0x*YC - vd0y*YS, vdy=vd0x*YS + vd0y*YC, vdz=se;
     for(const L of mesh){
       const T = xf[L.name]; if(!T) continue;
       const nv = L.v.length/3, sx=new Float64Array(nv), sy=new Float64Array(nv), sd=new Float64Array(nv);
       const bx=new Float64Array(nv), by=new Float64Array(nv), bz=new Float64Array(nv);
       for(let i=0;i<nv;i++){
         const x=L.v[3*i], y=L.v[3*i+1], z=L.v[3*i+2];
-        const X = T[0]*x+T[1]*y+T[2]*z+T[3];      // row-major 4x4
-        const Y = T[4]*x+T[5]*y+T[6]*z+T[7];
+        const X0 = T[0]*x+T[1]*y+T[2]*z+T[3];      // row-major 4x4
+        const Y0 = T[4]*x+T[5]*y+T[6]*z+T[7];
         const Z = T[8]*x+T[9]*y+T[10]*z+T[11];
+        const X = X0*YC - Y0*YS, Y = X0*YS + Y0*YC;   // yaw about base z (turn on table)
         bx[i]=X; by[i]=Y; bz[i]=Z;
         const s = proj([X,Y,Z]); sx[i]=s[0]; sy[i]=s[1]; sd[i]=s[2];
       }
@@ -1602,25 +2388,33 @@ should snap onto the cyan cross. Persists across restarts.">Calibrate HAND-EYE</
     for(let i=0;i<=n;i++){ const t=-g+2*g*i/n;
       line([t,-g,0],[t,g,0],'#243040',1); line([-g,t,0],[g,t,0],'#243040',1); }
     ctx.globalAlpha=1;
-    // base axes
-    line([0,0,0],[0.08,0,0],'#c9524a',2); line([0,0,0],[0,0.08,0],'#4a93c9',2); line([0,0,0],[0,0,0.08],'#4ac275',2);
+    // base axes (turn with the robot's base frame)
+    line(yz([0,0,0]),yz([0.08,0,0]),'#c9524a',2); line(yz([0,0,0]),yz([0,0.08,0]),'#4a93c9',2); line(yz([0,0,0]),yz([0,0,0.08]),'#4ac275',2);
     if(mesh && geom.xf){
       drawMeshes();
     } else {
       // fallback: link-origin polyline (what this viewer used to be)
       const L=geom.links||[];
-      for(let i=0;i+1<L.length;i++) line(L[i],L[i+1],'#7f9fd8',4);
-      for(const p of L){ const s=proj(p); ctx.fillStyle='#b9c9ea'; ctx.beginPath(); ctx.arc(s[0],s[1],3.5,0,7); ctx.fill(); }
+      for(let i=0;i+1<L.length;i++) line(yz(L[i]),yz(L[i+1]),'#7f9fd8',4);
+      for(const p of L){ const s=proj(yz(p)); ctx.fillStyle='#b9c9ea'; ctx.beginPath(); ctx.arc(s[0],s[1],3.5,0,7); ctx.fill(); }
     }
-    if(geom.ee){ const s=proj(geom.ee); ctx.fillStyle='#e6ecf1'; ctx.beginPath(); ctx.arc(s[0],s[1],4.5,0,7); ctx.fill(); }
+    if(geom.ee){ const s=proj(yz(geom.ee)); ctx.fillStyle='#e6ecf1'; ctx.beginPath(); ctx.arc(s[0],s[1],4.5,0,7); ctx.fill(); }
     // object cube
     if(geom.obj){ const o=geom.obj, h=(geom.obj_size||0.03)/2;
-      const c=[]; for(let dx of [-h,h]) for(let dy of [-h,h]) for(let dz of [-h,h]) c.push([o[0]+dx,o[1]+dy,o[2]+dz]);
+      const c=[]; for(let dx of [-h,h]) for(let dy of [-h,h]) for(let dz of [-h,h]) c.push(yz([o[0]+dx,o[1]+dy,o[2]+dz]));
       const E=[[0,1],[0,2],[1,3],[2,3],[4,5],[4,6],[5,7],[6,7],[0,4],[1,5],[2,6],[3,7]];
       const col = (geom.obj_label==='green')?'#3fc46b':'#e2574c';
       for(const e of E) line(c[e[0]],c[e[1]],col,2);
-      const s=proj(o); ctx.fillStyle=col; ctx.font='11px ui-monospace,Consolas';
+      const s=proj(yz(o)); ctx.fillStyle=col; ctx.font='11px ui-monospace,Consolas';
       ctx.fillText(`${(geom.obj_label||'obj')}  r=${Math.hypot(o[0],o[1]).toFixed(2)}m`, s[0]+8, s[1]-8); }
+    // mapped objects (2D map) — each as a cube RESTING on the table (z: 0..size)
+    const E2=[[0,1],[0,2],[1,3],[2,3],[4,5],[4,6],[5,7],[6,7],[0,4],[1,5],[2,6],[3,7]];
+    for(const o of (geom.objs2d||[])){ const sz=o.s||0.03, hh=sz/2;
+      const cl=/green/.test(o.label)?'#3fc46b':/blue/.test(o.label)?'#4a93c9':/red/.test(o.label)?'#e2574c':'#e0b040';
+      const c=[]; for(const dx of [-hh,hh]) for(const dy of [-hh,hh]) for(const dz of [0,sz]) c.push(yz([o.x+dx,o.y+dy,dz]));
+      for(const e of E2) line(c[e[0]],c[e[1]],cl,1.5);
+      const s=proj(yz([o.x,o.y,sz])); ctx.fillStyle=cl; ctx.font='10px ui-monospace,Consolas';
+      ctx.fillText(`${o.label.split(' ')[0]}#${o.tag}`, s[0]+7, s[1]-6); }
   }
   let drag=null;
   cv.addEventListener('pointerdown', e=>{ drag=[e.clientX,e.clientY]; cv.setPointerCapture(e.pointerId); });
@@ -1641,6 +2435,30 @@ async function setQuery(){
   setTimeout(()=>document.getElementById('q-set').textContent='Set', 1200);
 }
 document.getElementById('query').addEventListener('keydown', e => { if(e.key==='Enter') setQuery(); });
+async function setTune(id, url){
+  const el = document.getElementById('tune-'+id);
+  const v = el.value.trim();
+  if(v === '') return;
+  const btn = el.nextElementSibling; btn.textContent = '…';
+  try{
+    const r = await (await fetch(url+encodeURIComponent(v),{method:'POST'})).json();
+    btn.textContent = r.ok ? 'Set ✓' : 'Set';
+    if(!r.ok) alert(r.reason || 'failed');
+  }catch(e){ btn.textContent = 'Set'; alert(e.message); }
+  setTimeout(()=>btn.textContent='Set', 1200);
+}
+async function runYoloApproach(){
+  const q = document.getElementById('query').value.trim();
+  if(!q) { alert('Enter a query first (e.g. "red cube")'); return; }
+  const btn = document.getElementById('q-run'); btn.textContent = '⟳ running…'; btn.disabled = true;
+  try{
+    const r = await (await fetch('/yolo-approach?q='+encodeURIComponent(q),{method:'POST'})).json();
+    btn.textContent = r.ok ? '✓ Done' : 'Run YOLO Approach';
+    if(!r.ok) alert('Error: ' + (r.reason||'unknown'));
+  }
+  catch(e){ btn.textContent = 'Run YOLO Approach'; alert('Connection error: ' + e.message); }
+  finally { btn.disabled = false; setTimeout(()=>document.getElementById('q-run').textContent='Run YOLO Approach', 2000); }
+}
 async function setPush(){
   const cm = parseFloat(document.getElementById('pushout').value);
   const btn = document.getElementById('p-set'); btn.textContent = '…';
@@ -1742,10 +2560,62 @@ async function tick(){
     document.getElementById('log').textContent = (s.log||[]).join('\\n');
     const qi = document.getElementById('query');
     if(s.query && !qi.value && document.activeElement !== qi) qi.value = s.query;
+    if(s.tune){
+      const ta = document.getElementById('tune-aim');
+      if(ta && document.activeElement !== ta) ta.value = s.tune.aim_du;
+      const tt = document.getElementById('tune-trim');
+      if(tt && document.activeElement !== tt) tt.value = s.tune.right_trim_cm;
+      const ts = document.getElementById('tune-steps');
+      if(ts && document.activeElement !== ts) ts.value = s.tune.approach_steps;
+    }
   }catch(e){}
   setTimeout(tick, 700);
 }
 tick();
+
+// ---- 2D top-down object map ----
+(function(){
+  const cv=document.getElementById('v2d'); if(!cv) return;
+  const ctx=cv.getContext('2d'); let objs=[];
+  function resize(){const r=cv.getBoundingClientRect(),dpr=devicePixelRatio||1;
+    cv.width=Math.round(r.width*dpr);cv.height=Math.round(r.height*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);}
+  addEventListener('resize',resize);resize();
+  // base at bottom-centre; +x = up (forward), +y = left. scale: fit ~55cm radius.
+  function W2S(x,y){const W=cv.clientWidth,H=cv.clientHeight,s=Math.min(W/1.4,(H-30)/0.80);
+    return [W/2 - y*s, H-20 - x*s];}
+  function col(l){return /red/.test(l)?'#e2574c':/green/.test(l)?'#3fc46b':/blue/.test(l)?'#4a93c9':'#e0b040';}
+  function draw(){const W=cv.clientWidth,H=cv.clientHeight;ctx.clearRect(0,0,W,H);
+    const s=Math.min(W/1.4,(H-30)/0.80),[ox,oy]=W2S(0,0);
+    ctx.strokeStyle='#1b2733';ctx.fillStyle='#4a5a68';ctx.font='10px ui-monospace,Consolas';
+    for(let r=10;r<=70;r+=10){ctx.beginPath();ctx.arc(ox,oy,r/100*s,Math.PI,2*Math.PI);ctx.stroke();
+      ctx.fillText(r+'cm',ox+3,oy-r/100*s+11);}
+    // reach limit ~42cm
+    ctx.strokeStyle='#3a5a3a';ctx.beginPath();ctx.arc(ox,oy,0.62*s,Math.PI,2*Math.PI);ctx.stroke();
+    ctx.fillStyle='#c9524a';ctx.beginPath();ctx.arc(ox,oy,5,0,7);ctx.fill();
+    ctx.fillStyle='#8aa';ctx.fillText('base',ox+7,oy+4);
+    for(const o of objs){const sz=o.size||0.03,hh=sz/2,c=col(o.label);
+      // the object's GROUND FOOTPRINT: an axis-aligned square of side `size`
+      const P=[W2S(o.x-hh,o.y-hh),W2S(o.x-hh,o.y+hh),W2S(o.x+hh,o.y+hh),W2S(o.x+hh,o.y-hh)];
+      ctx.beginPath();ctx.moveTo(P[0][0],P[0][1]);for(let k=1;k<4;k++)ctx.lineTo(P[k][0],P[k][1]);ctx.closePath();
+      ctx.globalAlpha=0.30;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
+      ctx.strokeStyle=c;ctx.lineWidth=2;ctx.stroke();
+      const [sx,sy]=W2S(o.x,o.y);
+      ctx.fillStyle=c;ctx.beginPath();ctx.arc(sx,sy,2,0,7);ctx.fill();
+      ctx.fillStyle='#e6ecf1';ctx.font='11px ui-monospace,Consolas';
+      ctx.fillText(o.label.split(' ')[0]+'#'+o.tag+' '+(sz*100).toFixed(0)+'cm',sx+9,sy-6);}
+  }
+  cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    let best=null,bd=22;for(const o of objs){const[sx,sy]=W2S(o.x,o.y);const d=Math.hypot(sx-mx,sy-my);
+      if(d<bd){bd=d;best=o;}} if(best)fetch('/goto2d?tag='+best.tag,{method:'POST'});});
+  async function poll(){try{const d=await(await fetch('/map2d')).json();objs=d.objs||[];draw();
+    const tb=document.querySelector('#map2dtab tbody');
+    tb.innerHTML=objs.map(o=>`<tr class="obj" style="cursor:pointer" onclick="fetch('/goto2d?tag=${o.tag}',{method:'POST'})">`+
+      `<td>${o.label.split(' ')[0]}#${o.tag}</td><td>x=${(o.x*100).toFixed(0)}</td><td>y=${(o.y*100).toFixed(0)}</td>`+
+      `<td>r=${o.r_cm}cm</td><td>stereo=${o.stereo_cm!=null?o.stereo_cm+'cm':'—'}</td><td>n=${o.n}</td></tr>`).join('')
+      ||'<tr><td colspan=6 style="color:#8aa">empty — Scan → 2D map</td></tr>';
+  }catch(e){} setTimeout(poll,500);}
+  poll();
+})();
 </script></body></html>"""
 
 
@@ -1762,6 +2632,11 @@ def status():
     with lock:
         s = {k: v for k, v in state.items()}
     s["log"] = list(log)
+    s["tune"] = {
+        "aim_du": round(AIM_DU, 1),
+        "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
+        "approach_steps": APPROACH_STEPS,
+    }
     return jsonify(s)
 
 
@@ -1841,6 +2716,11 @@ def geom():
     if jlist and kin is not None:
         try:
             q = np.array(jlist, dtype=np.float64)
+            # The URDF's wrist_roll zero does not line up with the servo's zero:
+            # the joint reads ~0 while the rendered gripper sits rotated. Offset the
+            # rendered angle so the picture matches the real hand. DISPLAY ONLY -
+            # IK/FK for actual motion are untouched.
+            q[4] += WRIST_RENDER_OFFSET
             chain = kin.get_link_transforms_chain(q)
             links = [[round(float(T[0, 3]), 4), round(float(T[1, 3]), 4),
                       round(float(T[2, 3]), 4)] for _n, T in chain]
@@ -1854,7 +2734,11 @@ def geom():
             ee = [round(float(Tee[i, 3]), 4) for i in range(3)]
         except Exception:
             pass
-    return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl, obj_size=0.03)
+    # every mapped object (2D map) as a table-resting cube for the 3D viewer
+    objs2d = [{"x": o["x"], "y": o["y"], "s": o["size"], "label": o["label"], "tag": o["tag"]}
+              for o in world2d_snapshot()]
+    return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl, obj_size=0.03,
+                   objs2d=objs2d)
 
 
 @app.route("/stream")
@@ -1877,7 +2761,7 @@ def stream2():
         try:
             s = pyrequests.Session()
             s.post(CAMSURV[0] + "/", data={"password": CAMSURV[1]}, timeout=5)
-            r = s.get(CAMSURV[0] + "/stream/0", stream=True, timeout=10)
+            r = s.get(CAMSURV[0] + "/stream/1", stream=True, timeout=10)
             for chunk in r.iter_content(chunk_size=8192):
                 yield chunk
         except Exception:
@@ -2013,9 +2897,12 @@ def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=80, tol=2e-3,
     if e > tol and _retry:
         # Wrong IK branch. There is a genuine elbow-flip dead band (mapped 2026-07-13):
         # at r=10-15cm the arm simply cannot hold a shallow pitch at all. Re-seed.
+        # The last two seeds extend the arm forward for far / shallow-pitch targets.
         for alt in ([q_seed[0], -95.0, 90.0, 30.0, j5_fixed],
                     [q_seed[0], -30.0, 50.0, 60.0, j5_fixed],
-                    [q_seed[0], -60.0, 20.0, 80.0, j5_fixed]):
+                    [q_seed[0], -60.0, 20.0, 80.0, j5_fixed],
+                    [q_seed[0], -20.0, 75.0, 0.0, j5_fixed],
+                    [q_seed[0], -10.0, 85.0, 0.0, j5_fixed]):
             q2, e2 = _ik_hold_pitch(np.array(alt, np.float64), p_tgt, pitch_tgt,
                                     j5_fixed, iters, tol, ret_err=True, _retry=False)
             if e2 < e:
@@ -2194,6 +3081,76 @@ def setquery():
     return jsonify(ok=True, query=q)
 
 
+yolo_approach_running = [False]
+yolo_approach_process = [None]
+
+
+@app.route("/yolo-approach", methods=["POST"])
+def yolo_approach():
+    """Launch lerobot-yolo-track-approach with the given text query.
+    Note: This requires stopping the main control loop first (close this UI).
+    The YOLO approach will take full control of the robot via COM4."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify(ok=False, reason="empty query")
+
+    if yolo_approach_running[0]:
+        return jsonify(ok=False, reason="YOLO approach already running")
+
+    def run_yolo():
+        try:
+            yolo_approach_running[0] = True
+            say(f"Starting YOLO approach with query: {q}")
+            # Run lerobot-yolo-track-approach with the query
+            # NOTE: This will fail if COM4 is still in use by the main loop
+            cmd = [
+                "lerobot-yolo-track-approach",
+                "--robot.type=so101_follower",
+                "--robot.port=COM4",
+                "--robot.cameras={\"front\": {\"type\": \"oakd\", \"fps\": 30, \"width\": 640, \"height\": 480, \"use_depth\": true}}",
+                f"--query={q}",
+                "--model-path=./yolov8s-worldv2.pt",
+                "--camera-mount=gripper",
+                "--camera-frame-convention=opencv",
+                "--gripper-camera-tf=0.04,0,0.02,0,-0.35,0",
+                "--target-from-gripper-tf=true",
+                "--approach-style=plan_top",
+                "--search-scan-enabled=true",
+                "--depth-from-bbox-enabled=true",
+                "--target-physical-size-m=0.03",
+                "--depth-source-policy=bbox_preferred",
+                "--top-approach-height-m=0.05",
+                "--top-max-reach-m=0.35",
+                "--table-z-m=-0.02",
+                "--table-clearance-m=0.005",
+                "--plan-top-tilt-fraction=0.0",
+                "--plan-top-tilt-tolerance-deg=90",
+                "--plan-top-final-hover-m=0.05",
+                "--plan-top-gripper-tip-offset-m=0.02",
+                "--plan-top-center-enable=true",
+                "--smooth-center-alpha=0.25",
+                "--plan-top-keep-in-frame-enable=true",
+                "--plan-top-keep-in-frame-deadband-px=24",
+                "--plan-top-keep-in-frame-kp=0.40",
+                "--plan-top-keep-in-frame-max-step-deg=2.5",
+                "--show-window=true",
+                "--display-data=true",
+                "--display-sim3d=true"
+            ]
+            proc = subprocess.Popen(cmd, cwd=LEROBOT)
+            yolo_approach_process[0] = proc
+            proc.wait()
+            say("YOLO approach completed")
+        except Exception as e:
+            say(f"YOLO approach error: {e}")
+        finally:
+            yolo_approach_running[0] = False
+            yolo_approach_process[0] = None
+
+    threading.Thread(target=run_yolo, daemon=True).start()
+    return jsonify(ok=True, reason="YOLO approach launched in background. Close this UI to free COM4 if it fails to connect.")
+
+
 @app.route("/debugdepth", methods=["POST"])
 def debugdepth():
     def _dbg():
@@ -2230,6 +3187,47 @@ def pushout():
     return jsonify(ok=True, cm=cm)
 
 
+@app.route("/setaimdu", methods=["POST"])
+def setaimdu():
+    """Live-tune the lateral aim offset (px). Negative shifts the aim point LEFT
+    in the image, which makes the robot move RIGHT relative to the cube."""
+    try:
+        px = float(request.args.get("px", request.form.get("px", 0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    global AIM_DU
+    AIM_DU = float(np.clip(px, -300.0, 300.0))
+    say(f"AIM_DU set to {AIM_DU:.0f}px (left shift -> robot right)")
+    return jsonify(ok=True, px=AIM_DU)
+
+
+@app.route("/settrim", methods=["POST"])
+def settrim():
+    """Live-tune the approach rightward trim (cm). Positive shifts the staged
+    approach target to the cube's right."""
+    try:
+        cm = float(request.args.get("cm", request.form.get("cm", 0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    global TARGET_RIGHT_TRIM_M
+    TARGET_RIGHT_TRIM_M = float(np.clip(cm, -10.0, 15.0)) / 100.0
+    say(f"approach right trim set to {TARGET_RIGHT_TRIM_M*100:.1f}cm")
+    return jsonify(ok=True, cm=TARGET_RIGHT_TRIM_M*100)
+
+
+@app.route("/setsteps", methods=["POST"])
+def setsteps():
+    """Live-tune the number of staged approach steps."""
+    try:
+        n = int(request.args.get("n", request.form.get("n", 4)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need an integer")
+    global APPROACH_STEPS
+    APPROACH_STEPS = int(np.clip(n, 1, 12))
+    say(f"approach steps set to {APPROACH_STEPS}")
+    return jsonify(ok=True, n=APPROACH_STEPS)
+
+
 @app.route("/relocate", methods=["POST"])
 def relocate():
     """Locate the RED cube the SAME WAY the mission does (table-ray + push-out) WITHOUT
@@ -2262,6 +3260,38 @@ def relocate():
             set_phase("ERROR", f"relocate: {type(e).__name__}: {e}")
 
     threading.Thread(target=_rl, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/calibmount", methods=["POST"])
+def calibmount():
+    """Pin the camera mount by MULTI-VIEW CONSISTENCY: the same stationary cube must
+    map to the same table spot from every viewing pose. Keep one cube visible and
+    press once. See calibrate_mount_multiview."""
+    with lock:
+        busy = state["running"]
+    if busy:
+        return jsonify(ok=False, reason="mission running — stop first")
+
+    def _cal():
+        try:
+            stop_flag.clear()
+            with lock:
+                state["running"] = True
+            finder, tracker, label = _target_finder()
+            tracker.reset()
+            calibrate_mount_multiview(finder, label)
+        except Abort as e:
+            say(f"[CALIB FAILED] {e}")
+            set_phase("IDLE", "mount unchanged")
+        except Exception as e:
+            say(f"[CALIB ERROR] {type(e).__name__}: {e}")
+            set_phase("IDLE", "mount unchanged")
+        finally:
+            with lock:
+                state["running"] = False
+
+    threading.Thread(target=_cal, daemon=True).start()
     return jsonify(ok=True)
 
 
@@ -2312,19 +3342,21 @@ def locate():
             stop_flag.clear()
             set_phase("LOCATE", "reading stereo depth")
             green_tracker.reset(); red_tracker.reset()
-            # 1) fast single-shot stereo depth (works when the object is >~32cm)
-            p = locate_object(find_green, green_tracker, "green")
+            # 1) fast single-shot stereo depth (works when the object is >~32cm).
+            # Try RED first (the mission target); only fall back to green. This used
+            # to localize green FIRST, which is why the target defaulted to green.
+            p = locate_object(find_red, red_tracker, "red")
             if p is None:
-                p = locate_object(find_red, red_tracker, "red")
+                p = locate_object(find_green, green_tracker, "green")
             # 2) fallback: multi-vantage triangulation (works at close grasp
             #    range where the OAK-D stereo is blind). Move-and-intersect rays.
             if p is None:
                 joints, rgb, _ = observe()
                 T = T_cam_of(joints)
-                if find_green(rgb, T) is not None:
-                    fnd, trk, lbl = find_green, green_tracker, "green"
-                else:
+                if find_red(rgb, T) is not None:
                     fnd, trk, lbl = find_red, red_tracker, "red"
+                else:
+                    fnd, trk, lbl = find_green, green_tracker, "green"
                 set_phase("LOCATE", "close range — triangulating (move + intersect)")
                 trk.reset()
                 try:
@@ -2486,6 +3518,68 @@ def home():
     return jsonify(ok=True)
 
 
+# ---- 2D BEV map routes ----
+@app.route("/map2d")
+def r_map2d():
+    return jsonify(objs=world2d_snapshot())
+
+
+@app.route("/scan2d", methods=["POST"])
+def r_scan2d():
+    with lock:
+        if state["running"]:
+            return jsonify(ok=False, reason="busy")
+
+    def _t():
+        stop_flag.clear()
+        with lock:
+            state["running"] = True
+        try:
+            scan_2d()
+        except Abort as e:
+            set_phase("ABORTED", str(e))
+        except Exception as e:
+            set_phase("ERROR", f"{type(e).__name__}: {e}")
+        finally:
+            with lock:
+                state["running"] = False
+    threading.Thread(target=_t, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/goto2d", methods=["POST"])
+def r_goto2d():
+    tag = int(request.args.get("tag", "0"))
+    with lock:
+        if state["running"]:
+            return jsonify(ok=False, reason="busy")
+
+    def _t():
+        stop_flag.clear()
+        with lock:
+            state["running"] = True
+        try:
+            goto_2d(tag)
+        except Abort as e:
+            set_phase("ABORTED", str(e))
+        except Exception as e:
+            set_phase("ERROR", f"{type(e).__name__}: {e}")
+        finally:
+            with lock:
+                state["running"] = False
+    threading.Thread(target=_t, daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.route("/clearmap2d", methods=["POST"])
+def r_clearmap2d():
+    global W2D
+    with w2d_lock:
+        W2D = {"objs": {}, "next": 1}
+    say("2D map cleared")
+    return jsonify(ok=True)
+
+
 def idle_view():
     while True:
         with lock:
@@ -2494,7 +3588,8 @@ def idle_view():
             jogging = bool(jog_held)
         if not busy and not jogging:   # jog_loop owns the camera while jogging
             try:
-                observe()
+                joints, rgb, _ = observe()
+                sense_2d(joints, rgb)   # keep the 2D map fresh while idle
             except Exception:
                 time.sleep(1.0)
         time.sleep(0.25)
@@ -2614,10 +3709,14 @@ def main():
     for attempt in range(6):
         robot = make_robot_from_config(SO101FollowerConfig(
             port="COM4", id="so101_follower",
+            # DEPTH OFF. The pick locates the cube purely geometrically (cast its
+            # pixel ray onto the table plane), so stereo depth buys us nothing — and
+            # the stereo pipeline is what kept crashing the OAK-D mid-run
+            # (X_LINK_ERROR + firmware crash dump, taking the whole server with it).
+            # Dropping it also roughly halves the USB bandwidth. read_depth_m()
+            # degrades gracefully to None.
             cameras={"front": OAKDCameraConfig(
-                fps=30, width=640, height=480, use_depth=True,
-                stereo_extended_disparity=True,      # halves the min depth (~20cm)
-                stereo_confidence_threshold=150)},    # looser -> more valid pixels
+                fps=30, width=640, height=480, use_depth=False)},
         ))
         try:
             robot.connect()
@@ -2633,7 +3732,7 @@ def main():
             time.sleep(2.0)
     kin = RobotKinematics(LEROBOT + r"\SO101\so101_new_calib.urdf", "gripper_frame_link", ARM_MOTORS)
     cam = robot.cameras["front"]
-    say("stereo depth stream enabled — metric object localization active")
+    say("colour stream only (depth OFF) — the pick works by eye, not by stereo")
     intr = {"fx": 517.0, "fy": 517.0, "cx": 329.5, "cy": 231.4}
     if hasattr(cam, "get_depth_intrinsics"):
         try:
@@ -2667,7 +3766,9 @@ def main():
     say("loading YOLO (parallel validation thread)…")
     detector = YoloWorldDetector(LEROBOT + r"\yolov8s-worldv2.pt", conf=0.10, imgsz=320,
                                  color_filter_min_frac=0.15)
-    _q0 = "red cube, toy block, red box"
+    _q0 = "red cube, green cube"      # colour-ONLY: colourless terms like "toy
+                                      # block"/"box" make YOLO-World fire on the
+                                      # green cube and the mission then dives to it
     detector.set_query(_q0)
     with lock:
         state["query"] = _q0
