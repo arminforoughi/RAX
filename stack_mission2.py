@@ -428,14 +428,54 @@ def send_joints(q, gripper=None):
         robot.send_action(act)
 
 
+# Per-joint velocity / acceleration limits for smooth transit moves (deg/s, deg/s^2).
+# The base carries the most inertia and causes the visible jump, so it gets the
+# gentlest limits. Wrist joints can move faster.
+_GOTO_VMAX = np.array([20.0, 30.0, 30.0, 40.0, 50.0])
+_GOTO_AMAX = np.array([40.0, 60.0, 60.0, 80.0, 100.0])
+_GOTO_DT = 0.02  # 50 Hz command rate
+
+
 def goto_smooth(target, settle=0.3, step=2.0):
-    """Transit move (non-servo phases)."""
+    """Transit move with a quintic S-curve profile: zero start/end velocity and
+    acceleration. This removes the base jump at motion start/stop.
+
+    The old send_joint_target_smoothly moved at a fixed step per tick, which is
+    just a velocity cap — it still commanded abrupt starts and stops. Here the
+    velocity ramps up and down smoothly, so the camera/gripper "head" glides.
+    """
     joints, _r, obs = observe(overlay=False)
     gp = float(obs.get("gripper.pos", 50.0))
-    with bus_lock:
-        send_joint_target_smoothly(robot, ARM_MOTORS, joints, np.asarray(target, np.float64),
-                                   step_deg=step, sleep_s=0.03,
-                                   gripper_open=gp >= 50.0, gripper_width_pct=gp)
+    q0 = np.asarray(joints, dtype=np.float64)
+    q1 = np.asarray(target, dtype=np.float64)
+    delta = q1 - q0
+
+    # step=2.0 was the old default degrees/tick; use it as a speed scale.
+    speed = float(step) / 2.0
+    vmax = _GOTO_VMAX * speed
+    amax = _GOTO_AMAX * speed
+
+    # Quintic p(u) = 10u^3 - 15u^4 + 6u^5  ->  max vel 1.875/T, max acc 5.78/T^2
+    abs_d = np.abs(delta)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        T_v = np.where(abs_d > 0.001, 1.875 * abs_d / np.maximum(vmax, 1e-6), 0.0)
+        T_a = np.where(abs_d > 0.001, np.sqrt(5.78 * abs_d / np.maximum(amax, 1e-6)), 0.0)
+    T = float(np.max(np.maximum(T_v, T_a)))
+    T = max(T, 0.20)  # always at least 200 ms for tiny moves
+
+    n = int(np.ceil(T / _GOTO_DT))
+    t0 = time.time()
+    for k in range(n + 1):
+        t = min(k * _GOTO_DT, T)
+        u = t / T
+        s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        q_cmd = q0 + delta * s
+        send_joints(q_cmd, gripper=gp)
+        # sleep to maintain 50 Hz, accounting for command overhead
+        to_sleep = t0 + (k + 1) * _GOTO_DT - time.time()
+        if to_sleep > 0:
+            time.sleep(to_sleep)
+
     time.sleep(settle)
 
 
@@ -1829,46 +1869,93 @@ ALIGN_PROBE_M = 0.02       # metres to probe when measuring the image response
 ALIGN_CAP_M = 0.025        # max lateral correction per iteration
 
 
-def center_smooth(finder, label, timeout_s=25.0):
-    """Continuous smooth centering: streams filtered joint commands at ~14 Hz
-    with acceleration limiting, so the base glides instead of jumping.
-    Returns the final (x, y) fingertip position, or None if the cube is lost."""
-    set_phase(f"CENTER {label}", "smooth continuous alignment")
+def _center_on_cube(finder, gp, j5):
+    """Center the cube under the jaws with DECOUPLED single-DOF servos:
+
+      * horizontal pixel error  ->  rotate the BASE (shoulder_pan)
+      * vertical pixel error    ->  reach RADIALLY in/out
+
+    Each axis is one joint and monotonic, so the sign is trivial to measure and the
+    loop is stable. The previous 2D-Cartesian Jacobian oscillated (109->96->119px)
+    because base rotation, reach and an auto-swept wrist pitch all mixed into it.
+    Pitch is held FIXED here. Returns the final (x, y), or None."""
     tgt_u = HAND_UV[0] + AIM_DU
     tgt_v = HAND_UV[1] + AIM_DV
+    tr = _cube_track(finder, tries=5)
+    if tr is None:
+        say("center: cube not in view")
+        return None
+    uv0 = np.array(tr.uv, np.float64)
+    q0 = observe()[0].astype(np.float64)
+    p0 = _tip(q0)
 
-    def step_fn(joints, rgb, dt):
-        tr = finder(rgb, T_cam_of(joints))
+    # Small, slow probe moves so the measurement is clean and the arm does not jerk.
+    PAN_PROBE = 2.0      # deg
+    RAD_PROBE = 0.010    # m
+    # Speed is scaled by estimated cube range so the arm slows down as it gets close.
+    # The BASE is the main source of jerk, so its max step scales the most.
+    r_m = _cube_range_m(tr)
+    close = r_m < 0.12          # within ~12 cm -> slow/close mode
+    speed = 0.45 if close else 1.0
+    CENTER_STEP = 0.8 * speed   # deg per goto_smooth tick
+    CENTER_SETTLE = 0.6 if close else 0.45  # s
+    MAX_PAN_STEP = (1.5 if close else 3.5)  # deg per iteration
+    MAX_RAD_STEP = (0.008 if close else 0.015)  # m per iteration
+
+    # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
+    qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
+    goto_smooth(qp, settle=CENTER_SETTLE, step=CENTER_STEP)
+    trp = _cube_track(finder, tries=4)
+    goto_smooth(q0, settle=CENTER_SETTLE, step=CENTER_STEP)
+    if trp is None or abs(float(qp[0] - q0[0])) < 0.5:
+        say("center: horizontal probe failed")
+        return _tip(observe()[0])[:2]
+    du_dpan = (float(trp.uv[0]) - uv0[0]) / (qp[0] - q0[0])       # px per deg
+    if abs(du_dpan) < 3.0:
+        say("center: base rotation barely moves the cube")
+        return _tip(observe()[0])[:2]
+
+    # --- probe the VERTICAL sign: cube_v change per +RAD_PROBE radial reach ---
+    r0 = float(np.hypot(p0[0], p0[1])); uo = np.array([p0[0], p0[1]]) / max(r0, 1e-6)
+    dv_dr = None
+    if _move_tip(np.array([p0[0] + uo[0]*RAD_PROBE, p0[1] + uo[1]*RAD_PROBE, p0[2]]),
+                 gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
+        trr = _cube_track(finder, tries=4)
+        _move_tip(np.array([p0[0], p0[1], p0[2]]), gp, j5,
+                  settle=CENTER_SETTLE, step=CENTER_STEP)
+        if trr is not None:
+            dv_dr = (float(trr.uv[1]) - uv0[1]) / RAD_PROBE        # px per metre
+    say(f"center: du/dpan={du_dpan:.1f}px/deg" +
+        (f", dv/dr={dv_dr:.0f}px/m" if dv_dr else ", (no vertical probe)"))
+
+    for it in range(ALIGN_ITERS):
+        checkpoint()
+        tr = _cube_track(finder, tries=3)
         if tr is None:
-            return None
+            say("center: cube gone (likely under the jaws) - stopping")
+            break
         du = float(tr.uv[0]) - tgt_u
         dv = float(tr.uv[1]) - tgt_v
-        # Pan rate (deg/s) from horizontal pixel error. Softly scales with distance.
-        pan_des = float(np.clip(-du * 0.55, -14.0, 14.0))
-        # Radial velocity (m/s) from vertical pixel error, in the base XY plane.
-        tip = _tip(joints)
-        r = float(np.hypot(tip[0], tip[1]))
-        uo = np.array([tip[0], tip[1]]) / max(r, 1e-6)
-        v_rad = float(np.clip(-dv * 0.00012, -0.012, 0.012))
-        v_base = np.array([uo[0] * v_rad, uo[1] * v_rad, 0.0])
-        # Base XY velocity -> camera-frame velocity for servo_loop.
-        T_base_cam = T_cam_of(joints)
-        v_cam = T_base_cam[:3, :3].T @ v_base
-        return np.array([v_cam[0], v_cam[1], v_cam[2], pan_des])
-
-    def done_fn(joints, rgb):
-        tr = finder(rgb, T_cam_of(joints))
-        if tr is None:
-            return False
-        du = abs(float(tr.uv[0]) - tgt_u)
-        dv = abs(float(tr.uv[1]) - tgt_v)
-        return du < 18.0 and dv < 26.0
-
-    try:
-        servo_loop(step_fn, done_fn, timeout_s=timeout_s, label=f"center {label}")
-    except Abort:
-        say(f"{label}: centering aborted/timed out")
-        return None
+        say(f"center {it}: {abs(du):.0f}px {'right' if du > 0 else 'left'}, "
+            f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the jaws")
+        if abs(du) < ALIGN_TOL_PX and abs(dv) < ALIGN_TOL_PX * 1.3:
+            say("centered on the cube")
+            break
+        moved = False
+        q = observe()[0].astype(np.float64)
+        if abs(du) >= ALIGN_TOL_PX:                # horizontal via base rotation
+            dpan = float(np.clip(-du / du_dpan, -MAX_PAN_STEP, MAX_PAN_STEP))
+            q[0] = float(np.clip(q[0] + dpan, -100, 100))
+            goto_smooth(q, settle=CENTER_SETTLE, step=CENTER_STEP); moved = True
+        if dv_dr and abs(dv) >= ALIGN_TOL_PX * 1.3:   # vertical via radial reach
+            p = _tip(observe()[0]); r = float(np.hypot(p[0], p[1]))
+            uo = np.array([p[0], p[1]]) / max(r, 1e-6)
+            dr = float(np.clip(-dv / dv_dr, -MAX_RAD_STEP, MAX_RAD_STEP))
+            if _move_tip(np.array([p[0] + uo[0]*dr, p[1] + uo[1]*dr, p[2]]),
+                         gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
+                moved = True
+        if not moved:
+            break
     tip = _tip(observe()[0])
     return np.array([tip[0], tip[1]], np.float64)
 
@@ -2082,7 +2169,7 @@ def run_mission():
                 gp_mid, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
                 gp_mid = gp_mid if gp_mid else 70.0
                 set_phase("PICK", f"{stage} centering ({i+1}/{APPROACH_STEPS})")
-                aligned = center_smooth(finder, label, timeout_s=20.0)
+                aligned = _center_on_cube(finder, gp_mid, float(q[4]))
                 if aligned is not None:
                     xy = np.array([float(aligned[0]), float(aligned[1])])
                     say(f"{stage} centered: x={xy[0]*100:.1f} y={xy[1]*100:.1f} cm")
@@ -2095,7 +2182,7 @@ def run_mission():
         gp, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
-        aligned = center_smooth(finder, label, timeout_s=25.0)
+        aligned = _center_on_cube(finder, gp, j5)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
         else:
