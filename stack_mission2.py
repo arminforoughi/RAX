@@ -844,6 +844,13 @@ W2D = {"objs": {}, "next": 1}
 w2d_lock = threading.Lock()
 
 
+def _rotate_xy(xy, deg):
+    """Rotate a base-frame (x, y) point about the origin by deg degrees."""
+    th = math.radians(float(deg))
+    c, s = math.cos(th), math.sin(th)
+    return np.array([xy[0] * c - xy[1] * s, xy[0] * s + xy[1] * c], dtype=np.float64)
+
+
 def obj_xy_2d(bbox, T_cam, z_m=None):
     """Where the cube is, base-frame (x, y).
 
@@ -880,6 +887,8 @@ def obj_xy_2d(bbox, T_cam, z_m=None):
     xy = p[:2]
     if not (0.05 < float(np.hypot(*xy)) < 0.95):
         return None, float("nan"), CUBE_EDGE_M
+    # Correct heading/yaw error in the hand-eye by rotating the bearing.
+    xy = _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0])
     return xy, float(rng), CUBE_EDGE_M
 
 
@@ -1733,6 +1742,10 @@ AIM_DV = 0.0
 # is a coarse calibration knob for when the apparent-size / stereo depth numbers
 # are consistently off in scale.
 RANGE_SCALE = [1.0]
+# Rotate all localized (x, y) positions in the base horizontal plane. Positive
+# = counter-clockwise. Use this when the camera shows objects on opposite sides
+# but the map clusters them on one side (a heading/yaw error in the hand-eye).
+MAP_BEARING_OFFSET_DEG = [0.0]
 # Damping. Taking the FULL Jacobian step overshoots and the arm hunts back and
 # forth. Move a fraction of the computed correction each step, and shrink the step
 # as the error shrinks, so it eases in instead of shaking.
@@ -2324,6 +2337,11 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
       <input id="tune-scale" type="number" step="0.05" value="1.0" title="Multiply all ranges by this. >1 spreads objects out; <1 compresses.">
       <button onclick="setTune('scale','/setrangescale?scale=')">Set</button>
     </div>
+    <div class="qrow">
+      <label>bearing deg</label>
+      <input id="tune-bearing" type="number" step="5" value="0.0" title="Rotate the map left/right. Use when camera shows objects on opposite sides but map clusters them on one side.">
+      <button onclick="setTune('bearing','/setbearing?deg=')">Set</button>
+    </div>
   </div>
   <pre id="log"></pre>
 </div></main><script>
@@ -2613,6 +2631,8 @@ async function tick(){
       if(tc && document.activeElement !== tc) tc.value = s.tune.cube_edge_cm;
       const tsc = document.getElementById('tune-scale');
       if(tsc && document.activeElement !== tsc) tsc.value = s.tune.range_scale;
+      const tb = document.getElementById('tune-bearing');
+      if(tb && document.activeElement !== tb) tb.value = s.tune.bearing_deg;
     }
   }catch(e){}
   setTimeout(tick, 700);
@@ -2684,6 +2704,7 @@ def status():
         "approach_steps": APPROACH_STEPS,
         "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
         "range_scale": round(float(RANGE_SCALE[0]), 2),
+        "bearing_deg": round(float(MAP_BEARING_OFFSET_DEG[0]), 1),
     }
     return jsonify(s)
 
@@ -3305,6 +3326,21 @@ def setrangescale():
     RANGE_SCALE[0] = scale
     say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, scale=scale)
+
+
+@app.route("/setbearing", methods=["POST"])
+def setbearing():
+    """Live-tune the map bearing offset (deg). Positive = rotate map CCW.
+    Use this when the camera shows objects on opposite sides but the 2D map
+    clusters them on one side (camera heading error)."""
+    try:
+        deg = float(request.args.get("deg", request.form.get("deg", 0.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    deg = float(np.clip(deg, -180.0, 180.0))
+    MAP_BEARING_OFFSET_DEG[0] = deg
+    say(f"map bearing offset set to {deg:.1f}deg — clear the 2D map and re-scan to see it")
+    return jsonify(ok=True, deg=deg)
 
 
 @app.route("/relocate", methods=["POST"])
