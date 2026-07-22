@@ -836,11 +836,10 @@ TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise
 # fly the gripper on top. Each entry also carries the STEREO range next to the
 # IPM range, so the two can be compared (if they disagree, the hand-eye distance
 # is off; if they agree, the object really is that far).
-W2D_MERGE = 0.18          # detections of the same label within this = same object.
-                          # Wider than one cube because the current hand-eye TF
-                          # spreads a single cube's localization ~15cm across pan
-                          # angles; re-fitting the TF (Calib) shrinks this and the
-                          # merge can come back down.
+W2D_MERGE = 0.14          # detections of the same label within this = same object.
+                          # Tightened because objects were being merged too
+                          # aggressively in the compressed map. Increase if you get
+                          # duplicate ghosts for one cube.
 W2D = {"objs": {}, "next": 1}
 w2d_lock = threading.Lock()
 
@@ -869,6 +868,9 @@ def obj_xy_2d(bbox, T_cam, z_m=None):
         rng = float(fx * CUBE_EDGE_M / float(w))
         if not (0.05 < rng < 1.20):
             return None, float("nan"), CUBE_EDGE_M
+
+    rng *= float(RANGE_SCALE[0])
+    rng = float(np.clip(rng, 0.03, 1.50))
 
     u = (x1 + x2) / 2.0
     v = (y1 + y2) / 2.0
@@ -924,7 +926,9 @@ def world2d_update(label, xy, stereo, size=0.03):
                               "size": float(size), "n": 1, "stereo": stereo, "t": time.time()}
         else:
             o = W2D["objs"][best]
-            o["xy"] = 0.7 * o["xy"] + 0.3 * np.asarray(xy, float)
+            # Give fresh observations more weight so the map converges faster and
+            # does not stay stuck on an early bad localization.
+            o["xy"] = 0.55 * o["xy"] + 0.45 * np.asarray(xy, float)
             o["size"] = 0.8 * o.get("size", size) + 0.2 * float(size)
             o["n"] += 1
             o["stereo"] = stereo
@@ -939,7 +943,9 @@ def sense_2d(joints=None, rgb=None):
     for finder, label in ((find_red, "red cube"), (find_green, "green cube")):
         tr = finder(rgb, T)
         if tr is not None and not tr.clipped:
-            z = read_depth_m(tr.uv)
+            # Average a few stereo depth reads for a cleaner range estimate.
+            zs = [z for z in (read_depth_m(tr.uv) for _ in range(3)) if z is not None]
+            z = float(np.median(zs)) if zs else None
             xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=z)
             if xy is not None:
                 world2d_update(label, xy, st, sz)
@@ -1719,10 +1725,14 @@ CUBE_EDGE_M = 0.0508       # the cube's real edge: 2 inches. Back-solved from a
 # makes the arm travel FURTHER RIGHT before it thinks it is lined up, because
 # swinging the camera right slides the cube left in the picture. If it now
 # overshoots to the right, make this less negative; if still left, more negative.
-# Shift the visual centering aim point ~5 cm to the LEFT of the crosshair so the
-# robot ends up on the RIGHT side of the cube.
+# The arm is still landing left, so push the aim point further left.
 AIM_DU = -90.0
 AIM_DV = 0.0
+# Global scale on computed range. Increase (>1.0) to push mapped objects FURTHER
+# OUT and spread them apart; decrease (<1.0) to pull them closer together. This
+# is a coarse calibration knob for when the apparent-size / stereo depth numbers
+# are consistently off in scale.
+RANGE_SCALE = [1.0]
 # Damping. Taking the FULL Jacobian step overshoots and the arm hunts back and
 # forth. Move a fraction of the computed correction each step, and shrink the step
 # as the error shrinks, so it eases in instead of shaking.
@@ -2064,7 +2074,8 @@ def run_mission():
             trf = _cube_track(finder, tries=3)
             if trf is not None and not trf.clipped:
                 jf, _rgbf, _ = observe()
-                zf = read_depth_m(trf.uv)
+                zfs = [z for z in (read_depth_m(trf.uv) for _ in range(3)) if z is not None]
+                zf = float(np.median(zfs)) if zfs else None
                 xyf, _rngf, _szf = obj_xy_2d(trf.bbox_xyxy, T_cam_of(jf), z_m=zf)
                 if xyf is not None:
                     xy2 = xyf
@@ -2307,6 +2318,11 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
       <label>cube cm</label>
       <input id="tune-cube" type="number" step="0.5" value="5.08" title="Real cube edge in cm. Used for apparent-size range fallback.">
       <button onclick="setTune('cube','/setcubesize?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>range scale</label>
+      <input id="tune-scale" type="number" step="0.05" value="1.0" title="Multiply all ranges by this. >1 spreads objects out; <1 compresses.">
+      <button onclick="setTune('scale','/setrangescale?scale=')">Set</button>
     </div>
   </div>
   <pre id="log"></pre>
@@ -2595,6 +2611,8 @@ async function tick(){
       if(ts && document.activeElement !== ts) ts.value = s.tune.approach_steps;
       const tc = document.getElementById('tune-cube');
       if(tc && document.activeElement !== tc) tc.value = s.tune.cube_edge_cm;
+      const tsc = document.getElementById('tune-scale');
+      if(tsc && document.activeElement !== tsc) tsc.value = s.tune.range_scale;
     }
   }catch(e){}
   setTimeout(tick, 700);
@@ -2665,6 +2683,7 @@ def status():
         "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
         "approach_steps": APPROACH_STEPS,
         "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
+        "range_scale": round(float(RANGE_SCALE[0]), 2),
     }
     return jsonify(s)
 
@@ -3271,6 +3290,21 @@ def setcubesize():
     CUBE_EDGE_M = cm / 100.0
     say(f"cube edge size set to {cm:.2f}cm")
     return jsonify(ok=True, cm=cm)
+
+
+@app.route("/setrangescale", methods=["POST"])
+def setrangescale():
+    """Live-tune the global range scale. >1.0 pushes mapped objects further out
+    (more spread); <1.0 pulls them closer. Use this if the whole map looks
+    compressed or stretched."""
+    try:
+        scale = float(request.args.get("scale", request.form.get("scale", 1.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    scale = float(np.clip(scale, 0.3, 3.0))
+    RANGE_SCALE[0] = scale
+    say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
+    return jsonify(ok=True, scale=scale)
 
 
 @app.route("/relocate", methods=["POST"])
