@@ -84,10 +84,12 @@ CAMSURV = ("http://127.0.0.1:5000", "camsurv123")
 LOOP_DT = 0.07            # ~14 Hz
 V_LAT_MAX = 0.016         # m/s lateral
 V_FWD_MAX = 0.030         # m/s approach
-ACC_ALPHA = 0.22          # velocity EMA (lower = smoother, more damped)
+ACC_ALPHA = 0.12          # velocity EMA (lower = smoother, more damped)
+PAN_ACC_LIMIT = 0.8       # deg/s per tick max change in pan rate — ramps up gently
+PAN_RAMP = 0.04           # soft transition factor for pan enable (smooth start)
 K_LAT = 0.45              # lateral P gain (0.9 caused left-right hunting)
 DEADBAND_PX = 18          # no lateral correction inside this — kills the limit cycle
-JOINT_RATE_MAX = 35.0     # deg/s per joint hard clamp
+JOINT_RATE_MAX = 25.0     # deg/s per joint hard clamp (lower = less jerk at stop)
 
 # gaze-engine approach: point at the target (direct-joint pixel P-control, no
 # IK, so it can't swing) then step straight down the line of sight, decreasing
@@ -600,6 +602,7 @@ def servo_loop(step_fn, done_fn, timeout_s=60.0, label="servo", stall_ok=None):
     returns success instead of retreating."""
     v_f = np.zeros(3)
     pan_f = 0.0   # smoothed shoulder-pan rate (deg/s) for horizontal centering
+    pan_rate = 0.0  # acceleration-limited pan command that ramps up from zero
     t_end = time.time() + timeout_s
     n, t_hz = 0, time.time()
     q_cmd = None  # persistent commanded trajectory — integrates velocity so
@@ -639,6 +642,7 @@ def servo_loop(step_fn, done_fn, timeout_s=60.0, label="servo", stall_ok=None):
             send_joints(q_up)
             q_cmd = np.asarray(q_up, dtype=np.float64).copy()
             v_f = np.zeros(3)
+            pan_rate = 0.0
             hist.clear()
             stall_cool = now + 2.0
             time.sleep(0.35)
@@ -675,13 +679,18 @@ def servo_loop(step_fn, done_fn, timeout_s=60.0, label="servo", stall_ok=None):
             moved = True
         # horizontal centering via BASE ROTATION (shoulder_pan) — singularity-
         # free, unlike sideways wrist translation which fails at extended reach.
-        if abs(pan_f) > 0.05:
-            q_cmd[0] += float(np.clip(pan_f, -30.0, 30.0)) * LOOP_DT
+        pan_target = pan_f
+        if abs(pan_target) > 0.02:
+            d_pan = float(np.clip(pan_target - pan_rate, -PAN_ACC_LIMIT, PAN_ACC_LIMIT))
+            pan_rate += d_pan
+            q_cmd[0] += float(np.clip(pan_rate, -25.0, 25.0)) * LOOP_DT
             moved = True
+        else:
+            pan_rate *= 0.85   # decay when idle — no hard stop
         if moved:
-            # anti-windup: if the arm can't follow (obstacle, limit), don't let
-            # the command grind into it.
-            q_cmd = joints + np.clip(q_cmd - joints, -2.5, 2.5)
+            # anti-windup: gentle pull instead of hard clamp — blends 70%
+            # measured + 30% commanded so the arm never snaps.
+            q_cmd = 0.7 * joints + 0.3 * q_cmd
             send_joints(q_cmd)
         n += 1
         if n % 20 == 0:
@@ -1863,10 +1872,10 @@ def _move_tip(p_tgt, pitch, j5, settle=0.25, step=1.5):
     return None
 
 
-ALIGN_TOL_PX = 34.0        # cube this close to the gripper pixel = aligned
-ALIGN_ITERS = 8
-ALIGN_PROBE_M = 0.02       # metres to probe when measuring the image response
-ALIGN_CAP_M = 0.025        # max lateral correction per iteration
+ALIGN_TOL_PX = 36.0        # cube this close to the gripper pixel = aligned
+ALIGN_ITERS = 5            # fewer iterations: by now the approach already got close
+ALIGN_PROBE_M = 0.015      # metres to probe when measuring the image response
+ALIGN_CAP_M = 0.020        # max lateral correction per iteration
 
 
 def _center_on_cube(finder, gp, j5):
@@ -1896,11 +1905,11 @@ def _center_on_cube(finder, gp, j5):
     # The BASE is the main source of jerk, so its max step scales the most.
     r_m = _cube_range_m(tr)
     close = r_m < 0.12          # within ~12 cm -> slow/close mode
-    speed = 0.45 if close else 1.0
-    CENTER_STEP = 0.8 * speed   # deg per goto_smooth tick
-    CENTER_SETTLE = 0.6 if close else 0.45  # s
-    MAX_PAN_STEP = (1.5 if close else 3.5)  # deg per iteration
-    MAX_RAD_STEP = (0.008 if close else 0.015)  # m per iteration
+    speed = 0.55 if close else 1.0
+    CENTER_STEP = 1.0 * speed   # deg per goto_smooth tick
+    CENTER_SETTLE = 0.35 if close else 0.25  # s
+    MAX_PAN_STEP = (2.0 if close else 4.0)  # deg per iteration
+    MAX_RAD_STEP = (0.010 if close else 0.020)  # m per iteration
 
     # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
     qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
@@ -2031,17 +2040,13 @@ def _mapped_xy(label):
         return None if best is None else np.array(best["xy"], float)
 
 
-STANDOFF_BACK = 0.045       # aim this far SHORT of the cube while approaching
-STANDOFF_RIGHT = 0.000      # (lateral centring is done by _visual_align now)
-GRASP_RIGHT_TRIM = 0.000    # (superseded by _visual_align)  the gripper lands LEFT, so
-                            # shift the FINAL target this far to the cube's right.
-                            # More positive = further right; negative = left.
 TARGET_RIGHT_TRIM_M = 0.030 # shift the APPROACH target this far to the cube's RIGHT
                             # from the start, because the arm consistently lands LEFT.
                             # This bias is applied before the staged approach and the
                             # visual centering servos then refine on the real cube.
-APPROACH_STEPS = 2          # waypoints in; each closes part of the REMAINING
-                            # gap, so steps shrink automatically near the end
+APPROACH_STEPS = 3          # default approach waypoints. Step 1 closes ~90% of the
+                            # gap so the arm gets close fast; remaining steps close
+                            # the rest without passing the target.
 
 
 def run_mission():
@@ -2080,24 +2085,32 @@ def run_mission():
             f"- approaching in {APPROACH_STEPS} stages")
         send_joints(observe()[0], gripper=95.0)
 
-        # ---- approach in stages, looking again at each checkpoint ----
+        # ---- approach: move directly toward the mapped cube, never backward ----
+        # Old logic aimed SHORT of the cube on every stage, so once the arm got
+        # close the next waypoint was behind it and it backed away. This just
+        # closes the remaining gap each step.
         for i in range(APPROACH_STEPS):
             checkpoint()
             q = observe()[0].astype(np.float64)
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
             tip = _tip(q)
+            target_xy = np.array(xy, dtype=np.float64)
+            delta_xy = target_xy - tip[:2]
+            dist_xy = float(np.linalg.norm(delta_xy))
+
+            if dist_xy < 0.015:
+                say(f"approach {i+1}: already at cube xy")
+                break
+
             last = (i == APPROACH_STEPS - 1)
-            frac = 1.0 if last else 0.45
-            # ALWAYS stop a little SHORT of the cube (radially), even on the last
-            # stage, so the cube stays in the camera view for the centring servo.
-            # The old last-stage lunge to the exact map point pushed the cube out of
-            # frame ("cube not in view") and then descended blind.
-            aim = np.array(xy, dtype=np.float64)
-            r_a = float(np.hypot(*aim))
-            if r_a > 1e-6:
-                aim = aim - (aim / r_a) * STANDOFF_BACK
-            wx = float(tip[0] + (aim[0] - tip[0]) * frac)
-            wy = float(tip[1] + (aim[1] - tip[1]) * frac)
+            frac = 1.0 if last else 0.9
+            # Last step reaches the target exactly (no cap). Earlier steps close 90%
+            # of the remaining gap, capped so the camera stays on the cube.
+            step_len = dist_xy * frac if last else min(dist_xy * frac, 0.12)
+            step_xy = (delta_xy / dist_xy * step_len) if dist_xy > 1e-6 else np.zeros(2)
+            wx = float(tip[0] + step_xy[0])
+            wy = float(tip[1] + step_xy[1])
+
             pitch, e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
             if pitch is None:
                 raise Abort(f"r={np.hypot(*xy)*100:.0f}cm is out of reach "
@@ -2105,24 +2118,17 @@ def run_mission():
             with lock:
                 state["obj3d"] = [float(xy[0]), float(xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
-            d_xy = float(np.linalg.norm(np.array([xy[0], xy[1]]) - tip[:2]))
-            close = d_xy < 0.12
             set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
-                              f"-> x={wx*100:.0f} y={wy*100:.0f} cm "
-                              f"({'close' if close else 'far'})")
-            step = 0.3 if close else 0.5
-            settle = 0.7 if close else 0.55
+                              f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
             if _move_tip(np.array([wx, wy, PICK_HOVER_Z]), pitch, j5,
-                         settle=settle, step=step) is None:
+                         settle=0.25, step=1.2) is None:
                 raise Abort(f"IK cannot reach x={wx*100:.0f} y={wy*100:.0f}")
 
-            # CHECKPOINT: look again from the new vantage and refine the target
-            time.sleep(0.25)
+            # Refine the target from the new vantage, but ignore corrections that
+            # would move us backward -- noisy close-range localizations sometimes
+            # claim the cube is further than it is.
+            time.sleep(0.15)
             sense_2d()
-            # Prefer a FRESH single-frame measurement over the running map average.
-            # world2d_update blends 0.7*old + 0.3*new, so by the time we are close the
-            # average is dominated by early sightings taken from far away - the least
-            # accurate ones. Up close, this frame beats that history.
             xy2 = None
             trf = _cube_track(finder, tries=3)
             if trf is not None and not trf.clipped:
@@ -2135,46 +2141,14 @@ def run_mission():
             if xy2 is None:
                 xy2 = _mapped_xy(label)
             if xy2 is not None:
-                adj = float(np.linalg.norm(xy2 - xy))
-                t2 = _tip(observe()[0])
-                # Where does the cube actually sit in frame? The goal is to bring it
-                # to the gripper pixel (bottom centre). This number is the honest
-                # measure of whether the approach is converging.
-                trc = _cube_track(finder, tries=2)
-                if trc is not None:
-                    du = trc.uv[0] - HAND_UV[0]
-                    dv = trc.uv[1] - HAND_UV[1]
-                    off = f" | cube is {abs(du):.0f}px {'right' if du > 0 else 'left'}, "                           f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the gripper"
+                new_dist = float(np.linalg.norm(xy2 - tip[:2]))
+                if new_dist <= dist_xy + 0.03:
+                    adj = float(np.linalg.norm(xy2 - xy))
+                    say(f"check {i+1}/{APPROACH_STEPS}: refined cube by {adj*100:.1f}cm")
+                    xy = xy2
                 else:
-                    off = " | cube not in frame"
-                say(f"check {i+1}/{APPROACH_STEPS}: tip x={t2[0]*100:.1f} y={t2[1]*100:.1f} | "
-                    f"cube x={xy2[0]*100:.1f} y={xy2[1]*100:.1f} (adjusted {adj*100:.1f}cm)" + off)
-                xy = xy2
-            else:
-                say(f"check {i+1}/{APPROACH_STEPS}: cube not in view - keeping last position")
-
-            # EARLY CENTERING: visually centre the cube under the jaws BEFORE the
-            # final lunge. This corrects map drift while there is still room to adjust,
-            # instead of discovering the misalignment only at the end when the cube may
-            # already be partially out of frame. Run after stage 1, stage 2 and halfway.
-            if i == 0 or i == 1 or i == APPROACH_STEPS // 2:
-                if i == 0:
-                    stage = "first step"
-                elif i == 1:
-                    stage = "stage 2"
-                else:
-                    stage = "halfway"
-                say(f"starting {stage} visual centering ({i+1}/{APPROACH_STEPS})")
-                q = observe()[0].astype(np.float64)
-                gp_mid, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
-                gp_mid = gp_mid if gp_mid else 70.0
-                set_phase("PICK", f"{stage} centering ({i+1}/{APPROACH_STEPS})")
-                aligned = _center_on_cube(finder, gp_mid, float(q[4]))
-                if aligned is not None:
-                    xy = np.array([float(aligned[0]), float(aligned[1])])
-                    say(f"{stage} centered: x={xy[0]*100:.1f} y={xy[1]*100:.1f} cm")
-                else:
-                    say(f"{stage} centering skipped / no usable cube in view")
+                    say(f"check {i+1}/{APPROACH_STEPS}: refined target is {new_dist*100:.0f}cm away "
+                        f"(current {dist_xy*100:.0f}cm) - ignoring")
 
         # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
         q = observe()[0].astype(np.float64)
@@ -2194,8 +2168,8 @@ def run_mission():
             z = float(z0 + (PICK_GRASP_Z - z0) * f)
             last = (f == 1.0)
             set_phase("PICK", f"descending to z={z*100:.1f}cm")
-            step = 0.2 if last else 0.4
-            settle = 0.8 if last else 0.6
+            step = 0.5 if last else 0.8
+            settle = 0.35 if last else 0.25
             if _move_tip(np.array([gx, gy, z]), gp, j5,
                          settle=settle, step=step) is None:
                 say("could not reach that height - closing from here")
