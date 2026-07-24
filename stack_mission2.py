@@ -1784,7 +1784,7 @@ CUBE_EDGE_M = 0.0508       # the cube's real edge: 2 inches. Back-solved from a
 # swinging the camera right slides the cube left in the picture. If it now
 # overshoots to the right, make this less negative; if still left, more negative.
 # The arm is still landing left, so push the aim point further left.
-AIM_DU = -20.0   # small final centering bias: robot lands just right of cube
+AIM_DU = -45.0   # final centering bias: robot lands on the cube's RIGHT
 AIM_DV = 0.0
 # Global scale on computed range. Increase (>1.0) to push mapped objects FURTHER
 # OUT and spread them apart; decrease (<1.0) to pull them closer together. This
@@ -2040,10 +2040,9 @@ def _mapped_xy(label):
         return None if best is None else np.array(best["xy"], float)
 
 
-TARGET_RIGHT_TRIM_M = 0.030 # shift the APPROACH target this far to the cube's RIGHT
-                            # from the start, because the arm consistently lands LEFT.
-                            # This bias is applied before the staged approach and the
-                            # visual centering servos then refine on the real cube.
+TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH hover target this far to the
+                            # cube's RIGHT, so the cube stays on the LEFT side of the
+                            # camera view during approach.
 APPROACH_STEPS = 3          # default approach waypoints. Step 1 closes ~90% of the
                             # gap so the arm gets close fast; remaining steps close
                             # the rest without passing the target.
@@ -2064,15 +2063,16 @@ def run_mission():
         if r < 1e-6 or d == 0.0:
             return np.array(p, dtype=np.float64)
         u = np.array(p, dtype=np.float64) / r
-        perp = np.array([u[1], -u[0]])          # to the cube's right
+        # Flip sign from previous attempt: this direction puts the gripper on the
+        # cube's RIGHT in the actual camera/base frame.
+        perp = np.array([-u[1], u[0]])
         return np.array(p, dtype=np.float64) + perp * d
 
-    def _approach_target(cube_xy, back_m=0.020, right_m=0.030):
+    def _approach_target(cube_xy, back_m=0.015):
         """Hover position for the approach: short of the cube and to its right.
 
         back_m: stop this many metres radially BEFORE the cube (keeps it in view).
-        right_m: offset this many metres to the cube's right (so the cube appears
-                 on the LEFT side of the camera image during approach).
+        The lateral offset is TARGET_RIGHT_TRIM_M (tunable in the UI).
         """
         cube_xy = np.asarray(cube_xy, dtype=np.float64)
         r = float(np.hypot(*cube_xy))
@@ -2080,7 +2080,7 @@ def run_mission():
             backed = cube_xy * ((r - back_m) / r)
         else:
             backed = cube_xy.copy()
-        return _shift_right(backed, right_m)
+        return _shift_right(backed, TARGET_RIGHT_TRIM_M)
 
     try:
         stop_flag.clear()
