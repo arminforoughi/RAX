@@ -1784,7 +1784,7 @@ CUBE_EDGE_M = 0.0508       # the cube's real edge: 2 inches. Back-solved from a
 # swinging the camera right slides the cube left in the picture. If it now
 # overshoots to the right, make this less negative; if still left, more negative.
 # The arm is still landing left, so push the aim point further left.
-AIM_DU = -90.0
+AIM_DU = -110.0
 AIM_DV = 0.0
 # Global scale on computed range. Increase (>1.0) to push mapped objects FURTHER
 # OUT and spread them apart; decrease (<1.0) to pull them closer together. This
@@ -2040,10 +2040,11 @@ def _mapped_xy(label):
         return None if best is None else np.array(best["xy"], float)
 
 
-TARGET_RIGHT_TRIM_M = 0.030 # shift the APPROACH target this far to the cube's RIGHT
-                            # from the start, because the arm consistently lands LEFT.
-                            # This bias is applied before the staged approach and the
-                            # visual centering servos then refine on the real cube.
+TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH target this far to the cube's RIGHT
+                            # because the arm consistently lands LEFT. The approach
+                            # goes to this biased point; visual centering then refines.
+FINAL_STANDOFF_M = 0.020    # stop the approach this far SHORT of the cube radially.
+                            # The last bit is closed by visual centering / descent.
 APPROACH_STEPS = 3          # default approach waypoints. Step 1 closes ~90% of the
                             # gap so the arm gets close fast; remaining steps close
                             # the rest without passing the target.
@@ -2074,49 +2075,55 @@ def run_mission():
             state["t0"] = time.time()
         finder, tracker, label = _target_finder()
 
-        xy = _mapped_xy(label)
-        if xy is None:
+        def _approach_target(cube_xy):
+            """Cube position -> right-biased, slightly-short approach aim point.
+            The arm approaches this point so it arrives on the cube's right side
+            and stops 2 cm short radially; final centering then closes the gap."""
+            p = _shift_right(cube_xy, TARGET_RIGHT_TRIM_M)
+            r = float(np.hypot(p[0], p[1]))
+            if r > 1e-6:
+                p = p - (p / r) * FINAL_STANDOFF_M
+            return p
+
+        cube_xy = _mapped_xy(label)
+        if cube_xy is None:
             raise Abort(f"{label} cube is not on the 2D map - press 'Scan -> 2D map' first")
-        # The arm consistently lands LEFT of the cube, so bias the whole approach
-        # target to the cube's RIGHT from the start. Visual centering then refines.
-        xy = _shift_right(xy, TARGET_RIGHT_TRIM_M)
-        say(f"{label} cube mapped at x={xy[0]*100:.1f} y={xy[1]*100:.1f} cm "
-            f"(r={np.hypot(*xy)*100:.1f}cm, biased right {TARGET_RIGHT_TRIM_M*100:.0f}mm) "
+        approach_xy = _approach_target(cube_xy)
+        say(f"{label} cube mapped at x={cube_xy[0]*100:.1f} y={cube_xy[1]*100:.1f} cm "
+            f"(r={np.hypot(*cube_xy)*100:.1f}cm, approach aim "
+            f"x={approach_xy[0]*100:.1f} y={approach_xy[1]*100:.1f}cm) "
             f"- approaching in {APPROACH_STEPS} stages")
         send_joints(observe()[0], gripper=95.0)
 
-        # ---- approach: move directly toward the mapped cube, never backward ----
-        # Old logic aimed SHORT of the cube on every stage, so once the arm got
-        # close the next waypoint was behind it and it backed away. This just
-        # closes the remaining gap each step.
+        # ---- approach: move directly toward the biased aim point, never backward ----
         for i in range(APPROACH_STEPS):
             checkpoint()
             q = observe()[0].astype(np.float64)
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
             tip = _tip(q)
-            target_xy = np.array(xy, dtype=np.float64)
+            target_xy = np.array(approach_xy, dtype=np.float64)
             delta_xy = target_xy - tip[:2]
             dist_xy = float(np.linalg.norm(delta_xy))
 
             if dist_xy < 0.015:
-                say(f"approach {i+1}: already at cube xy")
+                say(f"approach {i+1}: already at approach aim")
                 break
 
             last = (i == APPROACH_STEPS - 1)
             frac = 1.0 if last else 0.9
-            # Last step reaches the target exactly (no cap). Earlier steps close 90%
+            # Last step reaches the aim exactly (no cap). Earlier steps close 90%
             # of the remaining gap, capped so the camera stays on the cube.
             step_len = dist_xy * frac if last else min(dist_xy * frac, 0.12)
             step_xy = (delta_xy / dist_xy * step_len) if dist_xy > 1e-6 else np.zeros(2)
             wx = float(tip[0] + step_xy[0])
             wy = float(tip[1] + step_xy[1])
 
-            pitch, e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
+            pitch, e = plan_grasp_pitch(np.array([cube_xy[0], cube_xy[1], PICK_GRASP_Z]), q)
             if pitch is None:
-                raise Abort(f"r={np.hypot(*xy)*100:.0f}cm is out of reach "
+                raise Abort(f"r={np.hypot(*cube_xy)*100:.0f}cm is out of reach "
                             f"(best IK {e*1e3:.0f}mm)")
             with lock:
-                state["obj3d"] = [float(xy[0]), float(xy[1]), PICK_GRASP_Z]
+                state["obj3d"] = [float(cube_xy[0]), float(cube_xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
             set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
                               f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
@@ -2124,9 +2131,8 @@ def run_mission():
                          settle=0.25, step=1.2) is None:
                 raise Abort(f"IK cannot reach x={wx*100:.0f} y={wy*100:.0f}")
 
-            # Refine the target from the new vantage, but ignore corrections that
-            # would move us backward -- noisy close-range localizations sometimes
-            # claim the cube is further than it is.
+            # Refine the CUBE position from the new vantage, then recompute the
+            # approach aim so the right-bias and standoff persist.
             time.sleep(0.15)
             sense_2d()
             xy2 = None
@@ -2143,9 +2149,10 @@ def run_mission():
             if xy2 is not None:
                 new_dist = float(np.linalg.norm(xy2 - tip[:2]))
                 if new_dist <= dist_xy + 0.03:
-                    adj = float(np.linalg.norm(xy2 - xy))
+                    adj = float(np.linalg.norm(xy2 - cube_xy))
                     say(f"check {i+1}/{APPROACH_STEPS}: refined cube by {adj*100:.1f}cm")
-                    xy = xy2
+                    cube_xy = xy2
+                    approach_xy = _approach_target(cube_xy)
                 else:
                     say(f"check {i+1}/{APPROACH_STEPS}: refined target is {new_dist*100:.0f}cm away "
                         f"(current {dist_xy*100:.0f}cm) - ignoring")
@@ -2153,14 +2160,14 @@ def run_mission():
         # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
         q = observe()[0].astype(np.float64)
         j5 = float(q[4])             # no wrist twist
-        gp, _e = plan_grasp_pitch(np.array([xy[0], xy[1], PICK_GRASP_Z]), q)
+        gp, _e = plan_grasp_pitch(np.array([cube_xy[0], cube_xy[1], PICK_GRASP_Z]), q)
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
         aligned = _center_on_cube(finder, gp, j5)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
         else:
-            gx, gy = float(xy[0]), float(xy[1])
+            gx, gy = float(cube_xy[0]), float(cube_xy[1])
         q = observe()[0].astype(np.float64)
         z0 = float(_tip(q)[2])
         for f in (0.4, 0.75, 1.0):
