@@ -2043,8 +2043,9 @@ def _mapped_xy(label):
 TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH target this far to the cube's RIGHT
                             # because the arm consistently lands LEFT. The approach
                             # goes to this biased point; visual centering then refines.
-FINAL_STANDOFF_M = 0.020    # stop the approach this far SHORT of the cube radially.
+FINAL_STANDOFF_M = [0.010]  # stop the approach this far SHORT of the cube radially.
                             # The last bit is closed by visual centering / descent.
+                            # Tunable via UI; smaller = closer to the cube.
 APPROACH_STEPS = 3          # default approach waypoints. Step 1 closes ~90% of the
                             # gap so the arm gets close fast; remaining steps close
                             # the rest without passing the target.
@@ -2082,7 +2083,7 @@ def run_mission():
             p = _shift_right(cube_xy, TARGET_RIGHT_TRIM_M)
             r = float(np.hypot(p[0], p[1]))
             if r > 1e-6:
-                p = p - (p / r) * FINAL_STANDOFF_M
+                p = p - (p / r) * float(FINAL_STANDOFF_M[0])
             return p
 
         cube_xy = _mapped_xy(label)
@@ -2340,8 +2341,13 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     </div>
     <div class="qrow">
       <label>right trim cm</label>
-      <input id="tune-trim" type="number" step="0.5" value="3.0" title="Approach target shifted this many cm to the cube's RIGHT.">
+      <input id="tune-trim" type="number" step="0.5" value="5.0" title="Approach target shifted this many cm to the cube's RIGHT.">
       <button onclick="setTune('trim','/settrim?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>standoff cm</label>
+      <input id="tune-standoff" type="number" step="0.5" value="1.0" title="How far short of the cube the approach stops radially. Smaller = closer.">
+      <button onclick="setTune('standoff','/setstandoff?cm=')">Set</button>
     </div>
     <div class="qrow">
       <label>steps</label>
@@ -2654,6 +2660,8 @@ async function tick(){
       if(tsc && document.activeElement !== tsc) tsc.value = s.tune.range_scale;
       const tb = document.getElementById('tune-bearing');
       if(tb && document.activeElement !== tb) tb.value = s.tune.bearing_deg;
+      const tso = document.getElementById('tune-standoff');
+      if(tso && document.activeElement !== tso) tso.value = s.tune.standoff_cm;
     }
   }catch(e){}
   setTimeout(tick, 700);
@@ -2726,6 +2734,7 @@ def status():
         "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
         "range_scale": round(float(RANGE_SCALE[0]), 2),
         "bearing_deg": round(float(MAP_BEARING_OFFSET_DEG[0]), 1),
+        "standoff_cm": round(float(FINAL_STANDOFF_M[0]) * 100, 2),
     }
     return jsonify(s)
 
@@ -3347,6 +3356,20 @@ def setrangescale():
     RANGE_SCALE[0] = scale
     say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, scale=scale)
+
+
+@app.route("/setstandoff", methods=["POST"])
+def setstandoff():
+    """Live-tune the final approach standoff (cm). How far SHORT of the cube the
+    staged approach stops radially. Smaller = closer to the cube."""
+    try:
+        cm = float(request.args.get("cm", request.form.get("cm", 1.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    cm = float(np.clip(cm, 0.0, 8.0))
+    FINAL_STANDOFF_M[0] = cm / 100.0
+    say(f"approach standoff set to {cm:.1f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/setbearing", methods=["POST"])
