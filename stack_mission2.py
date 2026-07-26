@@ -433,12 +433,12 @@ def send_joints(q, gripper=None):
 # Per-joint velocity / acceleration limits for smooth transit moves (deg/s, deg/s^2).
 # The base carries the most inertia and causes the visible jump, so it gets the
 # gentlest limits. Wrist joints can move faster.
-_GOTO_VMAX = np.array([20.0, 30.0, 30.0, 40.0, 50.0])
-_GOTO_AMAX = np.array([40.0, 60.0, 60.0, 80.0, 100.0])
+_GOTO_VMAX = np.array([38.0, 55.0, 55.0, 75.0, 90.0])
+_GOTO_AMAX = np.array([75.0, 110.0, 110.0, 150.0, 180.0])
 _GOTO_DT = 0.02  # 50 Hz command rate
 
 
-def goto_smooth(target, settle=0.3, step=2.0):
+def goto_smooth(target, settle=0.15, step=2.0):
     """Transit move with a quintic S-curve profile: zero start/end velocity and
     acceleration. This removes the base jump at motion start/stop.
 
@@ -463,7 +463,7 @@ def goto_smooth(target, settle=0.3, step=2.0):
         T_v = np.where(abs_d > 0.001, 1.875 * abs_d / np.maximum(vmax, 1e-6), 0.0)
         T_a = np.where(abs_d > 0.001, np.sqrt(5.78 * abs_d / np.maximum(amax, 1e-6)), 0.0)
     T = float(np.max(np.maximum(T_v, T_a)))
-    T = max(T, 0.20)  # always at least 200 ms for tiny moves
+    T = max(T, 0.12)  # always at least 120 ms for tiny moves
 
     n = int(np.ceil(T / _GOTO_DT))
     t0 = time.time()
@@ -645,7 +645,7 @@ def servo_loop(step_fn, done_fn, timeout_s=60.0, label="servo", stall_ok=None):
             pan_rate = 0.0
             hist.clear()
             stall_cool = now + 2.0
-            time.sleep(0.35)
+            time.sleep(0.18)
             continue
         v_des = step_fn(joints, rgb, LOOP_DT)
         pan_des = 0.0
@@ -735,14 +735,14 @@ def search(finder, label):
              for p in (0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0)]
     for i, q in enumerate(sweep):
         set_phase(f"SEARCH {label}", f"sweep {i + 1}/{len(sweep)}")
-        goto_smooth(q, settle=0.7)
-        for _ in range(3):
+        goto_smooth(q, settle=0.35)
+        for _ in range(2):
             joints, rgb, _ = observe()
             tr = finder(rgb, T_cam_of(joints))
             if tr is not None:
                 say(f"{label} found: uv=({tr.uv[0]:.0f},{tr.uv[1]:.0f}) area={tr.area_px}")
                 return
-            time.sleep(0.25)
+            time.sleep(0.12)
     raise Abort(f"{label} cube not found in sweep")
 
 
@@ -754,14 +754,14 @@ def triangulate(finder, tracker, label):
                np.array([0, -8, +6, +4, 0]), np.array([+6, +5, -4, -3, 0])):
         if len(rays) >= 4:
             break
-        goto_smooth(base + dq, settle=1.1)
+        goto_smooth(base + dq, settle=0.45)
         tr = None
-        for _ in range(3):
+        for _ in range(2):
             joints, rgb, _ = observe()
             tr = finder(rgb, T_cam_of(joints))
             if tr is not None and not tr.clipped:
                 break
-            time.sleep(0.35)
+            time.sleep(0.15)
         if tr is None or tr.clipped:
             say(f"{label} vantage {dq}: unusable — skipped")
             continue
@@ -769,7 +769,7 @@ def triangulate(finder, tracker, label):
         d_cam = np.array([(tr.uv[0] - cx0) / fx, (tr.uv[1] - cy0) / fy, 1.0])
         d = T[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
         rays.append((T[:3, 3], d))
-    goto_smooth(base, settle=0.6)
+    goto_smooth(base, settle=0.30)
     if len(rays) < 3:
         raise Abort(f"{label}: only {len(rays)} usable vantages")
     A = np.zeros((3, 3)); b = np.zeros(3)
@@ -786,11 +786,11 @@ def triangulate(finder, tracker, label):
     return p
 
 
-def close_with_current(step=4.0, delay=0.1):
+def close_with_current(step=5.0, delay=0.05):
     """Close the gripper in small increments, watching the servo current, and
     stop the instant it rises (torque change = fingers on the object). Smaller
     step / longer delay = the slow, gentle close the user asked for."""
-    idle = [c for c in (gripper_current() for _ in range(10)) if c is not None]
+    idle = [c for c in (gripper_current() for _ in range(5)) if c is not None]
     i_idle = float(np.mean(idle)) if idle else 0.0
     pct = 95.0
     while pct > 2.0:
@@ -803,16 +803,16 @@ def close_with_current(step=4.0, delay=0.1):
         if c is not None and abs(c - i_idle) >= 8.0:
             # firmer squeeze — ΔI=1.8 holds slipped the cube during transit
             send_joints(joints, gripper=max(0.0, pct - 14.0))
-            time.sleep(0.4)
+            time.sleep(0.18)
             return True, i_idle
     # Closed on air: DO NOT stay stalled shut (that's what tripped the servo's
     # overload protection earlier) — relax to a neutral opening.
     send_joints(observe(overlay=False)[0], gripper=40.0)
-    time.sleep(0.4)
+    time.sleep(0.18)
     return False, i_idle
 
 
-def ee_move_rel(d_base, step=1.4, settle=0.5):
+def ee_move_rel(d_base, step=2.2, settle=0.22):
     joints = observe()[0]
     T = np.asarray(kin.forward_kinematics(joints))
     p = T[:3, 3] + np.asarray(d_base)
@@ -1060,7 +1060,7 @@ def goto_2d(tag):
                             float(j[4]), ret_err=True)
     if err > 0.008:
         raise Abort(f"hover pose unreachable (IK {err*1e3:.0f}mm)")
-    goto_smooth(q, settle=0.6)
+    goto_smooth(q, settle=0.25)
     with lock:
         state["obj3d"] = [float(xy[0]), float(xy[1]), 0.02]
         state["obj3d_label"] = label.split()[0]
@@ -1190,7 +1190,7 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
             q[0] = float(np.clip(q[0] + dpan, -100, 100))
             q[1] = float(np.clip(q[1] + dlift, -95, 95))
             try:
-                goto_smooth(q, settle=0.35)
+                goto_smooth(q, settle=0.18)
             except Exception:
                 continue
             j, rgb, _ = observe()
@@ -1199,7 +1199,7 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
                 continue
             T_ee = np.asarray(kin.forward_kinematics(np.asarray(j, np.float64)))
             samples.append((T_ee, np.array(tr.uv, np.float64)))
-    goto_smooth(q0, settle=0.5)
+    goto_smooth(q0, settle=0.25)
     say(f"multi-view: {len(samples)} usable views of the {label} cube")
     if len(samples) < 5:
         raise Abort(f"only {len(samples)} views - need at least 5. "
@@ -1547,7 +1547,7 @@ def approach_over_the_top(finder, tracker, label):
     """
     set_phase(f"APPROACH {label}", "locking the cube, then over the top of it")
     send_joints(observe()[0], gripper=95.0)
-    time.sleep(0.35)
+    time.sleep(0.15)
 
     p_obj = np.asarray(locate_on_table(finder, tracker, label), np.float64)
     q0 = observe()[0].astype(np.float64)
@@ -1625,7 +1625,7 @@ def approach_over_the_top(finder, tracker, label):
         if e > 0.006:
             raise Abort(f"{label}: waypoint unreachable (IK residual {e * 1e3:.0f}mm). "
                         f"Refusing to drive to a half-solved pose.")
-        goto_smooth(q_tgt, settle=0.12, step=1.5)
+        goto_smooth(q_tgt, settle=0.08, step=2.5)
     else:
         say(f"{label}: ran out of hops — descending from here")
 
@@ -1644,7 +1644,7 @@ def descend_and_close(p_obj, pitch, label):
     """
     set_phase(f"GRASP {label}", "descending onto the cube")
     send_joints(observe()[0].astype(np.float64), gripper=95.0)   # fingers OPEN first
-    time.sleep(0.35)
+    time.sleep(0.15)
 
     p_grip = p_obj.copy()
     p_grip[2] = max(float(p_obj[2]), OBJ_FLOOR_Z)
@@ -1667,7 +1667,7 @@ def descend_and_close(p_obj, pitch, label):
             say(f"{label}: descend blocked — IK residual {e * 1e3:.0f}mm. Refusing to "
                 f"drive to a half-solved pose (that is what made the arm wander).")
             return False
-        goto_smooth(q_tgt, settle=0.10, step=1.0)
+        goto_smooth(q_tgt, settle=0.06, step=1.8)
     say(f"{label}: descend ran out of steps")
     return False
 
@@ -1681,7 +1681,7 @@ def detect_now(finder, tries=12):
         tr = finder(rgb, T_cam_of(joints))
         if tr is not None:
             return tr
-        time.sleep(0.05)
+        time.sleep(0.03)
     return None
 
 
@@ -1844,7 +1844,7 @@ def _tip(q):
     return np.asarray(kin.forward_kinematics(np.asarray(q, np.float64)))[:3, 3]
 
 
-def _move_tip(p_tgt, pitch, j5, settle=0.25, step=1.5):
+def _move_tip(p_tgt, pitch, j5, settle=0.12, step=2.5):
     """Move the FINGERTIP to a base-frame POSITION. Returns the pitch used, or None.
 
     Demanding ONE exact wrist pitch is why the arm sat still: measured live, it was
@@ -1899,17 +1899,17 @@ def _center_on_cube(finder, gp, j5):
     p0 = _tip(q0)
 
     # Small, slow probe moves so the measurement is clean and the arm does not jerk.
-    PAN_PROBE = 2.0      # deg
-    RAD_PROBE = 0.010    # m
+    PAN_PROBE = 3.0      # deg
+    RAD_PROBE = 0.015    # m
     # Speed is scaled by estimated cube range so the arm slows down as it gets close.
     # The BASE is the main source of jerk, so its max step scales the most.
     r_m = _cube_range_m(tr)
     close = r_m < 0.12          # within ~12 cm -> slow/close mode
-    speed = 0.55 if close else 1.0
-    CENTER_STEP = 1.0 * speed   # deg per goto_smooth tick
-    CENTER_SETTLE = 0.25 if close else 0.18  # s
-    MAX_PAN_STEP = (2.5 if close else 5.0)  # deg per iteration
-    MAX_RAD_STEP = (0.012 if close else 0.025)  # m per iteration
+    speed = 0.9 if close else 1.6
+    CENTER_STEP = 1.8 * speed   # deg per goto_smooth tick
+    CENTER_SETTLE = 0.12 if close else 0.08  # s
+    MAX_PAN_STEP = (4.5 if close else 8.0)  # deg per iteration
+    MAX_RAD_STEP = (0.020 if close else 0.040)  # m per iteration
 
     # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
     qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
@@ -1987,8 +1987,8 @@ def _step_tip(p_from, delta, pitch, j5):
     # final centimetres glide in instead of snapping and ringing.
     n = float(np.linalg.norm(delta))
     fine = n < 0.012
-    settle = 0.45 if fine else 0.25
-    rate = 0.8 if fine else 1.5
+    settle = 0.22 if fine else 0.12
+    rate = 1.5 if fine else 2.5
     for scale in (1.0, 0.7, 0.45, 0.3, 0.18, 0.1):
         used = _move_tip(p_from + delta * scale, pitch, j5, settle=settle, step=rate)
         if used is not None:
@@ -2140,7 +2140,7 @@ def run_mission():
 
             # Refine the cube position from the new vantage. The approach target
             # will recompute with the right/short offset next loop.
-            time.sleep(0.10)
+            time.sleep(0.05)
             sense_2d()
             xy2 = None
             trf = _cube_track(finder, tries=3)
@@ -2179,17 +2179,17 @@ def run_mission():
             z = float(z0 + (PICK_GRASP_Z - z0) * f)
             last = (f == 1.0)
             set_phase("PICK", f"descending to z={z*100:.1f}cm")
-            step = 0.5 if last else 0.8
-            settle = 0.35 if last else 0.25
+            step = 0.9 if last else 1.4
+            settle = 0.18 if last else 0.12
             if _move_tip(np.array([gx, gy, z]), gp, j5,
                          settle=settle, step=step) is None:
                 say("could not reach that height - closing from here")
                 break
 
         set_phase("PICK", "closing the gripper")
-        held, _i = close_with_current(step=3.0, delay=0.16)
+        held, _i = close_with_current(step=4.0, delay=0.08)
         set_phase("PICK", "lifting")
-        ee_move_rel([0, 0, PICK_LIFT_M], settle=0.6)
+        ee_move_rel([0, 0, PICK_LIFT_M], settle=0.25)
         set_phase("DONE" if held else "PICK",
                   f"{label} cube {'picked' if held else 'missed - closed on air'}")
 
@@ -3529,9 +3529,9 @@ def caltip():
             stop_flag.clear()
             set_phase("CAL TIP", "descending to grasp deck")
             # a nominal grasp pose over the table centre (measured deck poses)
-            goto_smooth(np.array([-7.5, 49.0, 29.0, -58.0, -40.0]), settle=1.2)
+            goto_smooth(np.array([-7.5, 49.0, 29.0, -58.0, -40.0]), settle=0.5)
             send_joints(observe()[0], gripper=15.0)   # close black fingers
-            time.sleep(0.8)
+            time.sleep(0.3)
             joints, rgb, _ = observe(overlay=False)
             img = np.ascontiguousarray(rgb)
             hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
@@ -3589,14 +3589,14 @@ def probe3d():
             stop_flag.clear()
             p = np.array(pg, float)
             send_joints(observe()[0], gripper=95.0)
-            time.sleep(0.4)
+            time.sleep(0.15)
             for hz in (0.09, 0.06, 0.04, 0.02, 0.005):
                 set_phase("PROBE3D", f"gripper_frame -> green xy, z={hz:.3f}")
                 q, err = ik_to_point(np.array([p[0], p[1], hz]), observe()[0])
                 if err > 0.02:
                     say(f"probe z={hz:.3f}: unreachable (err {err*1e3:.0f}mm)")
                     continue
-                goto_smooth(q, settle=0.9)
+                goto_smooth(q, settle=0.35)
                 joints, rgb, _ = observe(overlay=False)
                 img = np.ascontiguousarray(rgb)
                 # mark the calibrated fingertip pixel for reference
@@ -3606,8 +3606,8 @@ def probe3d():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imwrite(OUT + rf"\probe_{int(hz*1000):03d}.jpg", img[:, :, ::-1])
                 publish(img[:, :, ::-1])
-                time.sleep(0.3)
-            goto_smooth(VIEW, settle=0.8)
+                time.sleep(0.12)
+            goto_smooth(VIEW, settle=0.35)
             set_phase("PROBE3D", "done — images saved")
         except Exception as e:
             set_phase("ERROR", f"probe3d: {e}")
@@ -3630,7 +3630,7 @@ def reset_pose():
         try:
             stop_flag.clear()
             set_phase("RESET", "moving to working pose")
-            goto_smooth(VIEW, settle=1.0)
+            goto_smooth(VIEW, settle=0.4)
             send_joints(observe()[0], gripper=95.0)
             set_phase("IDLE", "at working pose — ready to jog")
         except Exception as e:
@@ -3650,7 +3650,7 @@ def home():
         try:
             stop_flag.clear()
             set_phase("FOLD HOME")
-            goto_smooth(HOME, settle=1.0)
+            goto_smooth(HOME, settle=0.5)
             set_phase("IDLE", "folded")
         except Exception as e:
             set_phase("ERROR", str(e))
