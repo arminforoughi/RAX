@@ -2043,6 +2043,8 @@ def _mapped_xy(label):
 TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH hover target this far to the
                             # cube's RIGHT, so the cube stays on the LEFT side of the
                             # camera view during approach.
+TARGET_BACK_M = 0.010       # stop the approach hover target this far SHORT of the
+                            # cube radially. Tunable in the UI; 1 cm default.
 APPROACH_STEPS = 3          # default approach waypoints. Step 1 closes ~90% of the
                             # gap so the arm gets close fast; remaining steps close
                             # the rest without passing the target.
@@ -2068,16 +2070,16 @@ def run_mission():
         perp = np.array([u[1], -u[0]])
         return np.array(p, dtype=np.float64) + perp * d
 
-    def _approach_target(cube_xy, back_m=0.005):
+    def _approach_target(cube_xy):
         """Hover position for the approach: short of the cube and to its right.
 
-        back_m: stop this many metres radially BEFORE the cube (keeps it in view).
-        The lateral offset is TARGET_RIGHT_TRIM_M (tunable in the UI).
+        TARGET_BACK_M: stop this many metres radially BEFORE the cube (keeps it in view).
+        TARGET_RIGHT_TRIM_M: shift this far to the cube's right (tunable in the UI).
         """
         cube_xy = np.asarray(cube_xy, dtype=np.float64)
         r = float(np.hypot(*cube_xy))
         if r > 1e-6:
-            backed = cube_xy * ((r - back_m) / r)
+            backed = cube_xy * ((r - TARGET_BACK_M) / r)
         else:
             backed = cube_xy.copy()
         return _shift_right(backed, TARGET_RIGHT_TRIM_M)
@@ -2346,6 +2348,11 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
       <label>right trim cm</label>
       <input id="tune-trim" type="number" step="0.5" value="3.0" title="Approach target shifted this many cm to the cube's RIGHT.">
       <button onclick="setTune('trim','/settrim?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>back cm</label>
+      <input id="tune-back" type="number" step="0.2" value="1.0" title="Approach target stops this many cm SHORT of the cube radially.">
+      <button onclick="setTune('back','/setback?cm=')">Set</button>
     </div>
     <div class="qrow">
       <label>steps</label>
@@ -2650,6 +2657,8 @@ async function tick(){
       if(ta && document.activeElement !== ta) ta.value = s.tune.aim_du;
       const tt = document.getElementById('tune-trim');
       if(tt && document.activeElement !== tt) tt.value = s.tune.right_trim_cm;
+      const tbk = document.getElementById('tune-back');
+      if(tbk && document.activeElement !== tbk) tbk.value = s.tune.back_cm;
       const ts = document.getElementById('tune-steps');
       if(ts && document.activeElement !== ts) ts.value = s.tune.approach_steps;
       const tc = document.getElementById('tune-cube');
@@ -2726,6 +2735,7 @@ def status():
     s["tune"] = {
         "aim_du": round(AIM_DU, 1),
         "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
+        "back_cm": round(TARGET_BACK_M * 100, 2),
         "approach_steps": APPROACH_STEPS,
         "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
         "range_scale": round(float(RANGE_SCALE[0]), 2),
@@ -3307,6 +3317,19 @@ def settrim():
     TARGET_RIGHT_TRIM_M = float(np.clip(cm, -10.0, 15.0)) / 100.0
     say(f"approach right trim set to {TARGET_RIGHT_TRIM_M*100:.1f}cm")
     return jsonify(ok=True, cm=TARGET_RIGHT_TRIM_M*100)
+
+
+@app.route("/setback", methods=["POST"])
+def setback():
+    """Live-tune the approach radial back-off (cm). Positive stops SHORT of the cube."""
+    try:
+        cm = float(request.args.get("cm", request.form.get("cm", 1.0)))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a number")
+    global TARGET_BACK_M
+    TARGET_BACK_M = float(np.clip(cm, 0.0, 10.0)) / 100.0
+    say(f"approach back-off set to {TARGET_BACK_M*100:.1f}cm")
+    return jsonify(ok=True, cm=TARGET_BACK_M*100)
 
 
 @app.route("/setsteps", methods=["POST"])
