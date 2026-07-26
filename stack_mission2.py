@@ -2063,12 +2063,12 @@ def run_mission():
         if r < 1e-6 or d == 0.0:
             return np.array(p, dtype=np.float64)
         u = np.array(p, dtype=np.float64) / r
-        # Flip sign from previous attempt: this direction puts the gripper on the
-        # cube's RIGHT in the actual camera/base frame.
-        perp = np.array([-u[1], u[0]])
+        # Perpendicular direction that puts the gripper on the cube's RIGHT.
+        # If this still lands left, the base frame y-axis is inverted.
+        perp = np.array([u[1], -u[0]])
         return np.array(p, dtype=np.float64) + perp * d
 
-    def _approach_target(cube_xy, back_m=0.015):
+    def _approach_target(cube_xy, back_m=0.005):
         """Hover position for the approach: short of the cube and to its right.
 
         back_m: stop this many metres radially BEFORE the cube (keeps it in view).
@@ -2106,6 +2106,9 @@ def run_mission():
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
             tip = _tip(q)
             target_xy = _approach_target(cube_xy)
+            say(f"approach {i+1}: cube=({cube_xy[0]*100:.1f},{cube_xy[1]*100:.1f})cm "
+                f"target=({target_xy[0]*100:.1f},{target_xy[1]*100:.1f})cm "
+                f"offset=({(target_xy-cube_xy)[0]*100:.1f},{(target_xy-cube_xy)[1]*100:.1f})cm")
             delta_xy = target_xy - tip[:2]
             dist_xy = float(np.linalg.norm(delta_xy))
 
