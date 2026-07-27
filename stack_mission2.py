@@ -276,8 +276,15 @@ green_tracker = AnchorTracker("green")
 
 # ---------------- parallel YOLO validation ----------------
 detector = None
-yolo_red = {"t": 0.0, "box": None}
+# Latest YOLO detections keyed by class label. Each entry: {"xyxy": tuple, "conf": float, "t": float}.
+yolo_latest = {"t": 0.0, "dets": {}}
 pending_query = [None]      # set by /setquery, applied inside the YOLO thread
+
+
+def _query_labels():
+    """Parse the active detection query into class labels, preserving order."""
+    q = (state.get("query") or "red cube, green cube").lower()
+    return [p.strip() for p in q.split(",") if p.strip()]
 
 
 def yolo_worker():
@@ -303,8 +310,16 @@ def yolo_worker():
         except Exception:
             continue
         with lock:
-            yolo_red["t"] = time.time()
-            yolo_red["box"] = dets[0].xyxy if dets else None
+            labels = _query_labels()
+            by_label = {}
+            for d in dets:
+                if 0 <= d.class_id < len(labels):
+                    lbl = labels[d.class_id]
+                    # keep highest-confidence box per label
+                    if lbl not in by_label or d.confidence > by_label[lbl]["conf"]:
+                        by_label[lbl] = {"xyxy": tuple(d.xyxy), "conf": float(d.confidence)}
+            yolo_latest["t"] = time.time()
+            yolo_latest["dets"] = by_label
 
 
 def find_red(rgb, T_base_cam=None):
@@ -331,6 +346,30 @@ def find_red(rgb, T_base_cam=None):
 
 def find_green(rgb, T_base_cam=None):
     return green_tracker.track(rgb, T_base_cam)
+
+
+def find_label(rgb, label, T_base_cam=None):
+    """Generic YOLO-driven finder for any query label.
+
+    Falls back to the legacy colour trackers for 'red cube' / 'green cube' because
+    those trackers are tighter during close approach than a 2.5 Hz YOLO refresh.
+    """
+    label = str(label).strip().lower()
+    # legacy colour trackers for the original cube colours
+    if label == "red cube":
+        return find_red(rgb, T_base_cam)
+    if label == "green cube":
+        return find_green(rgb, T_base_cam)
+
+    with lock:
+        det = yolo_latest["dets"].get(label)
+        t = yolo_latest["t"]
+    if det is None or time.time() - t > 4.0:
+        return None
+    x1, y1, x2, y2 = det["xyxy"]
+    clipped = x1 <= 1 or y1 <= 1 or x2 >= rgb.shape[1] - 2 or y2 >= rgb.shape[0] - 2
+    return Track(((x1 + x2) / 2.0, (y1 + y2) / 2.0), tuple(det["xyxy"]),
+                 int((x2 - x1) * (y2 - y1)), clipped, t)
 
 
 # ---------------- robot I/O ----------------
@@ -900,30 +939,32 @@ def _rotate_xy(xy, deg):
     return np.array([xy[0] * c - xy[1] * s, xy[0] * s + xy[1] * c], dtype=np.float64)
 
 
-def obj_xy_2d(bbox, T_cam, z_m=None):
-    """Where the cube is, base-frame (x, y).
+def obj_xy_2d(bbox, T_cam, z_m=None, label=None):
+    """Where the object is, base-frame (x, y).
 
     RANGE COMES FROM STEREO DEPTH when it is available and sane; otherwise it
     falls back to apparent size:
 
-        range = focal * real_cube_edge / bbox_width_px
+        range = focal * real_object_width / bbox_width_px
 
-    The apparent-size method needs only the lens and the cube's real size, but
-    it is sensitive to CUBE_EDGE_M being wrong. Stereo depth is independent of
-    the object's size, so it anchors the range and kills the random jumps.
+    The real width is looked up from CLASS_META by label. Stereo depth is
+    independent of the object's size, so it anchors the range and kills the
+    random jumps.
     """
     x1, y1, x2, y2 = bbox
     w, h = x2 - x1, y2 - y1
     if w < 4 or h < 4:
-        return None, float("nan"), CUBE_EDGE_M
+        return None, float("nan"), class_size_m(label)
+
+    real_w = class_size_m(label)
 
     # Prefer stereo depth if the caller passed a valid metric range.
     if z_m is not None and 0.03 < z_m < 1.20:
         rng = float(z_m)
     else:
-        rng = float(fx * CUBE_EDGE_M / float(w))
+        rng = float(fx * real_w / float(w))
         if not (0.05 < rng < 1.20):
-            return None, float("nan"), CUBE_EDGE_M
+            return None, float("nan"), real_w
 
     rng *= float(RANGE_SCALE[0])
     rng = float(np.clip(rng, 0.03, 1.50))
@@ -935,10 +976,10 @@ def obj_xy_2d(bbox, T_cam, z_m=None):
     p = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
     xy = p[:2]
     if not (0.05 < float(np.hypot(*xy)) < 0.95):
-        return None, float("nan"), CUBE_EDGE_M
+        return None, float("nan"), real_w
     # Correct heading/yaw error in the hand-eye by rotating the bearing.
     xy = _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0])
-    return xy, float(rng), CUBE_EDGE_M
+    return xy, float(rng), real_w
 
 
 def _consolidate_2d():
@@ -963,6 +1004,8 @@ def _consolidate_2d():
                     wsum = ko["n"] + do["n"]
                     ko["xy"] = (ko["n"] * ko["xy"] + do["n"] * do["xy"]) / wsum
                     ko["size"] = max(ko.get("size", 0.03), do.get("size", 0.03))
+                    ko["shape"] = ko.get("shape", do.get("shape", "cube"))
+                    ko["yaw"] = ko.get("yaw", do.get("yaw", 0.0))
                     ko["n"] = wsum
                     ko["t"] = max(ko["t"], do["t"])
                     del objs[drop]
@@ -972,7 +1015,7 @@ def _consolidate_2d():
                 break
 
 
-def world2d_update(label, xy, stereo, size=0.03):
+def world2d_update(label, xy, stereo, size=0.03, shape="cube", yaw=0.0):
     with w2d_lock:
         best, bd = None, W2D_MERGE
         for t, o in W2D["objs"].items():
@@ -981,13 +1024,16 @@ def world2d_update(label, xy, stereo, size=0.03):
         if best is None:
             t = W2D["next"]; W2D["next"] += 1
             W2D["objs"][t] = {"label": label, "xy": np.asarray(xy, float),
-                              "size": float(size), "n": 1, "stereo": stereo, "t": time.time()}
+                              "size": float(size), "shape": str(shape), "yaw": float(yaw),
+                              "n": 1, "stereo": stereo, "t": time.time()}
         else:
             o = W2D["objs"][best]
             # Give fresh observations more weight so the map converges faster and
             # does not stay stuck on an early bad localization.
             o["xy"] = 0.55 * o["xy"] + 0.45 * np.asarray(xy, float)
             o["size"] = 0.8 * o.get("size", size) + 0.2 * float(size)
+            o["shape"] = str(shape)
+            o["yaw"] = float(yaw)
             o["n"] += 1
             o["stereo"] = stereo
             o["t"] = time.time()
@@ -998,28 +1044,46 @@ def sense_2d(joints=None, rgb=None):
     if joints is None:
         joints, rgb, _ = observe()
     T = T_cam_of(joints)
-    for finder, label in ((find_red, "red cube"), (find_green, "green cube")):
-        tr = finder(rgb, T)
+    for label in _query_labels():
+        tr = find_label(rgb, label, T)
         if tr is not None and not tr.clipped:
             # Average a few stereo depth reads for a cleaner range estimate.
             zs = [z for z in (read_depth_m(tr.uv) for _ in range(3)) if z is not None]
             z = float(np.median(zs)) if zs else None
-            xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=z)
+            xy, st, sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=z, label=label)
             if xy is not None:
-                world2d_update(label, xy, st, sz)
+                world2d_update(label, xy, st, sz,
+                               shape=class_shape(label), size=sz, yaw=0.0)
 
 
 def world2d_snapshot():
     now = time.time()
     with w2d_lock:
-        return [{"tag": t, "label": o["label"],
-                 "x": round(float(o["xy"][0]), 3), "y": round(float(o["xy"][1]), 3),
-                 "size": round(float(o.get("size", 0.03)), 3),
-                 "r_cm": round(float(np.hypot(*o["xy"])) * 100, 1),
-                 "ang": round(math.degrees(math.atan2(o["xy"][1], o["xy"][0]))),
-                 "stereo_cm": (round(o["stereo"] * 100) if o["stereo"] == o["stereo"] else None),
-                 "n": o["n"], "age": round(now - o["t"], 1)}
-                for t, o in W2D["objs"].items()]
+        out = []
+        for t, o in W2D["objs"].items():
+            meta = class_meta(o["label"])
+            shape = o.get("shape", meta.get("shape", "cube"))
+            yaw = float(o.get("yaw", 0.0))
+            size = float(o.get("size", meta.get("size_m", CUBE_EDGE_M)))
+            w_m = size
+            d_m = size
+            if shape == "cuboid":
+                w_m = max(meta.get("w_m", size), 0.001)
+                d_m = max(meta.get("d_m", size), 0.001)
+            elif shape == "cylinder":
+                w_m = d_m = max(meta.get("diameter_m", size), 0.001)
+            out.append({"tag": t, "label": o["label"],
+                        "x": round(float(o["xy"][0]), 3), "y": round(float(o["xy"][1]), 3),
+                        "size": round(size, 3),
+                        "shape": shape,
+                        "yaw": round(yaw, 1),
+                        "w_m": round(w_m, 3),
+                        "d_m": round(d_m, 3),
+                        "r_cm": round(float(np.hypot(*o["xy"])) * 100, 1),
+                        "ang": round(math.degrees(math.atan2(o["xy"][1], o["xy"][0]))),
+                        "stereo_cm": (round(o["stereo"] * 100) if o["stereo"] == o["stereo"] else None),
+                        "n": o["n"], "age": round(now - o["t"], 1)})
+        return out
 
 
 def scan_2d():
@@ -1740,19 +1804,19 @@ def _target_finder():
     return find_red, red_tracker, "red"
 
 
-def locate_target_xy(finder, tries=8):
-    """Where the cube sits on the table, base-frame (x, y): cast its ground-contact
-    pixels onto the table plane and take the median over a few reads. This is the
-    SAME localisation the 2D map uses. None if the cube isn't clearly in view."""
+def locate_target_xy(label, tries=8):
+    """Where the object sits on the table, base-frame (x, y): cast its bbox onto
+    the table plane and take the median over a few reads. This is the SAME
+    localisation the 2D map uses. None if the object isn't clearly in view."""
     pts = []
     for _ in range(tries):
         checkpoint()
         j, rgb, _ = observe()
-        tr = finder(rgb, T_cam_of(j))
+        tr = find_label(rgb, label, T_cam_of(j))
         if tr is None or tr.clipped:
             time.sleep(0.05)
             continue
-        xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T_cam_of(j))
+        xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T_cam_of(j), label=label)
         if xy is not None:
             pts.append(xy)
         time.sleep(0.03)
@@ -1773,11 +1837,58 @@ SERVO_MAX_STEP = 0.030     # m of horizontal correction per iteration
 SERVO_PROBE = 0.020        # m probe step used to MEASURE the pixel response
 SERVO_DESC = 0.015         # m descend per iteration once roughly centred
 SERVO_DESC_GATE_PX = 120.0 # only descend while the cube is at least this centred
-CUBE_EDGE_M = 0.0508       # the cube's real edge: 2 inches. Back-solved from a
-                           # known 26cm sighting (edge = range*bbox_px/fx). At 1in
-                           # it read 12cm for a cube really 26cm out, and the
-                           # under-read range also squashed the cubes together — turns apparent size into
-                           # a range. If your cube isn't 4cm, change THIS number.
+# Per-object-class metadata: shape + real-world dimensions. YOLO-World is open
+# vocabulary, so the label string IS the class key. Unknown objects fall back to
+# a 5.08 cm cube guess. Add entries here for anything you want ranged accurately.
+CLASS_META = {
+    "red cube":   {"shape": "cube",   "size_m": 0.0508},
+    "green cube": {"shape": "cube",   "size_m": 0.0508},
+    "blue cube":  {"shape": "cube",   "size_m": 0.0508},
+    "pen":        {"shape": "cuboid", "w_m": 0.010, "h_m": 0.010, "d_m": 0.14},
+    "cup":        {"shape": "cylinder", "diameter_m": 0.075, "height_m": 0.10},
+    "pen cup":    {"shape": "cylinder", "diameter_m": 0.075, "height_m": 0.10},
+}
+CUBE_EDGE_M = 0.0508       # legacy default; used only when CLASS_META has no entry
+
+
+def class_meta(label):
+    """Return the metadata dict for a label, normalised to lower-case."""
+    return CLASS_META.get(str(label).strip().lower(), {"shape": "cube", "size_m": CUBE_EDGE_M})
+
+
+def class_size_m(label):
+    """Characteristic width for apparent-size ranging (the width the bbox maps to)."""
+    m = class_meta(label)
+    shape = m.get("shape", "cube")
+    if shape == "cube":
+        return m.get("size_m", CUBE_EDGE_M)
+    if shape == "cylinder":
+        return m.get("diameter_m", CUBE_EDGE_M)
+    if shape == "cuboid":
+        # Use the largest horizontal footprint dimension as a conservative width.
+        return max(m.get("w_m", CUBE_EDGE_M), m.get("d_m", CUBE_EDGE_M))
+    if shape == "sphere":
+        return m.get("diameter_m", CUBE_EDGE_M)
+    return m.get("size_m", CUBE_EDGE_M)
+
+
+def class_height_m(label):
+    """Vertical extent above the table — used for hover/grasp height."""
+    m = class_meta(label)
+    shape = m.get("shape", "cube")
+    if shape == "cube":
+        return m.get("size_m", CUBE_EDGE_M)
+    if shape == "cylinder":
+        return m.get("height_m", CUBE_EDGE_M)
+    if shape == "cuboid":
+        return m.get("h_m", CUBE_EDGE_M)
+    if shape == "sphere":
+        return m.get("diameter_m", CUBE_EDGE_M)
+    return m.get("size_m", CUBE_EDGE_M)
+
+
+def class_shape(label):
+    return class_meta(label).get("shape", "cube")
 # Lateral aim trim, in pixels, applied to the fingertip aim point. The gripper was
 # consistently ending up LEFT of the cube. Moving the aim point LEFT (negative)
 # makes the arm travel FURTHER RIGHT before it thinks it is lined up, because
@@ -2693,26 +2804,41 @@ tick();
     ctx.strokeStyle='#3a5a3a';ctx.beginPath();ctx.arc(ox,oy,0.62*s,Math.PI,2*Math.PI);ctx.stroke();
     ctx.fillStyle='#c9524a';ctx.beginPath();ctx.arc(ox,oy,5,0,7);ctx.fill();
     ctx.fillStyle='#8aa';ctx.fillText('base',ox+7,oy+4);
-    for(const o of objs){const sz=o.size||0.03,hh=sz/2,c=col(o.label);
-      // the object's GROUND FOOTPRINT: an axis-aligned square of side `size`
-      const P=[W2S(o.x-hh,o.y-hh),W2S(o.x-hh,o.y+hh),W2S(o.x+hh,o.y+hh),W2S(o.x+hh,o.y-hh)];
+    for(const o of objs){
+      const c=col(o.label);
+      const yaw=Math.PI/180*(o.yaw||0);
+      const cw=(o.w_m||o.size||0.03)/2;
+      const cd=(o.d_m||o.size||0.03)/2;
+      // footprint corners in base frame, rotated by yaw, then to screen
+      const corners=[[-cd,-cw],[-cd,cw],[cd,cw],[cd,-cw]];
+      const cos=Math.cos(yaw), sin=Math.sin(yaw);
+      const P=corners.map(([dx,dy])=>{
+        const rx=dx*cos-dy*sin, ry=dx*sin+dy*cos;
+        return W2S(o.x+rx,o.y+ry);
+      });
       ctx.beginPath();ctx.moveTo(P[0][0],P[0][1]);for(let k=1;k<4;k++)ctx.lineTo(P[k][0],P[k][1]);ctx.closePath();
       ctx.globalAlpha=0.30;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
       ctx.strokeStyle=c;ctx.lineWidth=2;ctx.stroke();
+      // orientation tick
       const [sx,sy]=W2S(o.x,o.y);
+      const [ex,ey]=W2S(o.x+0.03*Math.cos(yaw), o.y+0.03*Math.sin(yaw));
+      ctx.strokeStyle=c;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(ex,ey);ctx.stroke();
       ctx.fillStyle=c;ctx.beginPath();ctx.arc(sx,sy,2,0,7);ctx.fill();
       ctx.fillStyle='#e6ecf1';ctx.font='11px ui-monospace,Consolas';
-      ctx.fillText(o.label.split(' ')[0]+'#'+o.tag+' '+(sz*100).toFixed(0)+'cm',sx+9,sy-6);}
+      ctx.fillText(o.label.split(' ')[0]+'#'+o.tag+' '+(o.shape||'cube')+' '+(o.size*100).toFixed(0)+'cm',sx+9,sy-6);}
   }
   cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
     let best=null,bd=22;for(const o of objs){const[sx,sy]=W2S(o.x,o.y);const d=Math.hypot(sx-mx,sy-my);
       if(d<bd){bd=d;best=o;}} if(best)fetch('/goto2d?tag='+best.tag,{method:'POST'});});
   async function poll(){try{const d=await(await fetch('/map2d')).json();objs=d.objs||[];draw();
     const tb=document.querySelector('#map2dtab tbody');
-    tb.innerHTML=objs.map(o=>`<tr class="obj" style="cursor:pointer" onclick="fetch('/goto2d?tag=${o.tag}',{method:'POST'})">`+
-      `<td>${o.label.split(' ')[0]}#${o.tag}</td><td>x=${(o.x*100).toFixed(0)}</td><td>y=${(o.y*100).toFixed(0)}</td>`+
-      `<td>r=${o.r_cm}cm</td><td>stereo=${o.stereo_cm!=null?o.stereo_cm+'cm':'—'}</td><td>n=${o.n}</td></tr>`).join('')
-      ||'<tr><td colspan=6 style="color:#8aa">empty — Scan → 2D map</td></tr>';
+    const head='<tr style="color:#93a1ae;font-size:11px"><td>label#tag</td><td>x</td><td>y</td><td>shape</td><td>r</td><td>stereo</td><td>n</td></tr>';
+    const rows=objs.map(o=>`<tr class="obj" style="cursor:pointer" onclick="fetch('/goto2d?tag=${o.tag}',{method:'POST'})">`+
+      `<td>${o.label}#${o.tag}</td><td>${(o.x*100).toFixed(0)}</td><td>${(o.y*100).toFixed(0)}</td>`+
+      `<td>${o.shape||'cube'} ${(o.size*100).toFixed(0)}cm</td>`+
+      `<td>${o.r_cm}cm</td><td>${o.stereo_cm!=null?o.stereo_cm+'cm':'—'}</td><td>${o.n}</td></tr>`).join('')
+      ||'<tr><td colspan=7 style="color:#8aa">empty — Scan → 2D map</td></tr>';
+    tb.innerHTML=head+rows;
   }catch(e){} setTimeout(poll,500);}
   poll();
 })();

@@ -129,8 +129,8 @@ class SelfLearningAgent:
                 self._post(path)
                 time.sleep(0.05)
 
-    def execute_pick(self, color: str):
-        query = f"{color} cube"
+    def execute_pick(self, target: str):
+        query = str(target).strip()
         self._post(f"/setquery?q={query}")
         time.sleep(0.1)
         return self._post("/start")
@@ -183,21 +183,32 @@ class SelfLearningAgent:
     @staticmethod
     def parse_task(text: str) -> dict:
         text_lower = text.lower()
+        action = "pick"
+        if "place" in text_lower or "drop" in text_lower:
+            action = "place"
+
+        # Try to extract an explicit object phrase: "the <object>" / "pick up the <object>"
+        target = None
+        m = re.search(r"(?:pick\s+(?:up\s+)?|grab\s+|get\s+|place\s+(?:it\s+)?(?:on\s+)?)(?:the\s+)?(.+?)(?:\s+on\s+|\s+from\s+|$)", text_lower)
+        if m:
+            target = m.group(1).strip()
+
+        # Legacy colour support: "red cube" etc.
         color = None
         for c in ("red", "green", "blue", "yellow", "orange", "purple", "white", "black"):
             if c in text_lower:
                 color = c
                 break
-        action = "pick"
-        if "place" in text_lower or "drop" in text_lower:
-            action = "place"
-        dest_color = None
+        if target is None and color is not None:
+            target = f"{color} cube"
+        target = target or "red cube"
+
+        dest = None
         if action == "place":
-            # crude: color after "on" is destination
-            m = re.search(r"on\s+(?:the\s+)?(\w+)\s+cube", text_lower)
+            m = re.search(r"on\s+(?:the\s+)?(.+?)$", text_lower)
             if m:
-                dest_color = m.group(1)
-        return {"action": action, "color": color or "red", "destination_color": dest_color}
+                dest = m.group(1).strip()
+        return {"action": action, "target": target, "destination": dest, "color": color}
 
     # ------------------------------------------------------------------
     # Main loop
@@ -211,9 +222,9 @@ class SelfLearningAgent:
             # Find destination tag from 2D map
             perceive = self.perceive()
             tag = None
-            dest_color = parsed.get("destination_color")
+            dest = parsed.get("destination")
             for o in perceive.get("map", {}).get("objs", []):
-                if dest_color and dest_color in o.get("label", "").lower():
+                if dest and dest in o.get("label", "").lower():
                     tag = o.get("tag")
                     break
             self._say("Executor", f"Placing on tag={tag}")
@@ -233,8 +244,8 @@ class SelfLearningAgent:
             self._say("Learner", f"Predicted params: {json.dumps(params)}")
 
             self.set_params(params)
-            self._say("Executor", f"Executing pick of {parsed['color']} cube")
-            self.execute_pick(parsed["color"])
+            self._say("Executor", f"Executing pick of {parsed['target']}")
+            self.execute_pick(parsed["target"])
 
             outcome = self.observe_outcome()
             self._say(
