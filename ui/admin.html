@@ -1,0 +1,527 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAX stack mission</title><style>
+body{margin:0;background:#141a21;color:#e6ecf1;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:1280px;margin:0 auto;padding:18px;display:grid;grid-template-columns:2fr 1fr;gap:16px}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+h1{font-size:17px;margin:0 0 10px;grid-column:1/-1}
+h1 .tail{color:#93a1ae;font-weight:400;font-size:13px;margin-left:10px}
+.cams{display:flex;flex-direction:column;gap:10px}
+img{width:100%;border:1px solid #2b3540;border-radius:6px;background:#000;display:block}
+.lbl{font-size:11px;color:#93a1ae;letter-spacing:.1em;text-transform:uppercase;margin:0 0 4px;font-family:ui-monospace,Consolas,monospace}
+.panel{background:#1b232c;border:1px solid #2b3540;border-radius:6px;padding:12px}
+.phase{font:600 20px/1.2 ui-monospace,Consolas,monospace;color:#4cc275}
+.phase.bad{color:#d4795f}.detail{color:#93a1ae;font-size:13px;min-height:18px;margin:4px 0 10px}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+td{padding:3px 6px;border-bottom:1px solid #2b3540;color:#93a1ae}td+td{color:#e6ecf1;text-align:right}
+.btns{display:flex;gap:8px;margin-top:12px}
+button{flex:1;padding:9px 0;border:0;border-radius:5px;font:600 13px "Segoe UI";cursor:pointer}
+#b-start{background:#2e9e5b;color:#fff}#b-stop{background:#b0533c;color:#fff}#b-home{background:#2b3540;color:#e6ecf1}
+pre{background:#10161c;border:1px solid #2b3540;border-radius:6px;padding:10px;font-size:11.5px;
+line-height:1.5;height:240px;overflow-y:auto;white-space:pre-wrap;margin:12px 0 0}
+.jog{margin-top:14px}
+#jogmsg{color:#6fb2ff;font-family:ui-monospace,Consolas,monospace;font-size:11px;margin-left:8px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:6px}
+.pad .j{padding:14px 0;background:#26313c;color:#e6ecf1;border:1px solid #37454f;border-radius:6px;
+font:600 14px "Segoe UI";cursor:pointer;touch-action:manipulation;user-select:none}
+.pad .j:active{background:#3a6ea5}
+.pad .g{background:#2e5b46}
+.stp{grid-column:1/-1;display:flex;align-items:center;gap:8px;color:#93a1ae;font-size:12px;margin-top:4px}
+.stp input{flex:1}
+.qbox{margin-top:14px}
+.qrow{display:flex;gap:8px;margin-top:6px;align-items:center}
+.qrow input{flex:1;padding:10px;background:#10161c;border:1px solid #37454f;border-radius:6px;
+color:#e6ecf1;font:14px "Segoe UI"}
+.qrow input[type=number]{max-width:90px}
+.qrow label{color:#93a1ae;font-size:12px;white-space:nowrap;min-width:70px}
+.qrow button{padding:10px 18px;background:#2e6ea5;color:#fff;border:0;border-radius:6px;
+font:600 13px "Segoe UI";cursor:pointer}
+.sticks{display:flex;gap:18px;justify-content:center;align-items:center;margin:8px 0 8px;flex-wrap:wrap}
+.stick{position:relative;width:118px;height:118px;border-radius:50%;flex:0 0 auto;
+background:radial-gradient(circle at 50% 42%,#222c37,#141a21 72%);border:1px solid #37454f;
+touch-action:none;user-select:none;display:flex;align-items:center;justify-content:center}
+.stick::before{content:"";position:absolute;inset:0;border-radius:50%;opacity:.55;
+background:linear-gradient(#2b3540,#2b3540) center/1px 54% no-repeat,linear-gradient(#2b3540,#2b3540) center/54% 1px no-repeat}
+.stick.vert::before{background:linear-gradient(#2b3540,#2b3540) center/1px 54% no-repeat}
+.nub{width:46px;height:46px;border-radius:50%;pointer-events:none;
+background:radial-gradient(circle at 36% 30%,#4a93c9,#22506f);border:1px solid #2e6ea5;box-shadow:0 3px 12px rgba(0,0,0,.5)}
+.sl{position:absolute;bottom:-14px;left:50%;transform:translateX(-50%);white-space:nowrap;
+font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transform:uppercase}
+@media(max-width:760px){
+  main{padding:10px;gap:10px}
+  .panel{display:flex;flex-direction:column}
+  .jog{order:-1;margin-top:0}
+  .cams img{max-height:42vh;object-fit:contain}
+  .phone-hide{display:none}
+  .pad{grid-template-columns:repeat(2,1fr)}
+}
+</style></head><body><main>
+<h1>RAX · pick green → place on red<span class="tail">v2 · continuous servo · dual cam</span></h1>
+<div class="cams">
+  <div><p class="lbl">gripper camera (OAK-D)</p><img src="/stream" alt="gripper view"></div>
+  <div class="phone-hide"><p class="lbl">room camera (camsurv)</p><img src="/stream2" alt="room view"
+       onerror="this.parentElement.style.display='none'"></div>
+  <div class="phone-hide">
+    <p class="lbl">robot + object 3d · drag to rotate ·
+      <a id="r3d-link" href="#" target="_blank" style="color:#6fb2ff;text-transform:none">rerun ↗</a></p>
+    <canvas id="v3d"
+       style="width:100%;height:340px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+  </div>
+  <div class="phone-hide">
+    <p class="lbl">2D map (top-down · base frame) · click a dot / row to go on top</p>
+    <canvas id="v2d"
+       style="width:100%;height:300px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+    <table id="map2dtab" style="margin-top:6px"><tbody></tbody></table>
+    <div class="btns">
+      <button class="dim" id="b-scan2d" onclick="fetch('/scan2d',{method:'POST'})"
+        style="background:#2e6ea5;color:#fff">Scan → 2D map</button>
+      <button class="dim" onclick="fetch('/clearmap2d',{method:'POST'})">Clear 2D map</button>
+      <button class="dim" id="b-place" onclick="armPlace()"
+        title="Then click the map: an object to stack on, or bare table to drop at">Place held →</button>
+      <button class="dim" id="b-pickplace" onclick="armPickPlace()"
+        title="Pick the queried object, then place it where you click">Pick → Place →</button>
+    </div>
+    <div id="placehint" style="color:#e0b040;font-size:12px;margin-top:4px"></div>
+    <div class="qrow" style="margin-top:6px">
+      <input id="task" type="text" placeholder="task: green on red, blue on green"
+        title="One step per comma: '<object> on <destination>'. Both must be on the map.">
+      <button id="t-run" onclick="runTask()">Run task</button>
+    </div>
+  </div>
+  <div class="qbox" id="guestbox" style="margin-top:10px">
+    <p class="lbl">guest access · show this QR, anyone gets <span id="g-min">5</span> min</p>
+    <div style="display:flex;gap:12px;align-items:center">
+      <div id="g-qr" style="width:150px;height:150px;flex:0 0 150px;background:#fff;
+           border-radius:10px;padding:7px;display:grid;place-items:center">
+        <span style="color:#666;font-size:11px">starting…</span>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div id="g-url" style="font-size:11px;word-break:break-all;color:#8fd0ff">—</div>
+        <div id="g-busy" style="margin-top:8px;font-size:13px;color:#e0b040">nobody playing</div>
+        <div class="btns" style="margin-top:8px">
+          <button class="dim" onclick="fetch('/guestkick',{method:'POST'})">End their turn</button>
+        </div>
+      </div>
+    </div>
+    <table id="g-queue" style="margin-top:10px"><tbody></tbody></table>
+    <p class="lbl" style="margin-top:10px">visitors seen (from guest_log.jsonl)</p>
+    <table id="g-hist"><tbody></tbody></table>
+    <p class="lbl" style="margin-top:12px">feedback <span id="fb-count"></span></p>
+    <div id="fb-list" style="max-height:220px;overflow-y:auto;font-size:12.5px"></div>
+  </div>
+</div>
+<div class="panel">
+  <div class="phase" id="phase">—</div><div class="detail" id="detail"></div>
+  <table><tbody id="rows"></tbody></table>
+  <div class="btns">
+    <button id="b-start" onclick="fetch('/start',{method:'POST'})">Start</button>
+    <button id="b-stop" onclick="fetch('/stop',{method:'POST'})">Stop</button>
+    <button id="b-home" onclick="fetch('/home',{method:'POST'})">Fold home</button>
+    <button id="b-relax" onclick="fetch('/relax',{method:'POST'})"
+      title="Fold home then cut servo torque so nothing is held. Any motion command wakes it automatically.">Relax</button>
+  </div>
+  <div class="btns">
+    <button id="b-home" onclick="fetch('/reset',{method:'POST'})">Reset pose</button>
+    <button id="b-home" onclick="fetch('/survey',{method:'POST'})"
+      title="Locate the target from the fixed survey pose and report it, without grasping. Run it twice: if the two answers differ, the localization is the problem, not the approach.">Locate only</button>
+    <button id="b-home" onclick="if(confirm('The arm will gently touch the table at 7 points to measure its height and tilt. Clear the table of objects first. Continue?')) fetch('/floorcal',{method:'POST'})"
+      title="Self-calibrate the table plane: touches the table at several reaches and fits z_floor(x,y). Absorbs table tilt AND arm sag, which is what stops the gripper scraping at full reach.">Calibrate floor</button>
+  </div>
+  <div class="jog">
+    <p class="lbl">FPV polar · drag sticks, or W/S radius · A/D base · R/F height · T/G tilt · Q/E roll · space grip <span id="jogmsg"></span></p>
+    <div class="sticks">
+      <div class="stick" id="st-move"><div class="nub"></div><span class="sl">reach · base</span></div>
+      <div class="stick vert" id="st-lift"><div class="nub"></div><span class="sl">height</span></div>
+    </div>
+    <div class="pad">
+      <button data-d="up"    class="j">R ▲ higher</button>
+      <button data-d="fwd"   class="j">W radius+</button>
+      <button data-d="down"  class="j">F ▼ lower</button>
+      <button data-d="left"  class="j">A ↺ base</button>
+      <button data-d="back"  class="j">S radius−</button>
+      <button data-d="right" class="j">D ↻ base</button>
+      <button data-d="roll_ccw" class="j">Q ↺ roll</button>
+      <button data-d="roll_cw"  class="j">E ↻ roll</button>
+      <button data-d="pitch_up" class="j">T ⤒ tilt up</button>
+      <button data-d="pitch_dn" class="j">G ⤓ tilt dn</button>
+      <button data-d="open"  class="j g">OPEN gripper</button>
+      <button data-d="close" class="j g">CLOSE gripper</button>
+    </div>
+  </div>
+  <div class="qbox">
+    <p class="lbl">detection query (YOLO prompt)</p>
+    <div class="qrow">
+      <input id="query" type="text" placeholder="e.g. red cube, toy block">
+      <button id="q-set" onclick="setQuery()">Set</button>
+      <button id="q-run" onclick="runYoloApproach()">Run YOLO Approach</button>
+    </div>
+    <div class="qrow">
+      <button onclick="preset('coco')" title="All 80 COCO classes — everything YOLO knows">All YOLO classes</button>
+      <button onclick="preset('table')" title="The tabletop subset this arm can actually pick">Tabletop</button>
+      <button onclick="preset('cubes')" title="The original two cubes">Cubes</button>
+    </div>
+  </div>
+  <div class="qbox">
+    <p class="lbl">approach tuning · change while IDLE, takes effect on next Start</p>
+    <div class="qrow">
+      <label>aim px</label>
+      <input id="tune-aim" type="number" step="5" value="-90" title="Lateral aim offset (px). More negative = aim further LEFT in image = robot moves RIGHT.">
+      <button onclick="setTune('aim','/setaimdu?px=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>right trim cm</label>
+      <input id="tune-trim" type="number" step="0.5" value="3.0" title="Approach target shifted this many cm to the cube's RIGHT.">
+      <button onclick="setTune('trim','/settrim?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>back cm</label>
+      <input id="tune-back" type="number" step="0.2" value="1.0" title="Approach target stops this many cm SHORT of the cube radially.">
+      <button onclick="setTune('back','/setback?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>steps</label>
+      <input id="tune-steps" type="number" step="1" value="4" title="Number of staged approach waypoints.">
+      <button onclick="setTune('steps','/setsteps?n=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>cube cm</label>
+      <input id="tune-cube" type="number" step="0.5" value="5.08" title="Real cube edge in cm. Used for apparent-size range fallback.">
+      <button onclick="setTune('cube','/setcubesize?cm=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>range scale</label>
+      <input id="tune-scale" type="number" step="0.05" value="1.0" title="Multiply all ranges by this. >1 spreads objects out; <1 compresses.">
+      <button onclick="setTune('scale','/setrangescale?scale=')">Set</button>
+    </div>
+    <div class="qrow">
+      <label>bearing deg</label>
+      <input id="tune-bearing" type="number" step="5" value="0.0" title="Rotate the map left/right. Use when camera shows objects on opposite sides but map clusters them on one side.">
+      <button onclick="setTune('bearing','/setbearing?deg=')">Set</button>
+    </div>
+  </div>
+  <pre id="log"></pre>
+</div></main>
+<script src="/ui/joystick.js"></script>
+<script src="/ui/viewer3d.js"></script>
+<script>
+function jmsg(t){ document.getElementById('jogmsg').textContent = t; }
+// Placement is a two-step gesture: arm it, then click the 2D map to say WHERE.
+// Clicking an object stacks on top of it (release height from its measured
+// height); clicking bare table drops at that (x, y).
+window.placeArm = null;
+function setPlaceUI(){
+  const hint = document.getElementById('placehint');
+  const on = !!window.placeArm;
+  hint.textContent = on ? (window.placeArm==='pickplace'
+      ? 'click the map: where to PUT it after picking (object = stack on it)'
+      : 'click the map: where to PLACE what is held (object = stack on it)') : '';
+  for(const id of ['b-place','b-pickplace']){
+    const b=document.getElementById(id); if(!b) continue;
+    const mine = (id==='b-place'&&window.placeArm==='place')||(id==='b-pickplace'&&window.placeArm==='pickplace');
+    b.style.background = mine ? '#e0b040' : '';
+    b.style.color = mine ? '#111' : '';
+  }
+}
+function armPlace(){ window.placeArm = (window.placeArm==='place')?null:'place'; setPlaceUI(); }
+function armPickPlace(){ window.placeArm = (window.placeArm==='pickplace')?null:'pickplace'; setPlaceUI(); }
+async function runTask(){
+  const q = document.getElementById('task').value.trim();
+  if(!q) return;
+  const b = document.getElementById('t-run'); b.textContent='…'; b.disabled=true;
+  try{
+    const r = await (await fetch('/task?q='+encodeURIComponent(q),{method:'POST'})).json();
+    if(!r.ok) alert('task: '+(r.reason||'failed'));
+  }catch(e){ alert(e.message); }
+  finally{ b.disabled=false; b.textContent='Run task'; }
+}
+document.getElementById('task').addEventListener('keydown', e=>{ if(e.key==='Enter') runTask(); });
+// guest QR: the tunnel URL can take a few seconds to appear, so poll until it does
+(function(){
+  let haveQr = false;
+  async function poll(){
+    try{
+      const g = await (await fetch('/guestlink')).json();
+      document.getElementById('g-min').textContent = g.minutes ?? 5;
+      if(g.ok && !haveQr){
+        document.getElementById('g-qr').innerHTML = g.qr_svg;
+        const svg = document.querySelector('#g-qr svg');
+        if(svg){ svg.setAttribute('width','100%'); svg.setAttribute('height','100%');
+                 svg.style.imageRendering='pixelated'; }
+        document.getElementById('g-url').textContent = g.url;
+        haveQr = true;
+      }else if(!g.ok && g.error){
+        document.getElementById('g-qr').innerHTML =
+          '<span style="color:#b0533c;font-size:11px;text-align:center">'+g.error+'</span>';
+      }
+      document.getElementById('g-busy').textContent =
+        g.busy ? ('someone is playing · '+g.left+'s left') : 'nobody playing';
+    }catch(e){}
+    try{
+      const v = await (await fetch('/guests')).json();
+      const mmss = s => Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+      let rows = '<tr style="color:#93a1ae;font-size:11px"><td>who</td><td>ip</td>'
+               + '<td>state</td><td>turns</td></tr>';
+      if(v.playing){
+        rows += `<tr><td style="color:#4cc275">▶ DRIVING</td><td>${v.playing.ip}</td>`
+              + `<td>${mmss(v.playing.left)} left</td><td>${v.playing.turns}</td></tr>`;
+      }else{
+        rows += '<tr><td colspan=4 style="color:#8aa">nobody driving</td></tr>';
+      }
+      for(const q of v.queue){
+        rows += `<tr><td>#${q.pos} waiting</td><td>${q.ip}</td>`
+              + `<td>${mmss(q.waiting)} in line${q.cooldown?' · cooling':''}</td>`
+              + `<td>${q.turns}</td></tr>`;
+      }
+      document.querySelector('#g-queue tbody').innerHTML = rows;
+
+      let h = '<tr style="color:#93a1ae;font-size:11px"><td>ip</td><td>turns</td>'
+            + '<td>total time</td><td>last seen</td></tr>';
+      const now = Date.now()/1000;
+      h += (v.by_ip||[]).map(e=>{
+        const ago = Math.max(0, Math.round(now - e.last));
+        return `<tr><td>${e.ip}</td><td>${e.turns}</td><td>${mmss(Math.round(e.secs))}</td>`
+             + `<td>${ago<90?ago+'s ago':Math.round(ago/60)+'m ago'}</td></tr>`;
+      }).join('') || '<tr><td colspan=4 style="color:#8aa">no visitors logged yet</td></tr>';
+      document.querySelector('#g-hist tbody').innerHTML = h;
+    }catch(e){}
+    try{
+      const f = await (await fetch('/feedbacklist')).json();
+      document.getElementById('fb-count').textContent = f.count ? '('+f.count+')' : '';
+      const esc = t => String(t).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+      document.getElementById('fb-list').innerHTML = (f.items||[]).map(i =>
+        `<div style="border-bottom:1px solid #2b3540;padding:6px 0">
+           <div style="color:#e6ecf1">${esc(i.message)}</div>
+           <div style="color:#93a1ae;font-size:11px;margin-top:2px">
+             ${esc(i.iso)} · ${esc(i.from)} · ${esc(i.ip)}
+             ${i.contact ? ' · <span style="color:#8fd0ff">'+esc(i.contact)+'</span>' : ''}
+           </div>
+         </div>`).join('') || '<div style="color:#8aa">nothing yet</div>';
+    }catch(e){}
+  }
+  poll(); setInterval(poll, 2000);
+})();
+async function setQuery(){
+  const q = document.getElementById('query').value.trim();
+  if(!q) return;
+  const btn = document.getElementById('q-set'); btn.textContent = '…';
+  try{ const r = await (await fetch('/setquery?q='+encodeURIComponent(q),{method:'POST'})).json();
+    btn.textContent = r.ok ? 'Set ✓' : 'Set'; }
+  catch(e){ btn.textContent = 'Set'; }
+  setTimeout(()=>document.getElementById('q-set').textContent='Set', 1200);
+}
+document.getElementById('query').addEventListener('keydown', e => { if(e.key==='Enter') setQuery(); });
+async function preset(name){
+  try{ const r = await (await fetch('/preset?name='+name)).json();
+    if(r.q){ document.getElementById('query').value = r.q; setQuery(); } }
+  catch(e){ alert(e.message); }
+}
+async function setTune(id, url){
+  const el = document.getElementById('tune-'+id);
+  const v = el.value.trim();
+  if(v === '') return;
+  const btn = el.nextElementSibling; btn.textContent = '…';
+  try{
+    const r = await (await fetch(url+encodeURIComponent(v),{method:'POST'})).json();
+    btn.textContent = r.ok ? 'Set ✓' : 'Set';
+    if(!r.ok) alert(r.reason || 'failed');
+  }catch(e){ btn.textContent = 'Set'; alert(e.message); }
+  setTimeout(()=>btn.textContent='Set', 1200);
+}
+async function runYoloApproach(){
+  const q = document.getElementById('query').value.trim();
+  if(!q) { alert('Enter a query first (e.g. "red cube")'); return; }
+  const btn = document.getElementById('q-run'); btn.textContent = '⟳ running…'; btn.disabled = true;
+  try{
+    const r = await (await fetch('/yolo-approach?q='+encodeURIComponent(q),{method:'POST'})).json();
+    btn.textContent = r.ok ? '✓ Done' : 'Run YOLO Approach';
+    if(!r.ok) alert('Error: ' + (r.reason||'unknown'));
+  }
+  catch(e){ btn.textContent = 'Run YOLO Approach'; alert('Connection error: ' + e.message); }
+  finally { btn.disabled = false; setTimeout(()=>document.getElementById('q-run').textContent='Run YOLO Approach', 2000); }
+}
+async function setPush(){
+  const cm = parseFloat(document.getElementById('pushout').value);
+  const btn = document.getElementById('p-set'); btn.textContent = '…';
+  try{ await fetch('/pushout',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({cm})});
+    await fetch('/relocate',{method:'POST'});   // re-locate so the 3D lock box moves now
+    btn.textContent = 'Applied ✓'; }
+  catch(e){ btn.textContent = 'Apply + re-locate'; }
+  setTimeout(()=>{ document.getElementById('p-set').textContent='Apply + re-locate'; }, 1400);
+}
+async function press(d){ try{ const r = await (await fetch(`/jogpress?dir=${d}`,{method:'POST'})).json();
+  if(!r.ok) jmsg('✗ '+r.reason); else if(r.grip) jmsg(r.grip); }catch(e){} }
+async function release(d){ try{ await fetch(`/jogrelease?dir=${d}`,{method:'POST'}); }catch(e){} }
+const HOLD = new Set(['fwd','back','left','right','up','down','roll_ccw','roll_cw','pitch_up','pitch_dn']);
+// buttons: hold-to-move (pointer events cover mouse + touch)
+document.querySelectorAll('.j').forEach(b => {
+  const d = b.dataset.d;
+  if(HOLD.has(d)){
+    const go = e => { e.preventDefault(); press(d); };
+    const stop = () => release(d);
+    b.addEventListener('pointerdown', go);
+    b.addEventListener('pointerup', stop);
+    b.addEventListener('pointerleave', stop);
+    b.addEventListener('pointercancel', stop);
+  } else {
+    b.addEventListener('click', () => press(d));   // open/close = one shot
+  }
+});
+// ---- phone joysticks: shared with the guest page, see ui/joystick.js -------
+RAXStick.init({move:'st-move', lift:'st-lift'});
+// keyboard: keydown starts, keyup stops; guard OS key-repeat with a held set
+const KEYMAP = {w:'fwd', s:'back', a:'left', d:'right', r:'up', f:'down',
+  q:'roll_ccw', e:'roll_cw', t:'pitch_up', g:'pitch_dn'};
+const down = new Set();
+document.addEventListener('keydown', ev => {
+  if(ev.target.tagName === 'INPUT') return;
+  const k = ev.key.toLowerCase();
+  if(KEYMAP[k]){ ev.preventDefault(); if(!down.has(k)){ down.add(k); press(KEYMAP[k]); } }
+  else if(k === 'o'){ ev.preventDefault(); press('open'); }     // O = open
+  else if(k === 'c'){ ev.preventDefault(); press('close'); }    // C = close
+  else if(ev.key === ' '){ ev.preventDefault(); if(!down.has(' ')){ down.add(' ');
+    press(window._gripOpen ? 'close':'open'); window._gripOpen = !window._gripOpen; } }
+});
+document.addEventListener('keyup', ev => {
+  const k = ev.key.toLowerCase();
+  if(KEYMAP[k]){ down.delete(k); release(KEYMAP[k]); }
+  else if(ev.key === ' '){ down.delete(' '); }
+});
+window.addEventListener('blur', () => { down.clear(); release('all'); });  // safety
+async function tick(){
+  try{
+    const s = await (await fetch('/status')).json();
+    const ph = document.getElementById('phase');
+    ph.textContent = s.phase; ph.className = 'phase' + (/ABORT|ERROR/.test(s.phase) ? ' bad':'');
+    document.getElementById('detail').textContent = s.detail || '';
+    const rows = [
+      ['joints (deg)', (s.joints||[]).join('  ')],
+      ['gripper %', s.gripper ?? '—'],
+      ['servo loop', (s.loop_hz||0) + ' Hz'],
+      ['dist to target', s.dist_mm != null ? s.dist_mm + ' mm' : '—'],
+      ['gripper xyz (m)', s.jog_xyz ? s.jog_xyz.join(', ') : '—'],
+      ['gripper angle', s.pitch != null ? s.pitch + '°  (0=flat, 90=down)' : '—'],
+      ['located object (m)', s.located ? s.located.join(', ') : '—'],
+      ['target radius/angle', s.target_polar ? (s.target_polar[0]+' cm  '+s.target_polar[1]+'°  h='+s.target_polar[2]+' cm') : '—'],
+      ['red (base, m)', s.p_red ? s.p_red.join(', ') : '—'],
+      ['green (base, m)', s.p_green ? s.p_green.join(', ') : '—'],
+      ['elapsed', s.t0 && s.running ? Math.round(Date.now()/1000 - s.t0) + ' s' : '—'],
+      ['in the jaws', s.carry || '— (empty)'],
+      ['servos', s.relaxed ? '💤 RELAXED (torque off)'
+          : ('live · idle ' + (s.idle_for||0) + 's'
+             + (s.idle_relax_s ? ' / relax at ' + s.idle_relax_s + 's' : ' / auto-relax off'))],
+      ['floor plane', window._floor ? (window._floor.calibrated ? '' : '(uncalibrated) ')
+          + 'z=' + (window._floor.at_18cm*100).toFixed(1) + 'cm @18cm, '
+          + (window._floor.at_34cm*100).toFixed(1) + 'cm @34cm, tilt '
+          + window._floor.tilt_deg + '°' : '—'],
+    ];
+    document.getElementById('rows').innerHTML =
+      rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+    document.getElementById('log').textContent = (s.log||[]).join('\\n');
+    const qi = document.getElementById('query');
+    if(s.query && !qi.value && document.activeElement !== qi) qi.value = s.query;
+    if(s.tune){
+      const ta = document.getElementById('tune-aim');
+      if(ta && document.activeElement !== ta) ta.value = s.tune.aim_du;
+      const tt = document.getElementById('tune-trim');
+      if(tt && document.activeElement !== tt) tt.value = s.tune.right_trim_cm;
+      const tbk = document.getElementById('tune-back');
+      if(tbk && document.activeElement !== tbk) tbk.value = s.tune.back_cm;
+      const ts = document.getElementById('tune-steps');
+      if(ts && document.activeElement !== ts) ts.value = s.tune.approach_steps;
+      const tc = document.getElementById('tune-cube');
+      if(tc && document.activeElement !== tc) tc.value = s.tune.cube_edge_cm;
+      const tsc = document.getElementById('tune-scale');
+      if(tsc && document.activeElement !== tsc) tsc.value = s.tune.range_scale;
+      const tb = document.getElementById('tune-bearing');
+      if(tb && document.activeElement !== tb) tb.value = s.tune.bearing_deg;
+    }
+  }catch(e){}
+  setTimeout(tick, 700);
+}
+tick();
+
+// ---- 2D top-down object map ----
+(function(){
+  const cv=document.getElementById('v2d'); if(!cv) return;
+  const ctx=cv.getContext('2d'); let objs=[];
+  function resize(){const r=cv.getBoundingClientRect(),dpr=devicePixelRatio||1;
+    cv.width=Math.round(r.width*dpr);cv.height=Math.round(r.height*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);}
+  addEventListener('resize',resize);resize();
+  // base at bottom-centre; +x = up (forward), +y = left. scale: fit ~55cm radius.
+  function W2S(x,y){const W=cv.clientWidth,H=cv.clientHeight,s=Math.min(W/1.4,(H-30)/0.80);
+    return [W/2 - y*s, H-20 - x*s];}
+  function col(l){return /red/.test(l)?'#e2574c':/green/.test(l)?'#3fc46b':/blue/.test(l)?'#4a93c9':'#e0b040';}
+  function draw(){const W=cv.clientWidth,H=cv.clientHeight;ctx.clearRect(0,0,W,H);
+    const s=Math.min(W/1.4,(H-30)/0.80),[ox,oy]=W2S(0,0);
+    ctx.strokeStyle='#1b2733';ctx.fillStyle='#4a5a68';ctx.font='10px ui-monospace,Consolas';
+    for(let r=10;r<=70;r+=10){ctx.beginPath();ctx.arc(ox,oy,r/100*s,Math.PI,2*Math.PI);ctx.stroke();
+      ctx.fillText(r+'cm',ox+3,oy-r/100*s+11);}
+    // reach limit ~42cm
+    ctx.strokeStyle='#3a5a3a';ctx.beginPath();ctx.arc(ox,oy,0.62*s,Math.PI,2*Math.PI);ctx.stroke();
+    ctx.fillStyle='#c9524a';ctx.beginPath();ctx.arc(ox,oy,5,0,7);ctx.fill();
+    ctx.fillStyle='#8aa';ctx.fillText('base',ox+7,oy+4);
+    for(const o of objs){
+      const c=col(o.label);
+      const yaw=Math.PI/180*(o.yaw||0);
+      const cw=(o.w_m||o.size||0.03)/2;
+      const cd=(o.d_m||o.size||0.03)/2;
+      // footprint corners in base frame, rotated by yaw, then to screen
+      const corners=[[-cd,-cw],[-cd,cw],[cd,cw],[cd,-cw]];
+      const cos=Math.cos(yaw), sin=Math.sin(yaw);
+      const P=corners.map(([dx,dy])=>{
+        const rx=dx*cos-dy*sin, ry=dx*sin+dy*cos;
+        return W2S(o.x+rx,o.y+ry);
+      });
+      const [sx,sy]=W2S(o.x,o.y);
+      if(o.yaw_known){
+        ctx.beginPath();ctx.moveTo(P[0][0],P[0][1]);for(let k=1;k<4;k++)ctx.lineTo(P[k][0],P[k][1]);ctx.closePath();
+        ctx.globalAlpha=0.30;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.stroke();
+        const [ex,ey]=W2S(o.x+0.03*Math.cos(yaw), o.y+0.03*Math.sin(yaw));
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(ex,ey);ctx.stroke();
+      }else{
+        // ORIENTATION UNKNOWN. Nothing measured a yaw for this object, so drawing
+        // an oriented rectangle would invent one - every object ends up looking
+        // axis-aligned and identical. A circle says "here, this big, angle unknown".
+        const rad=Math.max(cw,cd)*Math.min(cv.clientWidth/1.4,(cv.clientHeight-30)/0.80);
+        ctx.beginPath();ctx.arc(sx,sy,Math.max(4,rad),0,7);
+        ctx.globalAlpha=0.22;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.setLineDash([4,3]);ctx.stroke();ctx.setLineDash([]);
+      }
+      ctx.fillStyle=c;ctx.beginPath();ctx.arc(sx,sy,2,0,7);ctx.fill();
+      ctx.fillStyle=o.measured?'#e6ecf1':'#8d9aa6';ctx.font='11px ui-monospace,Consolas';
+      const dims=(o.w_m*100).toFixed(0)+'x'+(o.d_m*100).toFixed(0)+'x'+(o.h_m*100).toFixed(0);
+      ctx.fillText(o.label.split(' ')[0]+'#'+o.tag+' '+(o.shape||'cube')+' '+dims+(o.measured?'':'?'),sx+9,sy-6);}
+  }
+  // S2W is the inverse of W2S: it turns a click into a base-frame (x, y) so a bare
+  // patch of table can be a placement destination, not just a mapped object.
+  function S2W(sx,sy){const W=cv.clientWidth,H=cv.clientHeight,s=Math.min(W/1.4,(H-30)/0.80);
+    return [(H-20-sy)/s, (W/2-sx)/s];}
+  cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    let best=null,bd=22;for(const o of objs){const[sx,sy]=W2S(o.x,o.y);const d=Math.hypot(sx-mx,sy-my);
+      if(d<bd){bd=d;best=o;}}
+    if(window.placeArm){
+      const q = best ? ('tag='+best.tag)
+                     : (()=>{const[wx,wy]=S2W(mx,my);return 'x='+(wx*100).toFixed(1)+'&y='+(wy*100).toFixed(1);})();
+      const ep = window.placeArm; window.placeArm=null; setPlaceUI();
+      fetch('/'+ep+'?'+q,{method:'POST'}).then(r=>r.json()).then(j=>{
+        if(!j.ok) alert(ep+': '+(j.reason||'failed'));});
+      return;}
+    if(best)fetch('/goto2d?tag='+best.tag,{method:'POST'});});
+  async function poll(){try{const d=await(await fetch('/map2d')).json();objs=d.objs||[];draw();
+    const tb=document.querySelector('#map2dtab tbody');
+    const head='<tr style="color:#93a1ae;font-size:11px"><td>label#tag</td><td>x</td><td>y</td>'+
+      '<td>shape</td><td>w×d×h cm</td><td>yaw</td><td>r</td><td>n</td></tr>';
+    const rows=objs.map(o=>`<tr class="obj" style="cursor:pointer;${o.measured?'':'color:#8d9aa6'}" onclick="fetch('/goto2d?tag=${o.tag}',{method:'POST'})">`+
+      `<td>${o.label}#${o.tag}</td><td>${(o.x*100).toFixed(0)}</td><td>${(o.y*100).toFixed(0)}</td>`+
+      `<td>${o.shape||'cube'}</td>`+
+      `<td>${(o.w_m*100).toFixed(1)}×${(o.d_m*100).toFixed(1)}×${(o.h_m*100).toFixed(1)}${o.measured?'':' (prior)'}</td>`+
+      `<td>${o.yaw.toFixed(0)}°</td>`+
+      `<td>${o.r_cm}cm</td><td>${o.n}</td></tr>`).join('')
+      ||'<tr><td colspan=8 style="color:#8aa">empty — Scan → 2D map</td></tr>';
+    tb.innerHTML=head+rows;
+  }catch(e){} setTimeout(poll,500);}
+  poll();
+})();
+</script></body></html>

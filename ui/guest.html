@@ -1,0 +1,377 @@
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>RAX · Robot Arm</title>
+<style>
+  :root{
+    --pink:#ff4d9d; --violet:#8b5cf6; --cyan:#22d3ee; --lime:#a3e635;
+    --amber:#fbbf24; --card:rgba(255,255,255,.10);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;font:16px/1.4 ui-rounded,"Segoe UI",system-ui,sans-serif;color:#fff;
+    background:linear-gradient(150deg,#1b1040 0%,#2d1b5e 40%,#0f2a4a 100%);
+    min-height:100dvh;overflow-x:hidden;user-select:none}
+  body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+    background:radial-gradient(60vw 60vw at 15% 8%,rgba(255,77,157,.30),transparent 60%),
+               radial-gradient(55vw 55vw at 88% 22%,rgba(34,211,238,.26),transparent 60%),
+               radial-gradient(50vw 50vw at 50% 100%,rgba(163,230,53,.18),transparent 60%)}
+  .wrap{position:relative;z-index:1;max-width:520px;margin:0 auto;padding:12px 14px 24px}
+  header{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .logo{font-weight:900;font-size:26px;letter-spacing:-1px;
+    background:linear-gradient(92deg,var(--pink),var(--amber),var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .timer{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums;
+    padding:6px 12px;border-radius:999px;background:var(--card);
+    border:1px solid rgba(255,255,255,.20);backdrop-filter:blur(8px)}
+  .timer.low{background:rgba(255,77,157,.30);border-color:var(--pink);
+    animation:pulse .9s ease-in-out infinite}
+  @keyframes pulse{50%{transform:scale(1.06)}}
+  .card{background:var(--card);border:1px solid rgba(255,255,255,.16);border-radius:20px;
+    padding:12px;backdrop-filter:blur(10px);box-shadow:0 8px 30px rgba(0,0,0,.28);margin-bottom:12px}
+  .fpv{position:relative;border-radius:16px;overflow:hidden;background:#0b0f14;aspect-ratio:4/3}
+  .fpv img{width:100%;height:100%;object-fit:cover;display:block}
+  .phase{position:absolute;left:10px;top:10px;font-weight:800;font-size:13px;
+    padding:5px 12px;border-radius:999px;background:rgba(10,8,20,.72);
+    border:1px solid rgba(255,255,255,.22)}
+  .sticks{display:grid;grid-template-columns:1fr 96px;gap:12px;align-items:center}
+  /* The nub is centred BY FLEX LAYOUT, never by transform: joystick.js drives
+     `transform` with the stick deflection in PIXELS, so a centring transform here
+     would be overwritten (and percentage deflections resolve against the nub's
+     own size, which is what made the stick look frozen). */
+  .pad{position:relative;aspect-ratio:1;border-radius:50%;touch-action:none;
+    display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 50% 50%,rgba(255,255,255,.14),rgba(255,255,255,.05));
+    border:2px solid rgba(255,255,255,.22)}
+  .pad.vert{border-radius:26px;aspect-ratio:.62}
+  .nub{width:56px;height:56px;border-radius:50%;pointer-events:none;flex:0 0 auto;
+    background:linear-gradient(150deg,var(--cyan),var(--violet));
+    box-shadow:0 6px 18px rgba(0,0,0,.42)}
+  .pad.vert .nub{width:62px;height:36px;border-radius:18px}
+  .lbl{text-align:center;font-size:11px;font-weight:700;opacity:.75;margin-top:6px;
+    letter-spacing:.5px;text-transform:uppercase}
+  .row{display:flex;gap:10px}
+  button{flex:1;border:0;border-radius:16px;padding:16px 10px;font:800 16px/1 inherit;
+    color:#fff;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.30);transition:transform .08s}
+  button:active{transform:scale(.96)}
+  button:disabled{opacity:.45;box-shadow:none}
+  .grab{background:linear-gradient(140deg,var(--lime),#16a34a);color:#0b2a10}
+  .open{background:linear-gradient(140deg,var(--amber),#f97316);color:#3a1c02}
+  .pick{background:linear-gradient(120deg,var(--pink),var(--violet));font-size:19px;padding:20px}
+  .stopb{background:linear-gradient(140deg,#f43f5e,#991b1b);flex:0 0 34%}
+  .mini{font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+    opacity:.7;margin:0 0 9px;text-align:center}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  .chip{flex:0 0 auto;padding:10px 14px;border-radius:999px;font:700 14px inherit;
+    color:#fff;background:rgba(255,255,255,.10);border:1.5px solid rgba(255,255,255,.22);
+    box-shadow:none;cursor:pointer}
+  .chip.on{background:linear-gradient(120deg,var(--pink),var(--violet));
+    border-color:transparent;box-shadow:0 5px 16px rgba(255,77,157,.42)}
+  .scan{background:linear-gradient(140deg,var(--cyan),#2563eb)}
+  .home{background:linear-gradient(140deg,#a78bfa,#6d28d9)}
+  .fb{background:linear-gradient(140deg,var(--lime),#0d9488);color:#04241f;width:100%}
+  textarea,input{width:100%;margin-bottom:8px;padding:11px 13px;border-radius:14px;
+    background:rgba(255,255,255,.10);border:1.5px solid rgba(255,255,255,.22);
+    color:#fff;font:15px inherit;resize:vertical}
+  textarea::placeholder,input::placeholder{color:rgba(255,255,255,.45)}
+  .hint{text-align:center;font-size:13px;opacity:.72;margin-top:2px}
+  footer{text-align:center;padding:18px 0 6px;opacity:.8}
+  .fname{font-weight:900;font-size:22px;letter-spacing:-.5px;
+    background:linear-gradient(92deg,var(--pink),var(--amber),var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .fsub{font-size:12px;letter-spacing:1.4px;text-transform:uppercase;opacity:.62;margin-top:1px}
+  .gh{display:inline-flex;align-items:center;gap:7px;margin-top:11px;padding:9px 15px;
+    border-radius:999px;font-size:13px;font-weight:700;text-decoration:none;color:#fff;
+    background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.22)}
+  .gh:active{transform:scale(.97)}
+
+  /* lobby: what everyone sees until the arm is theirs */
+  .lobby{position:fixed;inset:0;z-index:10;display:none;place-items:center;padding:22px;
+    background:linear-gradient(150deg,#1b1040,#2d1b5e 45%,#0f2a4a);text-align:center;overflow:auto}
+  .lobby.show{display:grid}
+  .lbox{max-width:380px;width:100%}
+  .lobby h2{font-size:27px;margin:0 0 16px;line-height:1.25;
+    background:linear-gradient(92deg,var(--pink),var(--amber),var(--cyan));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .ring{width:158px;height:158px;margin:0 auto 16px;border-radius:50%;display:grid;
+    place-items:center;font-size:38px;font-weight:900;font-variant-numeric:tabular-nums;
+    background:conic-gradient(var(--cyan) var(--p,0%),rgba(255,255,255,.10) 0);position:relative}
+  .ring::after{content:"";position:absolute;inset:12px;border-radius:50%;background:#241751}
+  .ring span{position:relative;z-index:1}
+  .lobby p{opacity:.82;margin:0 0 18px;font-size:15px}
+  .peek{border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,.18)}
+  .peek img{width:100%;display:block}
+  .cap{font-size:11px;opacity:.62;padding:7px}
+
+  .over{position:fixed;inset:0;z-index:11;display:none;place-items:center;padding:24px;
+    background:rgba(12,8,26,.92);backdrop-filter:blur(10px);text-align:center}
+  .over.show{display:grid}
+  .over h2{font-size:34px;margin:0 0 8px;
+    background:linear-gradient(92deg,var(--pink),var(--amber));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .over p{opacity:.8;margin:0 0 20px}
+  .over button{max-width:260px;background:linear-gradient(120deg,var(--cyan),var(--violet))}
+  .confetti{position:fixed;width:9px;height:14px;z-index:9;pointer-events:none;border-radius:2px}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="logo">RAX</div>
+    <div class="timer" id="timer">--:--</div>
+  </header>
+  <div class="card">
+    <div class="fpv">
+      <img id="fpv" src="/stream" alt="robot camera">
+      <div class="phase" id="phase">READY</div>
+    </div>
+  </div>
+  <div class="card">
+    <p class="mini">what should it grab?</p>
+    <div class="chips" id="chips"></div>
+  </div>
+  <div class="card">
+    <div class="sticks">
+      <div><div class="pad" id="p-move"><div class="nub"></div></div><div class="lbl">move</div></div>
+      <div><div class="pad vert" id="p-lift"><div class="nub"></div></div><div class="lbl">up · down</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <button class="open" id="b-open">✋ OPEN</button>
+      <button class="grab" id="b-close">🤏 GRAB</button>
+    </div>
+    <div class="row">
+      <button class="pick" id="b-pick">🎯 PICK IT UP!</button>
+      <button class="stopb" id="b-stop">STOP</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="scan" id="b-scan">🔎 LOOK AROUND</button>
+      <button class="home" id="b-home">🏠 PARK IT</button>
+    </div>
+    <div class="hint" id="hint">drag the circles to fly the arm</div>
+  </div>
+  <div class="card">
+    <p class="mini">the robot, right now</p>
+    <canvas id="v3d" style="width:100%;height:250px;border-radius:14px;
+      background:#0b0f14;display:block;touch-action:none"></canvas>
+    <div class="hint" style="margin-top:6px">drag to spin the view</div>
+  </div>
+  <div class="card">
+    <p class="mini">how was it? tell us</p>
+    <textarea id="fb-msg" rows="2" placeholder="it did the thing! / the arm missed / idea…"></textarea>
+    <input id="fb-contact" placeholder="email or @handle (optional)">
+    <button class="fb" id="fb-send">💌 SEND FEEDBACK</button>
+    <div class="hint" id="fb-hint"></div>
+  </div>
+  <footer>
+    <div class="fname">RAX</div>
+    <div class="fsub">Robot Agent Exchange</div>
+    <a class="gh" href="https://github.com/arminforoughi/RAX" target="_blank" rel="noopener">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor"
+        d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+        0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01
+        1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95
+        0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0
+        1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0
+        3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01
+        8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      github.com/arminforoughi/RAX
+    </a>
+  </footer>
+</div>
+
+<div class="lobby show" id="lobby">
+  <div class="lbox">
+    <div class="logo" style="font-size:40px;margin-bottom:4px">RAX</div>
+    <h2 id="l-title">Finding you a spot…</h2>
+    <div class="ring" id="ring"><span id="l-ring">–</span></div>
+    <p id="l-sub">hold tight</p>
+    <div class="peek">
+      <img src="/stream" alt="live robot camera">
+      <div class="cap">live from the robot</div>
+    </div>
+  </div>
+</div>
+
+<div class="over" id="over">
+  <div>
+    <h2 id="over-t">Time's up!</h2>
+    <p id="over-p">Scan the QR code again for another turn.</p>
+    <button onclick="location.reload()">Get back in line</button>
+  </div>
+</div>
+
+<script src="/ui/joystick.js"></script>
+<script src="/ui/viewer3d.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+let playing = false, ended = false, lastPhase = '';
+
+function showOver(t, p){
+  ended = true;
+  $('#over-t').textContent = t;
+  $('#over-p').textContent = p;
+  $('#over').classList.add('show');
+}
+function fmt(s){ return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0'); }
+
+// ONE heartbeat drives everything: it holds our place in the queue, promotes us
+// when our turn comes, and reports how long we have left. Stop polling and we
+// drop out of the queue — which is exactly right when a phone walks away.
+async function tick(){
+  let q;
+  try { q = await (await fetch('/guest/lobby', {method:'POST'})).json(); }
+  catch(e){ return; }
+
+  if(q.playing){
+    if(!playing){ playing = true; $('#lobby').classList.remove('show'); }
+    const t = $('#timer');
+    t.textContent = fmt(q.left);
+    t.classList.toggle('low', q.left <= 45);
+    return;
+  }
+  if(playing && !ended){
+    showOver("Time's up!", q.waiting > 0
+      ? 'Others are waiting — get back in line for another go.'
+      : 'Scan again for another turn.');
+    return;
+  }
+
+  $('#lobby').classList.add('show');
+  if(q.position <= 1){
+    $('#l-title').textContent = "You're next!";
+    $('#l-sub').textContent = 'the arm frees up in a moment';
+    $('#l-ring').textContent = fmt(q.left);
+  }else{
+    $('#l-title').textContent = "You're #" + q.position + ' in line';
+    $('#l-sub').textContent = (q.position - 1) + ' ahead of you · about ' + fmt(q.eta) + ' to wait';
+    $('#l-ring').textContent = '#' + q.position;
+  }
+  if(q.cooldown > 0 && q.waiting > 1){
+    $('#l-sub').textContent = 'you just had a turn — letting others go first';
+  }
+  $('#ring').style.setProperty('--p', (100 * q.left / (q.minutes*60)) + '%');
+}
+
+// sticks come from ui/joystick.js (same implementation the admin page uses);
+// they only send while it is actually our turn
+RAXStick.init({move:'p-move', lift:'p-lift', enabled: () => playing});
+
+function hold(btn, dir){
+  btn.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if(playing) fetch('/jogpress?dir=' + dir, {method:'POST'}).catch(()=>{});
+  });
+  const up = () => fetch('/jogrelease?dir=' + dir, {method:'POST'}).catch(()=>{});
+  ['pointerup','pointercancel','pointerleave'].forEach(ev => btn.addEventListener(ev, up));
+}
+hold($('#b-open'), 'open');
+hold($('#b-close'), 'close');
+
+$('#b-pick').onclick = async () => {
+  const b = $('#b-pick');
+  b.disabled = true;
+  try{
+    const r = await (await fetch('/guest/pick', {method:'POST'})).json();
+    if(!r.ok) $('#hint').textContent = r.reason || 'busy';
+  }catch(e){}
+  setTimeout(() => { b.disabled = false; }, 1200);
+};
+$('#b-stop').onclick = () => fetch('/stop', {method:'POST'}).catch(()=>{});
+
+$('#b-home').onclick = async () => {
+  const b = $('#b-home');
+  b.disabled = true;
+  try{
+    const r = await (await fetch('/guest/home', {method:'POST'})).json();
+    $('#hint').textContent = r.ok ? 'parking the arm…' : (r.reason || 'busy');
+  }catch(e){}
+  setTimeout(() => { b.disabled = false; }, 1500);
+};
+
+$('#b-scan').onclick = async () => {
+  const b = $('#b-scan');
+  b.disabled = true;
+  try{
+    const r = await (await fetch('/guest/scan', {method:'POST'})).json();
+    $('#hint').textContent = r.ok ? 'looking around the table…' : (r.reason || 'busy');
+  }catch(e){}
+  setTimeout(() => { b.disabled = false; }, 1500);
+};
+
+// target chips: a fixed server-side list, so nothing free-text reaches YOLO
+let curQuery = '';
+async function loadChips(){
+  try{
+    const t = await (await fetch('/guest/targets')).json();
+    curQuery = t.current || '';
+    const box = $('#chips');
+    box.innerHTML = '';
+    t.targets.forEach(o => {
+      const b = document.createElement('button');
+      b.className = 'chip' + (o.query === curQuery ? ' on' : '');
+      b.textContent = o.emoji + ' ' + o.label;
+      b.onclick = async () => {
+        if(!playing) return;
+        try{
+          const r = await (await fetch('/guest/query?q=' + encodeURIComponent(o.query),
+                                       {method:'POST'})).json();
+          if(r.ok){
+            curQuery = o.query;
+            [...box.children].forEach(c => c.classList.remove('on'));
+            b.classList.add('on');
+            $('#hint').textContent = 'now hunting for ' + o.label.toLowerCase();
+          }
+        }catch(e){}
+      };
+      box.appendChild(b);
+    });
+  }catch(e){}
+}
+loadChips();
+
+function party(){
+  const cols = ['#ff4d9d','#22d3ee','#a3e635','#fbbf24','#8b5cf6'];
+  for(let i = 0; i < 70; i++){
+    const d = document.createElement('div');
+    d.className = 'confetti';
+    d.style.background = cols[i % cols.length];
+    d.style.left = Math.random()*100 + 'vw';
+    d.style.top = '-20px';
+    document.body.appendChild(d);
+    const dx = (Math.random()-.5)*260;
+    d.animate([{transform:'translate(0,0) rotate(0deg)', opacity:1},
+               {transform:'translate(' + dx + 'px,105vh) rotate(' + (720*Math.random()) + 'deg)', opacity:.9}],
+              {duration: 1400 + Math.random()*1200, easing:'cubic-bezier(.2,.6,.5,1)'})
+     .onfinish = () => d.remove();
+  }
+}
+
+async function pollPhase(){
+  if(!playing) return;
+  try{
+    const s = await (await fetch('/guest/status')).json();
+    $('#phase').textContent = s.phase || 'READY';
+    if(s.phase === 'DONE' && lastPhase !== 'DONE'){ party(); $('#hint').textContent = 'got it! 🎉'; }
+    if(s.phase === 'ABORTED' && lastPhase !== 'ABORTED') $('#hint').textContent = s.detail || 'missed — try again';
+    lastPhase = s.phase;
+  }catch(e){}
+}
+
+$('#fb-send').onclick = async () => {
+  const msg = $('#fb-msg').value.trim();
+  if(!msg){ $('#fb-hint').textContent = 'type something first'; return; }
+  const b = $('#fb-send'); b.disabled = true;
+  try{
+    const r = await (await fetch('/feedback', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg, contact: $('#fb-contact').value.trim()})})).json();
+    if(r.ok){ $('#fb-msg').value=''; $('#fb-contact').value='';
+              $('#fb-hint').textContent = 'thank you! 💚'; }
+    else $('#fb-hint').textContent = r.reason || 'could not send';
+  }catch(e){ $('#fb-hint').textContent = 'no connection'; }
+  b.disabled = false;
+};
+
+tick();
+setInterval(tick, 1000);
+setInterval(pollPhase, 800);
+addEventListener('contextmenu', e => e.preventDefault());
+</script>

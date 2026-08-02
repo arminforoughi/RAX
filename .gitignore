@@ -28,3 +28,16 @@ weights/
 
 # OS
 .DS_Store
+
+# RAX runtime state & logs (machine-specific, regenerated at runtime)
+stack_mission2_stdout.log
+stack_mission2_stdout.log.err
+supervise.log
+camserver_stdout.log*
+handeye_tf.json*
+floor_plane.json
+guest_log.jsonl
+feedback.jsonl
+guest_qr.png
+_camview.jpg
+fpv_*.log
