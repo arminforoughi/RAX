@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>RAX — Gaze Robot Demo</title>
 <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body {
     background: #0d0d0d; color: #e0e0e0;
     font-family: 'SF Mono', 'Fira Code', monospace;
@@ -85,6 +85,55 @@
   #log .msg-sys   { color: #555; font-style: italic; }
   #log .msg-state { color: #ff9800; }
 
+  /* ── Manual control panel (joysticks + buttons) ── */
+  #controls {
+    border-top: 1px solid #1e1e1e;
+    padding: 12px;
+    display: flex; flex-wrap: wrap; gap: 12px;
+    align-items: center; justify-content: center;
+  }
+  .pad {
+    position: relative;
+    width: 120px; height: 120px; flex: 0 0 auto;
+    border-radius: 50%;
+    background: radial-gradient(circle at center, #171717 0%, #101010 70%);
+    border: 1px solid #2a2a2a;
+    touch-action: none; user-select: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pad::before {   /* cross-hair guide */
+    content: ""; position: absolute; inset: 0;
+    background:
+      linear-gradient(#222, #222) center / 1px 60% no-repeat,
+      linear-gradient(#222, #222) center / 60% 1px no-repeat;
+    border-radius: 50%;
+  }
+  .pad.vertical::before {
+    background: linear-gradient(#222, #222) center / 1px 60% no-repeat;
+  }
+  .knob {
+    position: relative;
+    width: 44px; height: 44px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #3a6b46, #1b4d2e);
+    border: 1px solid #2a6b3e;
+    transition: transform 0.05s linear;
+    z-index: 2;
+  }
+  .pad-label {
+    position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%);
+    font-size: 9px; color: #555; white-space: nowrap; letter-spacing: 0.4px;
+  }
+  .btns { display: flex; flex-direction: column; gap: 8px; }
+  button.ctl {
+    background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px;
+    color: #cfcfcf; padding: 10px 14px; font-size: 12px; font-family: inherit;
+    cursor: pointer; min-width: 110px; letter-spacing: 0.5px;
+  }
+  button.ctl:active { background: #242424; }
+  button.ctl.grip { color: #4caf50; border-color: #2a5a35; }
+  button.ctl.stop { color: #f66; border-color: #5a2a2a; }
+  button.ctl:disabled { opacity: 0.35; cursor: default; }
+
   /* transcript */
   #transcript-area {
     border-top: 1px solid #1e1e1e;
@@ -102,7 +151,7 @@
   #cmd {
     flex: 1;
     background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px;
-    color: #e0e0e0; padding: 8px 12px; font-size: 13px;
+    color: #e0e0e0; padding: 8px 12px; font-size: 16px;
     font-family: inherit; outline: none;
   }
   #cmd:focus { border-color: #4caf50; }
@@ -129,6 +178,23 @@
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+  /* ── Phone layout ── */
+  @media (max-width: 820px) {
+    header { padding: 8px 12px; }
+    header h1 { font-size: 13px; }
+    main {
+      grid-template-columns: 1fr;
+      grid-template-rows: 40vh auto 1fr;
+    }
+    #video-panel { grid-template-rows: 1fr; }   /* robot eye only */
+    #top-slot { display: none; }                /* hide overhead cam on phone */
+    #side { border-left: none; border-top: 1px solid #1e1e1e; }
+    #controls { order: -1; padding: 16px 12px 24px; }
+    .pad { width: 128px; height: 128px; }
+    #log { max-height: 14vh; flex: 0 0 auto; }
+    #transcript-area { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -141,9 +207,9 @@
 
 <main>
   <div id="video-panel">
-    <!-- Top row: robot eye-in-hand camera (OAK-D / LiveKit track) -->
+    <!-- Top row: robot eye-in-hand camera (OAK-D / LiveKit track) — the FPV -->
     <div class="cam-slot" id="eye-slot">
-      <span class="cam-label">robot eye</span>
+      <span class="cam-label">robot eye · first-person</span>
       <div class="no-cam" id="no-eye">
         connects when arm is active
       </div>
@@ -154,12 +220,12 @@
     <div class="cam-slot" id="top-slot">
       <span class="cam-label">top view</span>
       <img id="top-view"
-           src="http://localhost:5000/view/0"
+           src="http://localhost:5000/stream/0"
            onerror="this.style.display='none'; document.getElementById('no-top').style.display='flex';"
            onload="document.getElementById('no-top').style.display='none';">
       <div class="no-cam" id="no-top" style="display:none">
         top camera offline<br>
-        <span style="font-size:10px;color:#222">localhost:5000/view/0</span>
+        <span style="font-size:10px;color:#222">run camserver.py on Windows</span>
       </div>
     </div>
 
@@ -169,8 +235,25 @@
   <div id="audio-container"></div>
 
   <div id="side">
+    <!-- Manual teleop: hold + slide the pads like joysticks -->
+    <div id="controls">
+      <div class="pad" id="pad-move">
+        <div class="knob"></div>
+        <span class="pad-label">move · fwd/back · strafe</span>
+      </div>
+      <div class="pad vertical" id="pad-lift">
+        <div class="knob"></div>
+        <span class="pad-label">lift · up/down</span>
+      </div>
+      <div class="btns">
+        <button id="grip-btn"  class="ctl grip" disabled>GRIP: OPEN</button>
+        <button id="home-btn"  class="ctl"      disabled>HOME</button>
+        <button id="stop-btn"  class="ctl stop" disabled>STOP</button>
+      </div>
+    </div>
+
     <div id="log"></div>
-    <div id="transcript-area" id="transcript"></div>
+    <div id="transcript-area"></div>
     <div id="input-area">
       <input id="cmd" type="text" placeholder='pick up the red cube…' disabled
              onkeydown="if(event.key==='Enter') sendCmd()">
@@ -201,6 +284,86 @@ function setStatus(text, cls='') {
   el.className = cls;
 }
 
+// Enable/disable the manual control widgets together with the text box.
+function setControlsEnabled(on) {
+  ['grip-btn','home-btn','stop-btn','cmd','send-btn'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !on;
+  });
+}
+
+// ── Data channel senders ────────────────────────────────────────────────────
+function publish(obj) {
+  if (!connected || !room) return;
+  const enc = new TextEncoder().encode(JSON.stringify(obj));
+  room.localParticipant.publishData(enc, { reliable: true });
+}
+
+const JOG_STEP = 0.006;   // metres per tick at full stick deflection
+function sendJog(forward, right, up) {
+  if (Math.abs(forward) < 1e-4 && Math.abs(right) < 1e-4 && Math.abs(up) < 1e-4) return;
+  publish({ type: 'jog', f: forward, r: right, u: up });
+}
+
+// ── Virtual joystick: hold + slide, emits a velocity vector at ~15 Hz ────────
+function makeJoystick(padId, onVec, vertical=false) {
+  const pad  = document.getElementById(padId);
+  const knob = pad.querySelector('.knob');
+  let active = false, cx = 0, cy = 0, R = 1, vx = 0, vy = 0, timer = null;
+
+  function begin(e) {
+    active = true;
+    const r = pad.getBoundingClientRect();
+    cx = r.left + r.width / 2;
+    cy = r.top  + r.height / 2;
+    R  = r.width / 2 - 22;
+    if (!timer) timer = setInterval(() => { if (active) onVec(vx, vy); }, 66);
+    move(e);
+    e.preventDefault();
+  }
+  function move(e) {
+    if (!active) return;
+    const p = e.touches ? e.touches[0] : e;
+    let dx = p.clientX - cx, dy = p.clientY - cy;
+    if (vertical) dx = 0;
+    const dist = Math.min(Math.hypot(dx, dy), R);
+    const ang  = Math.atan2(dy, dx);
+    const kx = vertical ? 0 : dist * Math.cos(ang);
+    const ky = dist * Math.sin(ang);
+    knob.style.transform = `translate(${kx}px, ${ky}px)`;
+    vx = kx / R; vy = ky / R;
+    e.preventDefault();
+  }
+  function end() {
+    active = false; vx = 0; vy = 0;
+    knob.style.transform = 'translate(0,0)';
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  pad.addEventListener('mousedown', begin);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', end);
+  pad.addEventListener('touchstart', begin, { passive: false });
+  pad.addEventListener('touchmove',  move,  { passive: false });
+  pad.addEventListener('touchend',   end);
+  pad.addEventListener('touchcancel', end);
+}
+
+// Left pad: up = forward (camera +z), right = strafe (camera +x).
+makeJoystick('pad-move', (x, y) => sendJog(-y * JOG_STEP, x * JOG_STEP, 0), false);
+// Right pad: up = raise (world +z).
+makeJoystick('pad-lift', (x, y) => sendJog(0, 0, -y * JOG_STEP), true);
+
+// ── Buttons ─────────────────────────────────────────────────────────────────
+let gripOpen = true;
+document.getElementById('grip-btn').addEventListener('click', () => {
+  gripOpen = !gripOpen;
+  publish({ type: 'grip', open: gripOpen });
+  document.getElementById('grip-btn').textContent = 'GRIP: ' + (gripOpen ? 'OPEN' : 'CLOSED');
+});
+document.getElementById('home-btn').addEventListener('click', () => publish({ type: 'home' }));
+document.getElementById('stop-btn').addEventListener('click', () => publish({ type: 'command', text: 'stop' }));
+
 async function connect() {
   const btn = document.getElementById('connect-btn');
   btn.disabled = true;
@@ -227,19 +390,29 @@ async function connect() {
 
   room.on(RoomEvent.Connected, () => {
     connected = true;
-    setStatus('connected', 'connected');
+    setStatus('connected — waiting for agent…', 'connected');
     log(`joined room: ${roomName}`, 'msg-sys');
-    document.getElementById('cmd').disabled = false;
-    document.getElementById('send-btn').disabled = false;
+    log('waiting for rax-gaze-agent to join…', 'msg-sys');
+    setControlsEnabled(true);
     document.getElementById('cmd').focus();
+  });
+
+  room.on(RoomEvent.ParticipantConnected, (p) => {
+    log(`participant joined: ${p.identity}`, 'msg-sys');
+    if (p.identity.includes('agent') || p.identity.includes('rax')) {
+      setStatus('agent connected', 'connected');
+    }
+  });
+
+  room.on(RoomEvent.ParticipantDisconnected, (p) => {
+    log(`participant left: ${p.identity}`, 'msg-sys');
   });
 
   room.on(RoomEvent.Disconnected, () => {
     connected = false;
     setStatus('disconnected', '');
     log('disconnected', 'msg-sys');
-    document.getElementById('cmd').disabled = true;
-    document.getElementById('send-btn').disabled = true;
+    setControlsEnabled(false);
     btn.disabled = false;
     hideVideo();
   });
@@ -329,14 +502,7 @@ async function sendCmd() {
   if (!text || !connected) return;
   input.value = '';
   log('You: ' + text, 'msg-user');
-
-  // Send as text message into the room — agent listens for these
-  try {
-    const enc = new TextEncoder().encode(JSON.stringify({ type: 'command', text }));
-    await room.localParticipant.publishData(enc, { reliable: true });
-  } catch(e) {
-    log('send failed: ' + e, 'msg-sys');
-  }
+  publish({ type: 'command', text });
 }
 
 function hideVideo() {

@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -56,7 +57,8 @@ logger = logging.getLogger(__name__)
 # Config from environment
 # ---------------------------------------------------------------------------
 
-REALTIME_MODEL   = "gemini-3.1-flash-audio-eap"
+REALTIME_MODEL   = "gemini-2.5-flash-native-audio-preview-12-2025"  # plugin default
+VISION_MODEL     = "gemini-2.5-flash"
 ROBOT_PORT       = os.environ.get("ROBOT_PORT", "")
 ROBOT_URDF       = os.environ.get("ROBOT_URDF", "SO101/so101_new_calib.urdf")
 GRIPPER_CAM_TF   = os.environ.get("GRIPPER_CAM_TF", "0.04,0,0.09,-0.2690,0.2824,-1.6014")
@@ -73,7 +75,8 @@ When the user asks what the robot sees, what's on the table, or where an object 
 
 Your tools:
 - look: capture the robot's camera and answer a question about what it sees.
-- gaze_robot: command the SO-101 arm to find and grasp a named object.
+- gaze_robot: command the SO-101 arm to find and grasp a named object. The robot stays on standby between commands — no reload needed.
+- drop_object: open the gripper to release whatever the robot is holding.
 - stop_robot: immediately stop the arm.
 - robot_status: ask what the arm is currently doing.
 
@@ -81,7 +84,8 @@ Workflow:
 1. If the user asks what you see → call look("what do you see?").
 2. If they describe or point at an object → confirm, then call gaze_robot("object name").
 3. Narrate the robot state as it searches → approaches → grasps.
-4. Celebrate success or diagnose failure.
+4. After grasping, you can call drop_object() when asked to release.
+5. Celebrate success or diagnose failure.
 
 Keep responses short and energetic — this is a live hackathon demo.
 Never invent visual details you cannot actually see — use look() to check."""
@@ -90,189 +94,311 @@ Never invent visual details you cannot actually see — use look() to check."""
 # GazeRunner — manages GazeEngine in a background thread
 # ---------------------------------------------------------------------------
 
-class _GazeRunner:
-    """Runs a single gaze-pick task synchronously in a worker thread.
+LEROBOT_PYTHON  = "/home/labot/.venv/lerobot/bin/python"
+LEROBOT_SERVER  = str(Path(__file__).resolve().parent / "lero_server.py")
+LEROBOT_CONFIG  = "/mnt/c/Users/labot/Documents/lerobot/configs/gaze_engine_zmq.yaml"
+LEROBOT_CWD     = "/mnt/c/Users/labot/Documents/lerobot"
 
-    Thread-safe state is exposed via ``state``, ``final_state``, and ``log``.
+
+class _PersistentGaze:
+    """Persistent lerobot gaze server: loads YOLO+robot ONCE, accepts queries via stdin.
+
+    lero_server.py starts at agent launch. The slow YOLO/robot init (~20 s) happens
+    in the background so by the time the user says "pick up X" everything is warm.
+    Subsequent queries send a single stdin line — no reload, ~1 s latency.
     """
 
-    def __init__(
-        self,
-        query: str,
-        approach_style: str = GAZE_APPROACH,
-        max_ticks: int = 600,
-        loop_hz: float = 20.0,
-        on_state_change: "callable | None" = None,
-    ) -> None:
-        self.query          = query
-        self.approach_style = approach_style
-        self.max_ticks      = max_ticks
-        self.loop_hz        = loop_hz
-        self.on_state_change = on_state_change  # called(state) on each transition
-
-        self.state       = "INIT"
+    def __init__(self) -> None:
+        self.state        = "IDLE"
+        self.query: str | None = None
         self.final_state: str | None = None
         self.log: list[str] = []
+        self.on_state_change: "callable | None" = None
+        self._proc: "subprocess.Popen | None" = None
+        self._ready       = False   # True once "READY" seen from server stdout
+        self._busy        = False   # True while a query is running
+        self._starting    = False   # True while a launch is in flight (prevents double-spawn)
+        self._pending: str | None = None   # query queued to run as soon as READY
+        self._start_time: float | None = None   # perf_counter when launch began
+        self._lock        = threading.Lock()
+        self._arm         = None    # kept None; camera stream falls back to blank
 
-        self._stop = threading.Event()
-        self._arm  = None   # set inside the thread
-        self._viz  = None   # RerunViz if available
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-    # -- public API -------------------------------------------------------
+    def start(self) -> None:
+        """Launch lero_server.py in the background; it pre-loads YOLO+robot."""
+        with self._lock:
+            if self._starting:
+                return   # a launch is already in flight
+            self._starting = True
+        t = threading.Thread(target=self._launch_server, daemon=True)
+        t.start()
 
-    def run_until_done(self) -> None:
-        """Blocking: open hardware, run engine, close hardware. Call in a thread."""
+    def _ensure_running(self) -> None:
+        """(Re)start the daemon if it isn't alive — e.g. after a crash (OFFLINE)."""
+        with self._lock:
+            proc = self._proc
+            starting = self._starting
+        if starting:
+            return
+        if proc is not None and proc.poll() is None:
+            return   # already running
+        self._note("daemon not running — (re)starting")
+        self.start()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
+    def request_pick(self, query: str) -> str:
+        """Pick now if ready; otherwise queue the query and make sure the daemon is coming up.
+
+        Returns one of:
+          "picking" — sent to a ready arm, task started
+          "queued"  — arm still loading (or crashed); will auto-run on READY
+          "busy"    — arm ready but mid-task; caller should say "stop" first
+        """
+        with self._lock:
+            proc  = self._proc
+            ready = self._ready
+            busy  = self._busy
+
+        # Daemon down / crashed → queue and (re)launch.
+        if proc is None or proc.poll() is not None:
+            with self._lock:
+                self._pending = query
+            self._ensure_running()
+            return "queued"
+
+        # Still loading → queue; _launch_server dispatches it when READY.
+        if not ready:
+            with self._lock:
+                self._pending = query
+            return "queued"
+
+        if busy:
+            return "busy"
+
+        return "picking" if self.pick(query) else "busy"
+
+    def pick(self, query: str) -> bool:
+        """Send a query to the running server. Returns False if busy or not ready."""
+        with self._lock:
+            proc = self._proc
+            busy = self._busy
+            ready = self._ready
+
+        if proc is None or proc.poll() is not None:
+            self._note("server not running — pick() ignored")
+            return False
+        if busy:
+            return False   # currently executing a task
+
+        self.query       = query
+        self.final_state = None
+        with self._lock:
+            self._busy = True
+
         try:
-            self._setup()
-            self._loop()
+            proc.stdin.write(query + "\n")
+            proc.stdin.flush()
         except Exception as exc:
-            logger.exception("[GazeRunner] fatal: %s", exc)
-            self._note(f"FAILED: {exc}")
-            self.state = self.final_state = "FAILED"
-        finally:
-            self._teardown()
+            self._note(f"stdin write failed: {exc}")
+            with self._lock:
+                self._busy = False
+            return False
 
-    def stop(self) -> None:
-        """Signal the engine to stop after the current tick."""
-        self._stop.set()
+        self.state = "SEARCH"
+        if self.on_state_change:
+            self.on_state_change("SEARCH")
+        return True
 
-    def stopped(self) -> bool:
-        return self._stop.is_set()
+    def send_raw(self, cmd: str) -> bool:
+        """Send a raw command line to the server stdin. Returns False if server is down or busy."""
+        with self._lock:
+            proc = self._proc
+            busy = self._busy
+        if proc is None or proc.poll() is not None:
+            return False
+        if busy:
+            return False
+        with self._lock:
+            self._busy = True
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+            return True
+        except Exception:
+            with self._lock:
+                self._busy = False
+            return False
 
-    # -- internals --------------------------------------------------------
+    def send_jog(self, cmd: str) -> bool:
+        """Fire-and-forget stdin line for manual jog / gripper.
+
+        Unlike send_raw it does NOT set the busy latch — jog produces no
+        protocol reply, so a latch would stick and block every later jog. Still
+        refuses while an autonomous task owns the arm (busy True)."""
+        with self._lock:
+            proc = self._proc
+            busy = self._busy
+        if proc is None or proc.poll() is not None or busy:
+            return False
+        try:
+            with self._lock:
+                proc.stdin.write(cmd + "\n")
+                proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def stop_task(self) -> None:
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            try:
+                proc.stdin.write("STOP\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+        self.state = "STOPPED"
+        with self._lock:
+            self._busy = False
+        if self.on_state_change:
+            self.on_state_change("STOPPED")
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
     def _note(self, msg: str) -> None:
-        logger.info("[GazeRunner] %s", msg)
+        logger.info("[LeroGaze] %s", msg)
         self.log.append(msg)
 
-    def _setup(self) -> None:
-        from models.depth import make_stereo
-        from models.detection import make_detector, make_mask_tracker
-        from perception.depth_cloud import CloudTracker, PointCloudStream
-        from manipulation.arms.gaze_engine import GazeConfig, GazeEngine, DONE, FAILED
-        if USE_RERUN:
-            from perception.depth_cloud.rerun_viz import RerunViz
-            self._viz = RerunViz.try_create(session="rax_gaze_agent", spawn=True)
+    def _launch_server(self) -> None:
+        """Start lero_server.py and stream its stdout, updating state from protocol lines."""
+        import subprocess as _sp
+        import os as _os
 
-        self._note(f"opening arm  mock={USE_MOCK}  query={self.query!r}")
+        env = dict(_os.environ)
+        env["LERO_CONFIG"] = LEROBOT_CONFIG
 
-        if USE_MOCK:
-            from manipulation.arms.mock_arm import WORLD_UP, MockArm
-            from manipulation.arms.kinematics import CartesianKinematics
-            import numpy as np
-
-            self._arm = MockArm()
-            kin       = CartesianKinematics()
-            T_ee_cam  = np.eye(4)
-            world_up  = WORLD_UP
-        else:
-            from robots.arms.lerobot_so101.driver import So101Arm
-            self._arm = So101Arm(
-                port=ROBOT_PORT or self._auto_detect_port(),
-                urdf=ROBOT_URDF,
-                gripper_camera_tf=GRIPPER_CAM_TF,
-            )
-            kin      = self._arm.kin
-            T_ee_cam = self._arm.T_ee_cam
-            import numpy as np
-            world_up = np.array([0.0, 0.0, 1.0])
-
-        # detector
-        det_backend = GAZE_DETECTOR
-        if det_backend == "auto":
-            from models.detection.prompt_detector import _HSV_RANGES
-            words = self.query.lower().split()
-            det_backend = "color_blob" if any(w in _HSV_RANGES for w in words) else "blob"
-        if USE_MOCK:
-            det_backend = "color_blob"
-
-        detector     = make_detector(det_backend)
-        mask_tracker = make_mask_tracker("ellipse" if USE_MOCK else "auto")
-        stereo       = make_stereo("sgbm" if USE_MOCK else GAZE_STEREO)
-
-        stream = PointCloudStream()
-        cloud  = CloudTracker(
-            detector, mask_tracker, stereo, self.query,
-            detect_every=5, stream=stream,
-        )
-
-        cfg = GazeConfig(
-            T_ee_cam=T_ee_cam,
-            world_up=world_up,
-            approach_style=self.approach_style,
-        )
-        self._cloud  = cloud
-        self._engine = GazeEngine(
-            self._arm, kin, cloud, cfg,
-            cartesian=USE_MOCK,
-        )
-        self._DONE   = "DONE"
-        self._FAILED = "FAILED"
-
-    def _loop(self) -> None:
-        dt     = 1.0 / max(1.0, self.loop_hz)
-        engine = self._engine
-
-        for _ in range(self.max_ticks):
-            if self._stop.is_set():
-                self._note("stopped by user")
-                self.final_state = "STOPPED"
-                if self.on_state_change:
-                    self.on_state_change("STOPPED")
-                return
-
-            prev = self.state
-            s    = engine.step(dt)
-            self.state = s
-
-            if s != prev:
-                self._note(f"→ {s}")
-                if self.on_state_change:
-                    self.on_state_change(s)
-
-            # Stream to Rerun viewer
-            if self._viz is not None:
-                try:
-                    obs   = self._arm.get_observation()
-                    u_aim = getattr(engine, '_u_aim', None)
-                    v_aim = getattr(engine, '_v_aim', None)
-                    self._viz.log(obs, self._cloud, state=s, u_aim=u_aim, v_aim=v_aim)
-                except Exception:
-                    pass
-
-            if s in (self._DONE, self._FAILED):
-                break
-
-            time.sleep(dt)
-
-        self.final_state = self.state
+        cmd = [LEROBOT_PYTHON, LEROBOT_SERVER]
+        self._note(f"starting lero_server: {' '.join(cmd)}")
+        self._start_time = time.perf_counter()
+        self.state = "LOADING"
         if self.on_state_change:
-            self.on_state_change(self.final_state)
-        self._note(f"finished: {self.final_state}")
+            self.on_state_change("LOADING")
 
-    def _teardown(self) -> None:
-        arm = self._arm
-        if arm is None:
-            return
         try:
-            if USE_MOCK:
-                pass
-            else:
-                arm.disconnect()
-        except Exception:
-            pass
-        self._arm = None
+            proc = _sp.Popen(
+                cmd,
+                stdin=_sp.PIPE,
+                stdout=_sp.PIPE,
+                stderr=_sp.STDOUT,
+                text=True,
+                cwd=LEROBOT_CWD,
+                env=env,
+            )
+            with self._lock:
+                self._proc     = proc
+                self._starting = False
 
-    @staticmethod
-    def _auto_detect_port() -> str:
-        import glob as _glob
-        for pat in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS[2-9]"):
-            cands = sorted(_glob.glob(pat))
-            if cands:
-                return cands[0]
-        raise RuntimeError(
-            "No serial port found for SO-101. Set ROBOT_PORT=/dev/ttyACMx"
-        )
+            for raw in proc.stdout:
+                line = raw.rstrip()
+                if not line:
+                    continue
+                self._note(line)
+                print(f"[lero-server] {line}", flush=True)
+
+                upper = line.upper()
+
+                if line == "READY":
+                    with self._lock:
+                        self._ready   = True
+                        pending       = self._pending
+                        self._pending = None
+                    elapsed = (
+                        time.perf_counter() - self._start_time
+                        if self._start_time else 0.0
+                    )
+                    self._note(f"READY in {elapsed:.1f}s")
+                    self.state = "READY"
+                    if self.on_state_change:
+                        self.on_state_change("READY")
+                    if pending:
+                        self._note(f"auto-dispatching queued pick: {pending!r}")
+                        self.pick(pending)
+
+                elif upper.startswith("STARTING "):
+                    pass  # query echo
+
+                elif upper.startswith("STATE "):
+                    kw = line[6:].strip().upper()
+                    self.state = kw
+                    if self.on_state_change:
+                        self.on_state_change(kw)
+
+                elif upper in ("DONE", "DROPPED", "HOME"):
+                    self.state = self.final_state = upper
+                    with self._lock:
+                        self._busy = False
+                    if self.on_state_change:
+                        self.on_state_change(upper)
+
+                elif upper.startswith("FAILED"):
+                    self.state = self.final_state = "FAILED"
+                    with self._lock:
+                        self._busy = False
+                    if self.on_state_change:
+                        self.on_state_change("FAILED")
+
+                elif upper == "STOPPED":
+                    self.state = "STOPPED"
+                    with self._lock:
+                        self._busy = False
+                    if self.on_state_change:
+                        self.on_state_change("STOPPED")
+
+                else:
+                    # Parse lerobot log lines for state keywords
+                    for kw in ("SEARCH", "APPROACH", "GRASP", "PLACE", "PREPOSITION"):
+                        if kw in upper:
+                            self.state = kw
+                            if self.on_state_change:
+                                self.on_state_change(kw)
+                            break
+
+            proc.wait()
+            rc = proc.returncode
+            self._note(f"lero_server exited rc={rc}")
+            with self._lock:
+                self._ready    = False
+                self._busy     = False
+                self._starting = False
+            self.state = "OFFLINE"
+            if self.on_state_change:
+                self.on_state_change("OFFLINE")
+
+        except Exception as exc:
+            self._note(f"server error: {exc}")
+            with self._lock:
+                self._ready    = False
+                self._starting = False
+            self.state = "OFFLINE"
+            if self.on_state_change:
+                self.on_state_change("OFFLINE")
 
 
 # ---------------------------------------------------------------------------
@@ -281,14 +407,10 @@ class _GazeRunner:
 
 async def _stream_robot_camera(
     room: rtc.Room,
-    runner_ref: list[_GazeRunner | None],
+    gaze: "_PersistentGaze",
     fps: int = 15,
 ) -> None:
-    """Continuously publish the robot's OAK-D left frame as a LiveKit video track.
-
-    Reads frames directly from the arm that the current GazeRunner holds.
-    Falls back to a black 640×400 frame when the arm is idle.
-    """
+    """Publish the robot's camera as a LiveKit video track. Reads from the persistent arm."""
     import numpy as np
     import cv2
 
@@ -299,35 +421,24 @@ async def _stream_robot_camera(
     await room.local_participant.publish_track(track, opts)
     logger.info("[robot-cam] published robot-eye video track")
 
-    blank = np.zeros((H, W, 4), dtype=np.uint8)  # RGBA black
-
+    blank    = np.zeros((H, W, 4), dtype=np.uint8)
     interval = 1.0 / fps
+
     while True:
         try:
-            runner = runner_ref[0]
-            frame_bgr = None
-            if runner is not None and not USE_MOCK:
-                arm = runner._arm
-                if arm is not None:
-                    try:
-                        frame_bgr = arm.latest_left_bgr()
-                    except Exception:
-                        pass
-
+            frame_bgr = await asyncio.to_thread(_grab_zmq_frame)
             if frame_bgr is not None:
-                frame_resized = cv2.resize(frame_bgr, (W, H))
-                rgba = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGBA)
+                rgba = cv2.cvtColor(cv2.resize(frame_bgr, (W, H)), cv2.COLOR_BGR2RGBA)
             else:
                 rgba = blank
 
-            vf = rtc.VideoFrame(
+            source.capture_frame(rtc.VideoFrame(
                 width=W, height=H,
                 type=rtc.VideoBufferType.RGBA,
                 data=rgba.tobytes(),
-            )
-            source.capture_frame(vf)
+            ))
         except Exception as exc:
-            logger.debug("[robot-cam] frame error: %s", exc)
+            logger.debug("[robot-cam] %s", exc)
 
         await asyncio.sleep(interval)
 
@@ -341,91 +452,71 @@ class GazeRobotAgent(Agent):
 
     def __init__(self, room: rtc.Room) -> None:
         super().__init__(instructions=PERSONA)
-        self._room       = room
-        self._runner: _GazeRunner | None = None
-        self._runner_ref: list[_GazeRunner | None] = [None]  # shared with camera streamer
-        self._executor   = None   # ThreadPoolExecutor set in on_session_start
+        self._room  = room
+        self._gaze  = _PersistentGaze()   # initialized once, never torn down per-query
 
     # ---- lifecycle ------------------------------------------------------
 
     async def on_enter(self) -> None:
-        import concurrent.futures
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gaze")
-        asyncio.create_task(_stream_robot_camera(self._room, self._runner_ref))
-        logger.info("[GazeRobotAgent] entered")
+        loop = asyncio.get_running_loop()
+
+        def on_state(state: str):
+            loop.call_soon_threadsafe(
+                lambda s=state: asyncio.ensure_future(
+                    _broadcast(self._room, {"type": "state", "state": s})
+                )
+            )
+
+        self._gaze.on_state_change = on_state
+        self._gaze.start()   # launches background thread; arm init happens there
+        logger.info("[GazeRobotAgent] persistent gaze engine started")
+
+    def start_camera_stream(self) -> None:
+        asyncio.create_task(_stream_robot_camera(self._room, self._gaze))
 
     # ---- function tools -------------------------------------------------
 
     @function_tool()
-    async def gaze_robot(
-        self,
-        context: RunContext,
-        query: str,
-        approach: str = GAZE_APPROACH,
-    ) -> str:
+    async def gaze_robot(self, context: RunContext, query: str) -> str:
         """Command the SO-101 arm to find and grasp the named object.
 
-        Starts the gaze engine in the background and returns immediately.
-        The arm will search, approach, and grasp autonomously.
+        The gaze engine is always running in the background — this just
+        gives it a new target. No reload delay.
 
         Args:
             query: Natural-language object description, e.g. "red cube" or "blue block".
-            approach: How the gripper comes in — "angled" (default), "topdown", or "horizontal".
         """
-        if self._runner is not None and self._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-            return (
-                f"Arm is already running (state={self._runner.state}, query={self._runner.query!r}). "
-                "Call stop_robot first."
-            )
+        result = self._gaze.request_pick(query)
+        if result == "busy":
+            return f"Arm is busy (state={self._gaze.state}). Say stop first."
+        if result == "queued":
+            return f"Arm is still warming up (state={self._gaze.state}). I've queued {query!r} — it'll start automatically as soon as the arm is ready."
+        return f"Searching for {query!r}. Call robot_status() to track progress."
 
-        runner = _GazeRunner(query=query, approach_style=approach)
-        self._runner             = runner
-        self._runner_ref[0]      = runner
-
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(self._executor, runner.run_until_done)
-
-        return (
-            f"Gaze engine started — searching for {query!r} "
-            f"(approach={approach}). Call robot_status() to check progress."
-        )
+    @function_tool()
+    async def drop_object(self, context: RunContext) -> str:
+        """Open the gripper to release whatever the robot is holding. Robot stays on standby."""
+        if not self._gaze._ready:
+            return "Arm not ready."
+        ok = self._gaze.send_raw("DROP")
+        return "Dropping object — gripper opening." if ok else f"Busy (state={self._gaze.state})."
 
     @function_tool()
     async def stop_robot(self, context: RunContext) -> str:
-        """Stop the robot arm immediately and cancel the current gaze task."""
-        if self._runner is None:
-            return "Robot is already idle."
-        self._runner.stop()
-        state = self._runner.state
-        self._runner         = None
-        self._runner_ref[0]  = None
-        return f"Stop signal sent (was in state={state})."
+        """Stop the current gaze task. Arm stays connected and ready for the next command."""
+        self._gaze.stop_task()
+        return f"Stop sent (state was {self._gaze.state})."
 
     @function_tool()
     async def robot_status(self, context: RunContext) -> str:
-        """Return the current state of the gaze engine and recent log messages."""
-        if self._runner is None:
-            return "Robot is idle (no active task)."
-        r = self._runner
-        recent = "\n".join(r.log[-5:]) if r.log else "(no log yet)"
-        return (
-            f"Query: {r.query!r}\n"
-            f"State: {r.state}\n"
-            f"Final: {r.final_state or 'running'}\n"
-            f"Recent log:\n{recent}"
-        )
+        """Return the current gaze engine state and recent log."""
+        g = self._gaze
+        recent = "\n".join(g.log[-5:]) if g.log else "(no log yet)"
+        return f"Query: {g.query!r}\nState: {g.state}\nFinal: {g.final_state or 'running'}\n{recent}"
 
     @function_tool()
     async def look(self, context: RunContext, question: str = "What do you see?") -> str:
-        """Look through the robot's camera and answer a question about the scene.
-
-        Captures the current robot camera frame and asks Gemini Flash to describe it.
-        Use this when the user asks what the robot sees, what's on the table, where
-        an object is, or any question about the robot's point of view.
-
-        Args:
-            question: The question to answer about the robot's view.
-        """
+        """Look through the robot's camera and answer a question about the scene."""
         return await _look(self, question)
 
 
@@ -433,31 +524,36 @@ class GazeRobotAgent(Agent):
 # Shared look() implementation (used by function tool AND direct text dispatch)
 # ---------------------------------------------------------------------------
 
+ZMQ_CAM_HOST = os.environ.get("ZMQ_CAM_HOST", "172.17.240.1")
+ZMQ_CAM_PORT = int(os.environ.get("ZMQ_CAM_PORT", "5555"))
+
+
+def _grab_zmq_frame():
+    """Grab one BGR frame from the OAK-D ZMQ PUB server (runs in a thread)."""
+    try:
+        import zmq, numpy as np, cv2, json, base64
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        sock.connect(f"tcp://{ZMQ_CAM_HOST}:{ZMQ_CAM_PORT}")
+        raw = sock.recv_string()
+        sock.close()
+        msg = json.loads(raw)
+        buf = base64.b64decode(msg["images"]["color"])
+        arr = np.frombuffer(buf, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
 async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> str:
     import cv2
 
-    frame_bgr = None
-    runner = agent._runner
-    if runner is not None and runner._arm is not None:
-        try:
-            if USE_MOCK:
-                obs = runner._arm.get_observation()
-                frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
-            else:
-                frame_bgr = runner._arm.latest_left_bgr()
-        except Exception:
-            pass
-
-    if frame_bgr is None and USE_MOCK:
-        try:
-            from manipulation.arms.mock_arm import MockArm
-            obs = MockArm().get_observation()
-            frame_bgr = cv2.cvtColor(obs.left, cv2.COLOR_RGB2BGR)
-        except Exception as e:
-            return f"Could not capture frame: {e}"
-
+    frame_bgr = await asyncio.to_thread(_grab_zmq_frame)
     if frame_bgr is None:
-        return "Robot camera not active."
+        return "Robot camera not active — ZMQ camera server unreachable."
 
     _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     try:
@@ -466,7 +562,7 @@ async def _look(agent: "GazeRobotAgent", question: str = "What do you see?") -> 
         client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
         resp = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.0-flash",
+            model=VISION_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg"),
                 question,
@@ -495,11 +591,44 @@ async def _broadcast_state(room: rtc.Room, state: str) -> None:
 
 @server.rtc_session(agent_name="rax-gaze-agent")
 async def entrypoint(ctx: agents.JobContext) -> None:
-    logger.info("[entrypoint] job received, connecting…")
-    await ctx.connect()
-    logger.info("[entrypoint] connected to room: %s", ctx.room.name)
+    print(f"\n>>> [RAX] job received for room: {ctx.room.name}", flush=True)
 
     robot_agent = GazeRobotAgent(room=ctx.room)
+    loop = asyncio.get_running_loop()
+
+    # Register data_received BEFORE connecting so we never miss a message
+    @ctx.room.on("data_received")
+    def on_data(packet: rtc.DataPacket):
+        try:
+            msg = json.loads(packet.data.decode())
+        except Exception:
+            return
+        mtype = msg.get("type")
+
+        # ── Manual teleop from the phone UI (fast, silent, no TTS) ──
+        if mtype == "jog":
+            try:
+                f = float(msg.get("f", 0.0))
+                r = float(msg.get("r", 0.0))
+                u = float(msg.get("u", 0.0))
+            except (TypeError, ValueError):
+                return
+            robot_agent._gaze.send_jog(f"MOVE {f:.4f} {r:.4f} {u:.4f}")
+            return
+        if mtype == "grip":
+            robot_agent._gaze.send_jog("GRIP OPEN" if msg.get("open") else "GRIP CLOSE")
+            return
+        if mtype == "home":
+            robot_agent._gaze.send_raw("HOME")
+            return
+
+        if mtype != "command":
+            return
+        text = msg.get("text", "").strip()
+        if not text:
+            return
+        print(f">>> [RAX] text command: {text!r}", flush=True)
+        loop.create_task(_dispatch_text(robot_agent, session, ctx.room, text))
 
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
@@ -507,44 +636,24 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             voice="Aoede",
         ),
     )
+
+    # start session first (hackathon-starter pattern), then connect
     await session.start(room=ctx.room, agent=robot_agent)
-    logger.info("[entrypoint] session started")
+    await ctx.connect()
+    robot_agent.start_camera_stream()  # safe now — room is connected
+    print(f">>> [RAX] connected. Participants: {list(ctx.room.remote_participants.keys())}", flush=True)
 
-    loop = asyncio.get_running_loop()
-
-    # ----------------------------------------------------------------
-    # Text commands from the browser demo UI
-    # ----------------------------------------------------------------
-    # Realtime (audio) models don't accept text injection via generate_reply,
-    # so we parse intent directly and dispatch to the arm + session.say().
-    # ----------------------------------------------------------------
-    @ctx.room.on("data_received")
-    def on_data(packet: rtc.DataPacket):
-        try:
-            raw = packet.data.decode()
-            msg = json.loads(raw)
-        except Exception:
-            return
-        if msg.get("type") != "command":
-            return
-        text = msg.get("text", "").strip()
-        if not text:
-            return
-        logger.info("[entrypoint] text command: %r", text)
-        loop.create_task(_dispatch_text(robot_agent, session, ctx.room, text))
-
-    # Greet on startup
-    try:
-        arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
-        await session.say(
-            f"RAX gaze robot online. Running {arm_desc}. "
-            "Tell me what to pick up, or ask what I see."
-        )
-    except Exception as exc:
-        logger.warning("[entrypoint] greeting failed: %s", exc)
+    arm_desc = "mock arm" if USE_MOCK else f"SO-101 on {ROBOT_PORT or 'auto-detect'}"
+    greeting = (
+        f"RAX gaze robot online. Running {arm_desc}. "
+        f"Loading YOLO and connecting arm in the background — "
+        f"tell me what to pick up and I'll be ready in about 20 seconds."
+    )
+    await _say(session, ctx.room, greeting)
 
 
 _PICK_WORDS  = {"pick", "grab", "get", "take", "grasp", "fetch", "lift"}
+_DROP_WORDS  = {"drop", "release", "put", "place", "let"}
 _LOOK_WORDS  = {"see", "look", "what", "describe", "show", "view", "scene", "there", "visible"}
 _STOP_WORDS  = {"stop", "halt", "cancel", "freeze", "abort"}
 _STATUS_WORDS = {"status", "state", "doing", "happening", "progress"}
@@ -557,39 +666,40 @@ async def _dispatch_text(
     text: str,
 ) -> None:
     """Parse a browser text command and dispatch to gaze engine or look()."""
+    print(f">>> [dispatch] {text!r}", flush=True)
     words = set(text.lower().split())
 
     # ── STOP ──
     if words & _STOP_WORDS:
-        if agent._runner:
-            agent._runner.stop()
-            agent._runner = None
-            agent._runner_ref[0] = None
-            await session.say("Stopping the arm.")
+        agent._gaze.stop_task()
+        await _say(session, room, "Stopping the arm.")
+        return
+
+    # ── DROP / RELEASE ──
+    if words & _DROP_WORDS and not (words & _PICK_WORDS):
+        ok = agent._gaze.send_raw("DROP")
+        if ok:
+            await _say(session, room, "Releasing — opening gripper.")
         else:
-            await session.say("Arm is already idle.")
+            await _say(session, room, f"Can't drop right now (state={agent._gaze.state}).")
         return
 
     # ── STATUS ──
     if words & _STATUS_WORDS:
-        if agent._runner:
-            r = agent._runner
-            msg = f"State is {r.state}, query is {r.query}."
-        else:
-            msg = "Arm is idle, no active task."
-        await session.say(msg)
+        g = agent._gaze
+        msg = f"State is {g.state}" + (f", query is {g.query!r}." if g.query else ".")
+        await _say(session, room, msg)
         return
 
     # ── LOOK / DESCRIBE ──
     if words & _LOOK_WORDS and not (words & _PICK_WORDS):
         await _broadcast(room, {"type": "log", "text": f"Looking… ({text})"})
         result = await _look(agent, text)
-        await session.say(result)
-        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:120]}"})
+        await _broadcast(room, {"type": "log", "text": f"Vision: {result[:200]}"})
+        await _say(session, room, result)
         return
 
     # ── PICK UP / GRASP ──
-    # Extract object name: everything after pick/grab/get/… keyword
     query = text
     for w in sorted(_PICK_WORDS, key=len, reverse=True):
         for phrase in (f"{w} up the ", f"{w} up a ", f"{w} up ", f"{w} the ", f"{w} a ", f"{w} "):
@@ -598,31 +708,22 @@ async def _dispatch_text(
                 break
 
     if not query or query == text.lower():
-        # no keyword — treat whole input as the object description
         query = text
 
     logger.info("[dispatch] gaze_robot query=%r", query)
-    await _broadcast(room, {"type": "log", "text": f"Gaze engine starting: {query!r}"})
-    await _broadcast(room, {"type": "state", "state": "SEARCH"})
+    result = agent._gaze.request_pick(query)
 
-    if agent._runner and agent._runner.state not in ("DONE", "FAILED", "STOPPED", "INIT"):
-        await session.say(f"Already running — state is {agent._runner.state}. Say stop first.")
+    if result == "busy":
+        await _say(session, room, f"Already busy (state={agent._gaze.state}). Say stop first.")
         return
 
-    await session.say(f"On it. Searching for {query}.")
+    if result == "queued":
+        await _broadcast(room, {"type": "log", "text": f"Queued {query!r} — arm warming up ({agent._gaze.state})"})
+        await _say(session, room, f"Warming up the arm — I'll grab the {query} as soon as it's ready.")
+        return
 
-    def on_state(state: str):
-        asyncio.get_running_loop().call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_broadcast(room, {"type": "state", "state": state}))
-        )
-
-    runner = _GazeRunner(query=query, on_state_change=on_state)
-    agent._runner        = runner
-    agent._runner_ref[0] = runner
-
-    executor = agent._executor or __import__('concurrent.futures').futures.ThreadPoolExecutor(1)
-    agent._executor = executor
-    asyncio.get_running_loop().run_in_executor(executor, runner.run_until_done)
+    await _broadcast(room, {"type": "log", "text": f"Gaze engine: {query!r}"})
+    await _say(session, room, f"On it. Searching for {query}.")
 
 
 async def _broadcast(room: rtc.Room, msg: dict) -> None:
@@ -630,6 +731,15 @@ async def _broadcast(room: rtc.Room, msg: dict) -> None:
         await room.local_participant.publish_data(json.dumps(msg).encode(), reliable=True)
     except Exception as e:
         logger.debug("[broadcast] %s", e)
+
+
+async def _say(session: "AgentSession", room: rtc.Room, text: str) -> None:
+    """Speak text via Gemini if running, otherwise send as browser log."""
+    print(f">>> [say] {text!r}", flush=True)
+    try:
+        await session.say(text)
+    except Exception:
+        await _broadcast(room, {"type": "reply", "text": text})
 
 
 

@@ -62,6 +62,7 @@ class CartesianKinematics:
     """
 
     joint_names = ["x", "y", "z", "rx", "ry", "rz"]
+    # no urdf_dir — rerun_viz detects absence and uses fallback line-strip path
 
     def forward_kinematics(self, q_deg: np.ndarray) -> np.ndarray:
         return xyzrpy_to_pose(q_deg)
@@ -75,6 +76,11 @@ class CartesianKinematics:
         orientation_weight: float = 0.05,
     ) -> np.ndarray:
         return pose_to_xyzrpy(T_target)
+
+    def get_link_transforms_chain(self, q_deg: np.ndarray) -> list[tuple[str, np.ndarray]]:
+        """Two-link chain for Rerun: base origin → EE. Enables ground grid + EE axes."""
+        T_ee = self.forward_kinematics(q_deg)
+        return [("base", np.eye(4)), ("ee", T_ee)]
 
 
 class PlacoKinematics:

@@ -152,35 +152,84 @@ class RerunViz:
 
         # lerobot sim3d: URDF meshes, object cube proxy, ground grid.
         if kin is not None:
-            try:
-                from lerobot.utils.manipulation_sim3d import log_manipulation_sim3d
+            lk = getattr(kin, "_kin", kin)
+            # log_manipulation_sim3d needs urdf_dir; skip it for mock/CartesianKinematics
+            # (it swallows NoneType internally, so _log_arm_chain_fallback never fires)
+            has_urdf = getattr(lk, "urdf_dir", None) is not None
+            if has_urdf:
+                try:
+                    from lerobot.utils.manipulation_sim3d import log_manipulation_sim3d
 
-                lk = getattr(kin, "_kin", kin)
-                centers, halves, labels, focus_i = None, None, None, None
-                if p_target is not None:
-                    centers = np.asarray(p_target, dtype=np.float64).reshape(1, 3)
-                    halves = np.array([[0.025, 0.025, 0.025]], dtype=np.float64)
-                    labels = [focus.label if focus else "target"]
-                    focus_i = 0
-                log_manipulation_sim3d(
-                    frame_sequence=self._frame,
-                    kinematics=lk,
-                    joint_deg=np.asarray(obs.joints_deg, dtype=np.float64),
-                    object_centers_base=centers,
-                    object_half_sizes_base=halves,
-                    object_labels=labels,
-                    focus_object_index=focus_i,
-                    plan_summary=f"state={state}" + (f" d={depth_m:.2f}m" if depth_m else ""),
-                    ground_plane_z_m=0.0,
-                )
-            except Exception as e:
-                logger.debug("[rerun] sim3d: %s", e)
+                    centers, halves, labels, focus_i = None, None, None, None
+                    if p_target is not None:
+                        centers = np.asarray(p_target, dtype=np.float64).reshape(1, 3)
+                        halves = np.array([[0.025, 0.025, 0.025]], dtype=np.float64)
+                        labels = [focus.label if focus else "target"]
+                        focus_i = 0
+                    log_manipulation_sim3d(
+                        frame_sequence=self._frame,
+                        kinematics=lk,
+                        joint_deg=np.asarray(obs.joints_deg, dtype=np.float64),
+                        object_centers_base=centers,
+                        object_half_sizes_base=halves,
+                        object_labels=labels,
+                        focus_object_index=focus_i,
+                        plan_summary=f"state={state}" + (f" d={depth_m:.2f}m" if depth_m else ""),
+                        ground_plane_z_m=0.0,
+                    )
+                except Exception as e:
+                    logger.debug("[rerun] sim3d: %s", e)
+                    self._log_arm_chain_fallback(kin, obs)
+            else:
+                # Mock mode: draw EE dot + line from origin + ground grid manually
                 self._log_arm_chain_fallback(kin, obs)
+                self._log_ground_grid(p_target)
 
         try:
             rr.flush()
         except Exception:
             pass
+
+    def _log_ground_grid(self, p_target=None) -> None:
+        """Workspace grid + optional target cube box (mock mode substitute for sim3d)."""
+        rr = self.rr
+        try:
+            half_w = 0.5
+            n = 10
+            strips = []
+            for i in range(n + 1):
+                t = -half_w + 2 * half_w * i / n
+                strips.append(np.array([[t, -half_w, 0.0], [t, half_w, 0.0]]))
+                strips.append(np.array([[-half_w, t, 0.0], [half_w, t, 0.0]]))
+            rr.log(
+                "sim3d/workspace/ground_grid",
+                rr.LineStrips3D(
+                    strips=strips,
+                    radii=0.001,
+                    colors=np.tile(np.array([[160, 160, 180, 120]], dtype=np.uint8), (len(strips), 1)),
+                ),
+            )
+        except Exception:
+            pass
+        if p_target is not None:
+            try:
+                c = np.asarray(p_target, dtype=np.float64)
+                h = 0.025
+                verts = np.array([
+                    c + np.array([ h,  h,  h]), c + np.array([-h,  h,  h]),
+                    c + np.array([-h, -h,  h]), c + np.array([ h, -h,  h]),
+                    c + np.array([ h,  h, -h]), c + np.array([-h,  h, -h]),
+                    c + np.array([-h, -h, -h]), c + np.array([ h, -h, -h]),
+                ])
+                edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+                box_strips = [np.stack([verts[a], verts[b]]) for a, b in edges]
+                rr.log(
+                    "sim3d/objects/target_box",
+                    rr.LineStrips3D(strips=box_strips, radii=0.003,
+                                    colors=np.tile(np.array([[255, 60, 200, 255]], dtype=np.uint8), (len(box_strips), 1))),
+                )
+            except Exception:
+                pass
 
     def _log_arm_chain_fallback(self, kin, obs) -> None:
         """Line-strip arm skeleton when URDF meshes are unavailable."""
