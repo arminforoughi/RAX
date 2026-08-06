@@ -261,6 +261,158 @@ class AnchorTracker:
 red_tracker = AnchorTracker("red")
 green_tracker = AnchorTracker("green")
 
+
+# ---------------- generic per-object pixel tracker ----------------
+# WHY THIS EXISTS. YOLO only reports every ~2.5 s (yolo_worker's cycle), and for
+# any label other than the two cubes, find_label() was just handing back that SAME
+# cached box, unmoved, for the whole 2.5 s — then it JUMPS to wherever the object
+# is now. As the arm approaches and the camera moves, that reads as "the box can't
+# keep up" / shaky, because it isn't tracking anything between detections at all.
+#
+# The fix is the same idea AnchorTracker already uses for the cubes (window
+# continuity between confirmations) generalised to ANY appearance, via classic
+# CamShift: colour-histogram back-projection + mean-shift. This box's contrib
+# modules (CSRT/KCF/MOSSE) are not installed on this machine (checked: only
+# cv2.TrackerMIL is present, and CamShift needs nothing beyond core OpenCV), so
+# CamShift is also the pragmatic choice, not just the simple one.
+#
+# yolo_worker "tags" a tracker with a fresh ground-truth box every ~2.5 s;
+# find_label() then "tracks" it every call in between — every control-tick, not
+# every 2.5 s — so the box actually follows the object instead of teleporting.
+PIXEL_TRACK_MAX_AGE_S = 8.0   # no fresh YOLO tag within this long -> stop trusting
+                              # pure pixel tracking, it may have drifted onto
+                              # something else entirely
+PIXEL_TRACK_MIN_RESPONSE = 12.0  # mean back-projection value inside the tracked
+                                 # window; below this the histogram is no longer
+                                 # matching anything real (object left / occluded)
+
+
+class PixelTracker:
+    """CamShift tracker for one object instance, tagged from a YOLO box and then
+    followed frame-to-frame by colour-histogram mean-shift."""
+
+    def __init__(self, label):
+        self.label = label
+        self.hist = None
+        self.window = None        # (x, y, w, h)
+        self.tagged_t = 0.0
+        self.last: Track | None = None   # publish() reads this; it must never call
+                                          # track() itself, or CamShift runs twice
+                                          # per frame from two independent call sites
+        # The actual pixels driving the current track, for the FPV overlay — a
+        # boolean crop plus its (x, y) origin, refreshed every track() call.
+        # None until the first successful track.
+        self.pixel_mask = None
+        self.pixel_origin = (0, 0)
+
+    def tag(self, rgb, xyxy):
+        """(Re)acquire from a FRESH, trusted detection box.
+
+        CHOOSE PIXELS SMARTLY rather than histogramming the whole rectangular
+        box: a YOLO box is axis-aligned and a diagonal or round object often
+        fills only half of it, so histogramming the full box mixes in
+        background pixels from its corners — that is what let a track slide
+        onto the table the moment the object rotated. Reuse _silhouette_mask
+        (Lab colour-distance from a ring just outside the box, already used
+        elsewhere in this file to separate an object from the table) to find
+        the actual object pixels; it stays correct on a dark object because
+        Lab distance is not a saturation/value test.
+
+        THE TWO MASKS HAVE DIFFERENT JOBS AND MUST NOT BE MERGED BY INTERSECTION.
+        `sil` answers "is this pixel the object" (Lab colour-distance, works on a
+        black pen same as a bright one). The saturation/value gate answers "is
+        this pixel's HUE trustworthy enough to put in a hue histogram" — a black
+        or white pixel has essentially RANDOM hue, and CamShift keys on hue.
+        AND-ing them together was a real bug caught on a synthetic dark object:
+        the silhouette correctly found the pen (V~30), the sv gate rejected it
+        for being too dark, and the code fell back to the sv gate ALONE — which
+        happily kept the bright wood BACKGROUND instead. So: sv gate narrows the
+        HISTOGRAM only, never decides what the object is. And when an object is
+        genuinely achromatic and the narrowed set is too small to build a useful
+        histogram, widen it back to the full silhouette rather than drop to zero
+        — a noisy hue signal on the right pixels beats a clean one on the wrong
+        pixels, and it also avoids keying on "generic dark blob", which risks
+        matching our own black gripper the moment it enters frame.
+        """
+        x1, y1, x2, y2 = (int(round(v)) for v in xyxy)
+        H, W = rgb.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return
+        rgb_u8 = np.asarray(rgb, np.uint8)
+        hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
+        roi = hsv[y1:y2, x1:x2]
+        sv_gate = cv2.inRange(roi, np.array((0, 60, 32), np.uint8),
+                              np.array((179, 255, 255), np.uint8)) > 0
+        sil = _silhouette_mask(rgb_u8, (x1, y1, x2, y2))
+        if sil is not None:
+            obj_mask = sil[y1:y2, x1:x2] > 0
+        else:
+            # no reliable silhouette (object same colour as the table, or the box
+            # too small for a background ring) — the sv gate is the only signal
+            # left, imperfect as it is
+            obj_mask = sv_gate
+        hist_mask = obj_mask & sv_gate
+        if int(np.count_nonzero(hist_mask)) < 0.15 * max(1, int(np.count_nonzero(obj_mask))):
+            hist_mask = obj_mask        # achromatic object: accept a noisy hue signal
+        mask_u8 = (hist_mask.astype(np.uint8)) * 255
+        hist = cv2.calcHist([roi], [0], mask_u8, [30], [0, 180])
+        cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
+        self.hist = hist
+        self.window = (x1, y1, x2 - x1, y2 - y1)
+        self.tagged_t = time.time()
+        self.pixel_mask = obj_mask
+        self.pixel_origin = (x1, y1)
+
+    def track(self, rgb):
+        """One CamShift step on the CURRENT frame. None if lost or never tagged."""
+        if self.hist is None or self.window is None:
+            return None
+        if time.time() - self.tagged_t > PIXEL_TRACK_MAX_AGE_S:
+            self.hist = None            # stale — force a re-tag before trusting this again
+            return None
+        H, W = rgb.shape[:2]
+        wx, wy, ww, wh = self.window
+        if ww < 4 or wh < 4 or wx >= W or wy >= H:
+            return None
+        hsv = cv2.cvtColor(np.asarray(rgb, np.uint8), cv2.COLOR_RGB2HSV)
+        backproj = cv2.calcBackProject([hsv], [0], self.hist, [0, 180], 1)
+        term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
+        try:
+            _rot, window = cv2.CamShift(backproj, self.window, term)
+        except cv2.error:
+            return None
+        x, y, w, h = window
+        if w < 6 or h < 6:
+            return None                 # collapsed — the object is not here
+        x1, y1, x2, y2 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+        bp_roi = backproj[y1:y2, x1:x2]
+        response = float(np.mean(bp_roi)) if bp_roi.size else 0.0
+        if response < PIXEL_TRACK_MIN_RESPONSE:
+            return None                 # window found nothing that looks like the target
+        self.window = (x1, y1, x2 - x1, y2 - y1)
+        # WHICH PIXELS, RIGHT NOW, are actually driving this track — for the FPV
+        # overlay. Free: Otsu-threshold the back-projection crop CamShift just
+        # used, no extra frame work. This is the honest answer to "what is being
+        # tracked", since it moves and reshapes with the object every frame,
+        # unlike re-showing the mask captured at tag() time.
+        if bp_roi.size >= 16 and bp_roi.max() > 0:
+            _t, m = cv2.threshold(bp_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            self.pixel_mask = m > 0
+            self.pixel_origin = (x1, y1)
+        else:
+            self.pixel_mask = None
+        clipped = x1 <= 1 or y1 <= 1 or x2 >= W - 2 or y2 >= H - 2
+        tr = Track(((x1 + x2) / 2.0, (y1 + y2) / 2.0), (x1, y1, x2, y2),
+                   int((x2 - x1) * (y2 - y1)), clipped, time.time())
+        self.last = tr
+        return tr
+
+
+label_trackers = {}    # label -> PixelTracker, built lazily as labels are seen
+
+
 # ---------------- parallel YOLO validation ----------------
 detector = None
 # Latest YOLO detections keyed by class label. Each value is a LIST of instances,
@@ -355,6 +507,17 @@ def yolo_worker():
                 by_label[lbl] = _dedupe_boxes(inst)
             yolo_latest["t"] = time.time()
             yolo_latest["dets"] = by_label
+            # (Re)tag the per-label pixel tracker with this cycle's best box for
+            # each label, EXCEPT the two cubes — those already have their own
+            # dedicated, tighter HSV+anchor trackers (find_red / find_green).
+            for lbl, inst in by_label.items():
+                if lbl in ("red cube", "green cube") or not inst:
+                    continue
+                label_trackers.setdefault(lbl, PixelTracker(lbl)).tag(rgb, inst[0]["xyxy"])
+            # drop trackers for labels no longer being asked for, so a stale one
+            # does not keep reporting a box for something nobody is looking for
+            for lbl in [l for l in label_trackers if l not in labels]:
+                del label_trackers[lbl]
 
 
 def find_red(rgb, T_base_cam=None):
@@ -411,6 +574,12 @@ def find_label(rgb, label, T_base_cam=None):
 
     Falls back to the legacy colour trackers for 'red cube' / 'green cube' because
     those trackers are tighter during close approach than a 2.5 Hz YOLO refresh.
+
+    For everything else: track it FRAME-TO-FRAME with PixelTracker instead of
+    just handing back whatever YOLO last reported. YOLO only refreshes every
+    ~2.5 s, so returning its cached box unmoved made the FPV box look frozen,
+    then jump — this runs a real CamShift step on THIS frame every call, so the
+    box actually follows the object between YOLO confirmations.
     """
     label = str(label).strip().lower()
     # legacy colour trackers for the original cube colours
@@ -418,8 +587,21 @@ def find_label(rgb, label, T_base_cam=None):
         return find_red(rgb, T_base_cam)
     if label == "green cube":
         return find_green(rgb, T_base_cam)
+
+    pt = label_trackers.get(label)
+    if pt is not None:
+        tr = pt.track(rgb)
+        if tr is not None:
+            return tr
+    # no live pixel track (never tagged, or lost) — fall back to the raw cached
+    # YOLO box, and bootstrap a tracker from it so the NEXT call is already smooth
+    # instead of waiting up to 2.5 s for yolo_worker's next cycle to seed one.
     tracks = find_labels(rgb, label)
-    return tracks[0] if tracks else None
+    if not tracks:
+        return None
+    tr = tracks[0]
+    label_trackers.setdefault(label, PixelTracker(label)).tag(rgb, tr.bbox_xyxy)
+    return tr
 
 
 # ---------------- robot I/O ----------------
@@ -473,6 +655,14 @@ def publish(rgb, joints=None):
         if tr is not None and now - tr.t < 0.7:   # fresh only — no wandering stale boxes
             x1, y1, x2, y2 = (int(v) for v in tr.bbox_xyxy)
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            # THE EXACT PIXEL the tracker is locked to — same marker the generic
+            # (non-cube) path draws below. This loop is a SEPARATE code path (the
+            # dedicated red/green HSV trackers) that used to have no marker at
+            # all, which is why "add an X" appeared to do nothing when the query
+            # was the default "red cube, green cube" — that query never reaches
+            # the generic block the marker was first added to.
+            cv2.drawMarker(img, (int(round(tr.uv[0])), int(round(tr.uv[1]))), color,
+                           cv2.MARKER_TILTED_CROSS, 18, 2)
             # label with the DISTANCE, from apparent size: range = f * edge / width.
             # Needs only the lens focal length and the cube's real size, so it stays
             # honest regardless of the camera-mount numbers.
@@ -504,12 +694,42 @@ def publish(rgb, joints=None):
             if all(_box_iou(box, k[2]) < 0.45 for k in kept):
                 kept.append((conf, lbl, box))
         for conf, lbl, box in kept:
-            x1, y1, x2, y2 = (int(v) for v in box)
-            col = (0, 200, 255)               # amber: a generic YOLO hit
+            # Prefer the LIVE PIXEL-TRACKED box over the raw YOLO cache: the cache
+            # only moves every ~2.5s (yolo_worker's cycle) and drawing it directly
+            # is what made the overlay look frozen-then-jumping as the arm moved.
+            # publish() only READS pt.last here, never calls track() itself - the
+            # control loop (find_label) is what steps CamShift each tick.
+            pt = label_trackers.get(lbl)
+            tracked = pt.last if (pt is not None and pt.last is not None
+                                  and now - pt.last.t < 0.5) else None
+            x1, y1, x2, y2 = (int(v) for v in (tracked.bbox_xyxy if tracked else box))
+            col = (255, 210, 60) if tracked else (0, 200, 255)  # cyan=tracked, amber=raw
+            # THE TAG, ON THE VIEW: fill in the ACTUAL pixels driving the track
+            # (pt.pixel_mask, Otsu-thresholded back-projection — see track()),
+            # not just its bounding box. This is what "which pixels are being
+            # tracked" looks like frame to frame, and it moves/reshapes with the
+            # object instead of sitting fixed to a rectangle.
+            if tracked and pt.pixel_mask is not None:
+                mh, mw = pt.pixel_mask.shape
+                mx, my = pt.pixel_origin
+                if 0 <= mx and 0 <= my and mx + mw <= img.shape[1] and my + mh <= img.shape[0]:
+                    roi = img[my:my + mh, mx:mx + mw]
+                    overlay = np.full_like(roi, col)
+                    blended = cv2.addWeighted(roi, 0.55, overlay, 0.45, 0)
+                    m3 = pt.pixel_mask[:, :, None]
+                    roi[:] = np.where(m3, blended, roi)
             cv2.rectangle(img, (x1, y1), (x2, y2), col, 2)
+            # THE EXACT PIXEL the tag is anchored to — an X at tr.uv, the same
+            # point every downstream calculation (bearing, range, servo
+            # centering) actually uses. The box shows the extent; this shows the
+            # single coordinate that matters.
+            ux, uy = tracked.uv if tracked else ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+            cv2.drawMarker(img, (int(round(ux)), int(round(uy))), col,
+                           cv2.MARKER_TILTED_CROSS, 18, 2)
             w_px = float(max(4, x2 - x1))
             rng_cm = fx * class_size_m(lbl) / w_px * 100.0
-            txt = f"{lbl} {conf:.2f} {rng_cm:.0f}cm"
+            tag = "" if tracked else " (raw)"
+            txt = f"{lbl} {conf:.2f} {rng_cm:.0f}cm{tag}"
             ty = max(14, y1 - 6)
             (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             cv2.rectangle(img, (x1, ty - th - 3), (x1 + tw + 4, ty + 3), (20, 20, 20), -1)
