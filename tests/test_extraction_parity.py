@@ -80,12 +80,17 @@ def _load_module():
     # Pin the hand-eye to the in-source constant, NOT to handeye_tf.json — that file
     # is re-fitted by /calib and would silently move every golden.
     S.T_ee_cam = S.parse_tf_string(S.TF)
+    # Push both into the shared CameraGeometry the way the running server does. Doing
+    # this explicitly matters: the pinned intrinsics happen to equal the profile's
+    # fallback, so without it the geometry goldens would pass even if the sync were
+    # broken — a test passing for the wrong reason.
+    S._sync_geometry()
+    S.FLOOR.set(0.0, 0.0, -0.022)
     S.TABLE_Z[0] = S.Z_TABLE
-    S.FLOOR_PLANE = [0.0, 0.0, -0.022]
     S.PUSH_OUT[0] = 0.0
     S.RANGE_SCALE[0] = 1.0
     S.MAP_BEARING_OFFSET_DEG[0] = 0.0
-    S.CUBE_EDGE_M = 0.0508
+    S.PRIORS.fallback_edge_m = 0.0508
     return S
 
 
@@ -305,6 +310,58 @@ def test_urdf_limits_match_hardcoded():
     assert np.allclose(hi, S.J_HI, atol=0.05), f"upper: urdf {hi} vs J_HI {S.J_HI}"
 
 
+def test_geometry_sync_is_live():
+    """A re-fitted hand-eye or a late intrinsics read must reach the shared geometry.
+
+    The intrinsics and the hand-eye are both discovered after import — one when the
+    camera connects, the other whenever /calib re-fits it. If _sync_geometry() stopped
+    being called, every projection would silently keep using the profile's fallback,
+    which is the kind of failure that shows up as "the arm grabs at air" rather than
+    as an exception. So: perturb each, and require the geometry to follow.
+    """
+    S = _load_module()
+    q = np.array(JOINT_POSES[1], dtype=np.float64)
+    T = np.asarray(S.T_cam_of(q))
+    before = S.project_base(np.array([0.25, 0.0, 0.02]), T)
+
+    S.fx = FX * 1.10                      # as if the camera reported a longer lens
+    S._sync_geometry()
+    after = S.project_base(np.array([0.25, 0.0, 0.02]), T)
+    assert abs(after[0] - before[0]) > 1.0, "intrinsics change did not reach GEOM"
+
+    S.fx = FX
+    S._sync_geometry()
+    assert S.project_base(np.array([0.25, 0.0, 0.02]), T) == before
+
+    # A different hand-eye must move the camera pose itself.
+    S.T_ee_cam = S.parse_tf_string("0.01,0.02,0.03,0,0,0")
+    S._sync_geometry()
+    assert not np.allclose(np.asarray(S.T_cam_of(q)), T), "hand-eye change did not reach GEOM"
+
+
+def test_fixed_camera_pose_is_supported():
+    """The geometry must serve a world-mounted camera too, not just eye-in-hand —
+    with tip_pixel correctly reporting that it has no answer for that rig."""
+    from perception.camera_geometry import CameraGeometry, FixedCamera, intrinsics_from_dict
+
+    T = np.eye(4)
+    T[:3, 3] = [0.0, 0.0, 0.60]           # 60 cm above the base, looking down
+    T[:3, :3] = np.array([[1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0]])
+    geom = CameraGeometry(
+        intrinsics_from_dict({"fx": FX, "fy": FY, "cx": CX, "cy": CY}, 640, 480),
+        FixedCamera(T))
+
+    assert geom.tip_pixel(np.zeros(5)) is None, "a fixed camera has no fixed tip pixel"
+    # Its pose does not depend on the joints.
+    assert np.allclose(geom.T_base_cam(np.zeros(5)), geom.T_base_cam(np.ones(5)))
+    # Round trip: a point on the table projects to a pixel that rays back to it.
+    p = np.array([0.05, -0.03, 0.0])
+    uv = geom.project(p, T)
+    assert uv is not None
+    back = geom.ray_to_plane(uv, T, 0.0)
+    assert back is not None and np.allclose(back, p, atol=1e-9)
+
+
 def main(argv):
     record = "--record" in argv
     S = _load_module()
@@ -327,7 +384,10 @@ def main(argv):
             print(f"  ... and {len(bad) - 40} more", file=sys.stderr)
         return 1
     test_urdf_limits_match_hardcoded()
-    print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI")
+    test_geometry_sync_is_live()
+    test_fixed_camera_pose_is_supported()
+    print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI, "
+          f"geometry sync live, fixed-camera path works")
     return 0
 
 

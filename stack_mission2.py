@@ -64,6 +64,11 @@ os.makedirs(OUT, exist_ok=True)
 # the existing names so the rest of this file is unchanged.
 #   RAX_ARM=<name> selects a profile; see robots/profiles/available_profiles().
 from robots.profiles import load_profile
+from perception.camera_geometry import (
+    CameraGeometry, EyeInHand, FixedCamera, intrinsics_from_dict, parse_tf)
+from perception.object_priors import (
+    PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES, MAX_TABLE_OBJ_M)
+from perception.table_plane import Plane, fit_plane
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -132,6 +137,34 @@ kin = None
 cam = None
 T_ee_cam = parse_tf_string(TF)
 fx = fy = cx0 = cy0 = 0.0
+
+# ---- shared perception objects -------------------------------------------------
+# The camera geometry (project / back-project / ray-to-plane / tip pixel) and the
+# table plane now live in perception/, parameterized rather than reading globals.
+# GEOM's pose provider resolves `kin` at call time, so it is usable from module
+# scope even though the robot connects later in main(). A fixed (non-wrist) camera
+# swaps EyeInHand for FixedCamera and everything downstream is unchanged.
+GEOM = CameraGeometry(
+    intrinsics_from_dict(
+        dict(zip(("fx", "fy", "cx", "cy"), ARM.camera.intrinsics_fallback)),
+        width=ARM.camera.width, height=ARM.camera.height),
+    EyeInHand(lambda q: kin.forward_kinematics(q), T_ee_cam)
+    if ARM.camera.eye_in_hand else FixedCamera(parse_tf(ARM.camera.extrinsics)),
+)
+FLOOR = Plane()          # the measured table surface; re-fitted by calibrate_floor
+
+
+def _sync_geometry():
+    """Push the current intrinsics + hand-eye into GEOM.
+
+    Both are discovered late (intrinsics when the camera connects, the hand-eye
+    whenever a calibration re-fits it), so every site that rebinds them calls this.
+    """
+    GEOM.set_intrinsics(intrinsics_from_dict(
+        {"fx": fx, "fy": fy, "cx": cx0, "cy": cy0},
+        width=ARM.camera.width, height=ARM.camera.height))
+    if isinstance(GEOM.pose, EyeInHand):
+        GEOM.pose.T_ee_cam = np.asarray(T_ee_cam, dtype=np.float64)
 
 # ---------------- strict HSV tracking + FK anchor ----------------
 HSV_BANDS = {
@@ -653,7 +686,7 @@ def publish(rgb, joints=None):
             # Needs only the lens focal length and the cube's real size, so it stays
             # honest regardless of the camera-mount numbers.
             w_px = float(max(4, x2 - x1))
-            rng_cm = fx * CUBE_EDGE_M / w_px * 100.0
+            rng_cm = fx * PRIORS.fallback_edge_m / w_px * 100.0
             cv2.putText(img, f"{name} {rng_cm:.0f}cm", (x1, max(14, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     # EVERY OTHER YOLO DETECTION. Until now the overlay drew boxes for the two
@@ -895,7 +928,7 @@ def goto_smooth(target, settle=0.15, step=2.0):
 
 
 def T_cam_of(joints):
-    return np.asarray(kin.forward_kinematics(joints)) @ T_ee_cam
+    return GEOM.T_base_cam(np.asarray(joints, dtype=np.float64))
 
 
 def read_depth_m(uv, win=7):
@@ -925,20 +958,13 @@ def locate_3d(uv, z_m, T_base_cam):
     """Back-project pixel uv at metric depth z_m through the camera intrinsics,
     then transform by the camera pose -> object point in the BASE frame.
     This is single-shot metric localization (no multi-vantage triangulation)."""
-    x = (uv[0] - cx0) / fx * z_m
-    y = (uv[1] - cy0) / fy * z_m
-    p_cam = np.array([x, y, z_m, 1.0])
-    return (T_base_cam @ p_cam)[:3]
+    return GEOM.backproject(uv, z_m, T_base_cam)
 
 
 def project_base(p_base, T_base_cam):
     """Base-frame point -> pixel. The inverse of locate_3d; the ground truth test
     for the hand-eye TF."""
-    pc = np.linalg.inv(np.asarray(T_base_cam, np.float64)) @ np.append(
-        np.asarray(p_base, np.float64), 1.0)
-    if pc[2] <= 1e-4:
-        return None                      # behind the camera
-    return (float(fx * pc[0] / pc[2] + cx0), float(fy * pc[1] / pc[2] + cy0))
+    return GEOM.project(p_base, T_base_cam)
 
 
 def tip_pixel(joints):
@@ -957,8 +983,7 @@ def tip_pixel(joints):
     every cube is reported NEARER than it is -- the user's "it should be further out",
     arrived at independently. calibrate_handeye() re-fits the TF to kill this.
     """
-    T = np.asarray(kin.forward_kinematics(np.asarray(joints, np.float64)))
-    return project_base(T[:3, 3], T @ T_ee_cam)
+    return GEOM.tip_pixel(joints)
 
 
 def locate_object(finder, tracker, label, tries=6):
@@ -1145,16 +1170,8 @@ def ray_to_table(uv, T_base_cam, z_plane=None):
     """Intersect the pixel's back-projected sightline with the table plane. The
     plane height is TABLE_Z[0], which locate_on_table MEASURES from the bbox
     pinhole range rather than assuming."""
-    o = T_base_cam[:3, 3]
     z = TABLE_Z[0] if z_plane is None else float(z_plane)
-    d_cam = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
-    d = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
-    if abs(d[2]) < 1e-6:
-        return None
-    t = (z - o[2]) / d[2]
-    if t <= 0:
-        return None
-    return o + t * d
+    return GEOM.ray_to_plane(uv, T_base_cam, z)
 
 
 TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise:
@@ -1797,6 +1814,7 @@ def load_tf_override():
         with open(TF_FILE) as f:
             d = json.load(f)
         T_ee_cam = parse_tf_string(d["tf"])
+        _sync_geometry()
         return d
     except FileNotFoundError:
         return None
@@ -1912,6 +1930,7 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
     rv = Rotation.from_matrix(T_new[:3, :3]).as_rotvec()
     tf_str = ",".join(f"{v:.4f}" for v in list(T_new[:3, 3]) + list(rv))
     T_ee_cam = T_new
+    _sync_geometry()
     with open(TF_FILE, "w") as f:
         json.dump({"tf": tf_str, "rms_px": 0, "tip_px": 0,
                    "spread_cm": after, "views": len(samples),
@@ -2063,6 +2082,7 @@ def calibrate_handeye(finder, n_target=14):
         json.dump({"tf": tf_str, "rms_px": rms(sol.x), "tip_px": tipgap(sol.x),
                    "views": len(samples), "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
     T_ee_cam = tf
+    _sync_geometry()
     say(f"hand-eye CALIBRATED -> {tf_str}")
     say(f"  (saved to {os.path.basename(TF_FILE)}; loaded automatically on every restart)")
     say(f"  cube now solves to r={np.hypot(p[0], p[1])*100:.1f}cm "
@@ -2273,7 +2293,6 @@ FLOOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "floor_pla
 # Default c matches the value someone measured by hand and left in ee_move_rel's
 # comment ("table contact is z=-0.022, sag included"); a=b=0 means "flat and level"
 # until a calibration says otherwise.
-FLOOR_PLANE = [0.0, 0.0, -0.022]
 FLOOR_PROBE_STEP = 0.0025      # descend in 2.5 mm bites - gentle enough not to
                                # slam the servos or trip the overload latch
 FLOOR_PROBE_DROP = 0.055       # give up after this much descent from the start
@@ -2285,27 +2304,23 @@ FLOOR_GRASP_CLEAR = 0.012      # grasp this far ABOVE the measured floor
 
 def floor_z(x, y):
     """Table height in base z at (x, y), from the calibrated plane."""
-    a, b, c = FLOOR_PLANE
-    return float(a * float(x) + b * float(y) + c)
+    return FLOOR.z(x, y)
 
 
 def load_floor_plane():
-    global FLOOR_PLANE
     try:
-        with open(FLOOR_FILE) as f:
-            d = json.load(f)
-        FLOOR_PLANE = [float(d["a"]), float(d["b"]), float(d["c"])]
-        say(f"floor: calibrated plane loaded — z = {FLOOR_PLANE[0]:+.4f}x "
-            f"{FLOOR_PLANE[1]:+.4f}y {FLOOR_PLANE[2]:+.4f}  "
-            f"(tilt {d.get('tilt_deg', 0):.2f}deg, rms {d.get('rms_mm', 0):.1f}mm, "
-            f"fitted {d.get('fitted', '?')})")
-        return d
-    except FileNotFoundError:
-        say(f"floor: no calibration yet — assuming z={FLOOR_PLANE[2]*100:.1f}cm and level. "
+        d = FLOOR.load(FLOOR_FILE)
+    except ValueError as e:
+        say(f"floor: ignoring {e}")
+        return None
+    if d is None:
+        say(f"floor: no calibration yet — assuming z={FLOOR.c*100:.1f}cm and level. "
             f"Press 'Calibrate floor' to measure it.")
-    except Exception as e:
-        say(f"floor: ignoring bad {os.path.basename(FLOOR_FILE)} ({e})")
-    return None
+        return None
+    say(f"floor: calibrated plane loaded — {FLOOR.describe()}  "
+        f"(tilt {d.get('tilt_deg', 0):.2f}deg, rms {d.get('rms_mm', 0):.1f}mm, "
+        f"fitted {d.get('fitted', '?')})")
+    return d
 
 
 def _arm_load():
@@ -2370,7 +2385,6 @@ FLOOR_PROBE_POINTS = [(0.19, -18.0), (0.19, 0.0), (0.19, 18.0),
 def calibrate_floor():
     """Touch the table at several places and fit z_floor(x, y). Self-calibration:
     no ruler, no hand-tuned constant, and it absorbs arm sag for free."""
-    global FLOOR_PLANE
     set_phase("FLOORCAL", f"probing the table at {len(FLOOR_PROBE_POINTS)} points")
     say("=" * 52)
     say("FLOOR CALIBRATION — touching the table to find its real height")
@@ -2396,23 +2410,20 @@ def calibrate_floor():
 
     if len(pts) < 3:
         raise Abort(f"floor: only {len(pts)} touch points — need 3 to fit a plane")
-    A = np.array([[p[0], p[1], 1.0] for p in pts])
-    zz = np.array([p[2] for p in pts])
-    (a, b, c), *_ = np.linalg.lstsq(A, zz, rcond=None)
-    resid = zz - A @ np.array([a, b, c])
-    rms = float(np.sqrt(np.mean(resid ** 2)))
-    tilt = math.degrees(math.atan(math.hypot(a, b)))
-    FLOOR_PLANE = [float(a), float(b), float(c)]
-    d = {"a": float(a), "b": float(b), "c": float(c),
-         "tilt_deg": round(tilt, 3), "rms_mm": round(rms * 1000, 2),
-         "points": [[round(v, 4) for v in p] for p in pts],
-         "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
-        with open(FLOOR_FILE, "w") as f:
-            json.dump(d, f, indent=1)
+        res = fit_plane(pts)
+    except ValueError as e:
+        raise Abort(f"floor: {e}")
+    a, b, c = res.plane.a, res.plane.b, res.plane.c
+    rms, tilt = res.rms_m, res.tilt_deg
+    FLOOR.set(a, b, c)          # in place: every holder of FLOOR sees the new surface
+    d = res.to_dict()
+    try:
+        # Plane.save writes a/b/c itself; pass only the fit metadata alongside.
+        FLOOR.save(FLOOR_FILE, **{k: v for k, v in d.items() if k not in ("a", "b", "c")})
     except Exception as e:
         say(f"floor: could not save ({e})")
-    say(f"floor plane: z = {a:+.4f}x {b:+.4f}y {c:+.4f}   "
+    say(f"floor plane: {FLOOR.describe()}   "
         f"tilt {tilt:.2f}deg   fit rms {rms*1000:.1f}mm over {len(pts)} points")
     say(f"  at r=18cm the floor is z={floor_z(0.18,0)*100:+.2f}cm, "
         f"at r=34cm it is z={floor_z(0.34,0)*100:+.2f}cm  "
@@ -2470,157 +2481,23 @@ def _target_finder(label=None):
 #
 # Format: label -> (shape, width_m, depth_m, height_m), width/depth being the
 # footprint on the table and height the vertical extent.
-_CLASS_TABLE = {
-    # --- the original cubes (measured on the real blocks) ---
-    "red cube":      ("cube",     0.0508, 0.0508, 0.0508),
-    "green cube":    ("cube",     0.0508, 0.0508, 0.0508),
-    "blue cube":     ("cube",     0.0508, 0.0508, 0.0508),
-    "yellow cube":   ("cube",     0.0508, 0.0508, 0.0508),
-    "toy block":     ("cube",     0.0508, 0.0508, 0.0508),
-    # --- COCO: people & animals ---
-    "person":        ("cylinder", 0.45,  0.30,  1.70),
-    "bird":          ("cuboid",   0.10,  0.22,  0.16),
-    "cat":           ("cuboid",   0.18,  0.46,  0.25),
-    "dog":           ("cuboid",   0.25,  0.70,  0.50),
-    "horse":         ("cuboid",   0.60,  2.20,  1.60),
-    "sheep":         ("cuboid",   0.40,  1.20,  0.90),
-    "cow":           ("cuboid",   0.70,  2.40,  1.50),
-    "elephant":      ("cuboid",   1.50,  4.00,  3.00),
-    "bear":          ("cuboid",   0.80,  1.80,  1.20),
-    "zebra":         ("cuboid",   0.60,  2.20,  1.50),
-    "giraffe":       ("cuboid",   0.80,  2.50,  4.50),
-    # --- COCO: vehicles & street ---
-    "bicycle":       ("cuboid",   0.60,  1.75,  1.10),
-    "car":           ("cuboid",   1.80,  4.50,  1.50),
-    "motorcycle":    ("cuboid",   0.80,  2.10,  1.20),
-    "airplane":      ("cuboid",  30.0,  35.0,  10.0),
-    "bus":           ("cuboid",   2.55, 12.0,   3.20),
-    "train":         ("cuboid",   3.00, 25.0,   4.00),
-    "truck":         ("cuboid",   2.50,  8.00,  3.00),
-    "boat":          ("cuboid",   2.00,  6.00,  2.00),
-    "traffic light": ("cuboid",   0.30,  0.30,  1.00),
-    "fire hydrant":  ("cylinder", 0.30,  0.30,  0.75),
-    "stop sign":     ("cuboid",   0.75,  0.05,  2.10),
-    "parking meter": ("cuboid",   0.15,  0.15,  1.20),
-    "bench":         ("cuboid",   0.55,  1.50,  0.85),
-    # --- COCO: accessories & sport ---
-    "backpack":      ("cuboid",   0.32,  0.20,  0.45),
-    "umbrella":      ("cylinder", 0.06,  0.06,  0.90),
-    "handbag":       ("cuboid",   0.32,  0.14,  0.26),
-    "tie":           ("cuboid",   0.08,  0.02,  0.55),
-    "suitcase":      ("cuboid",   0.45,  0.22,  0.65),
-    "frisbee":       ("cylinder", 0.27,  0.27,  0.03),
-    "skis":          ("cuboid",   0.12,  1.70,  0.05),
-    "snowboard":     ("cuboid",   0.28,  1.50,  0.03),
-    "sports ball":   ("sphere",   0.22,  0.22,  0.22),
-    "kite":          ("cuboid",   1.00,  0.60,  0.05),
-    "baseball bat":  ("cylinder", 0.07,  0.07,  0.85),
-    "baseball glove":("cuboid",   0.25,  0.15,  0.30),
-    "skateboard":    ("cuboid",   0.21,  0.80,  0.11),
-    "surfboard":     ("cuboid",   0.50,  2.10,  0.07),
-    "tennis racket": ("cuboid",   0.28,  0.68,  0.03),
-    # --- COCO: tabletop (the ones this arm can actually pick) ---
-    "bottle":        ("cylinder", 0.068, 0.068, 0.23),
-    "wine glass":    ("cylinder", 0.080, 0.080, 0.20),
-    "cup":           ("cylinder", 0.080, 0.080, 0.10),
-    "pen cup":       ("cylinder", 0.075, 0.075, 0.10),
-    "mug":           ("cylinder", 0.085, 0.085, 0.10),
-    "fork":          ("cuboid",   0.025, 0.19,  0.012),
-    "knife":         ("cuboid",   0.022, 0.22,  0.012),
-    "spoon":         ("cuboid",   0.035, 0.18,  0.012),
-    "bowl":          ("cylinder", 0.15,  0.15,  0.07),
-    "banana":        ("cuboid",   0.045, 0.19,  0.040),
-    "apple":         ("sphere",   0.078, 0.078, 0.078),
-    "sandwich":      ("cuboid",   0.12,  0.12,  0.05),
-    "orange":        ("sphere",   0.075, 0.075, 0.075),
-    "broccoli":      ("sphere",   0.12,  0.12,  0.14),
-    "carrot":        ("cuboid",   0.035, 0.17,  0.035),
-    "hot dog":       ("cuboid",   0.050, 0.16,  0.050),
-    "pizza":         ("cylinder", 0.30,  0.30,  0.03),
-    "donut":         ("cylinder", 0.095, 0.095, 0.045),
-    "cake":          ("cylinder", 0.22,  0.22,  0.10),
-    # --- COCO: furniture & appliances ---
-    "chair":         ("cuboid",   0.45,  0.45,  0.90),
-    "couch":         ("cuboid",   0.90,  2.00,  0.80),
-    "potted plant":  ("cylinder", 0.22,  0.22,  0.40),
-    "bed":           ("cuboid",   1.50,  2.00,  0.60),
-    "dining table":  ("cuboid",   0.90,  1.60,  0.75),
-    "toilet":        ("cuboid",   0.38,  0.70,  0.75),
-    "microwave":     ("cuboid",   0.50,  0.38,  0.30),
-    "oven":          ("cuboid",   0.60,  0.60,  0.85),
-    "toaster":       ("cuboid",   0.28,  0.18,  0.20),
-    "sink":          ("cuboid",   0.55,  0.45,  0.20),
-    "refrigerator":  ("cuboid",   0.70,  0.70,  1.80),
-    # --- COCO: electronics & small objects ---
-    "tv":            ("cuboid",   1.10,  0.08,  0.65),
-    "laptop":        ("cuboid",   0.33,  0.24,  0.02),
-    "mouse":         ("cuboid",   0.062, 0.11,  0.038),
-    "remote":        ("cuboid",   0.045, 0.16,  0.022),
-    "keyboard":      ("cuboid",   0.44,  0.14,  0.025),
-    "cell phone":    ("cuboid",   0.072, 0.15,  0.009),
-    "book":          ("cuboid",   0.15,  0.22,  0.030),
-    "clock":         ("cylinder", 0.25,  0.25,  0.05),
-    "vase":          ("cylinder", 0.12,  0.12,  0.25),
-    "scissors":      ("cuboid",   0.065, 0.18,  0.010),
-    "teddy bear":    ("cuboid",   0.22,  0.15,  0.32),
-    "hair drier":    ("cuboid",   0.085, 0.22,  0.22),
-    "toothbrush":    ("cuboid",   0.015, 0.19,  0.015),
-    # --- handy extras that are not COCO but come up on this table ---
-    "pen":           ("cuboid",   0.010, 0.14,  0.010),
-    "pencil":        ("cuboid",   0.008, 0.17,  0.008),
-    "marker":        ("cylinder", 0.017, 0.017, 0.14),
-    "eraser":        ("cuboid",   0.022, 0.055, 0.012),
-    "screwdriver":   ("cuboid",   0.028, 0.21,  0.028),
-    "tape":          ("cylinder", 0.075, 0.075, 0.025),
-    "battery":       ("cylinder", 0.014, 0.014, 0.050),
-    "usb stick":     ("cuboid",   0.018, 0.055, 0.009),
-    "box":           ("cuboid",   0.10,  0.10,  0.10),
-    "can":           ("cylinder", 0.066, 0.066, 0.12),
-}
-# The 80 COCO names, in order — the "all YOLO classes" preset for the query box.
-COCO_CLASSES = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-    "hair drier", "toothbrush",
-]
+# The per-class size/shape priors, the COCO name list and the tabletop subset now
+# live in perception/object_priors.py and are imported at the top of this file.
 # Objects bigger than this in any footprint dimension cannot be on this table —
 # used to reject a nonsense measurement, not to reject the detection.
-MAX_TABLE_OBJ_M = 0.45
-CUBE_EDGE_M = 0.0508       # generic fallback edge for an unlisted label
-
-CLASS_META = {k: {"shape": v[0], "w_m": v[1], "d_m": v[2], "h_m": v[3]}
-              for k, v in _CLASS_TABLE.items()}
-
-
 def class_meta(label):
     """Prior for a label: {shape, w_m, d_m, h_m}. Unlisted labels get a cube guess."""
-    return CLASS_META.get(str(label).strip().lower(),
-                          {"shape": "cube", "w_m": CUBE_EDGE_M,
-                           "d_m": CUBE_EDGE_M, "h_m": CUBE_EDGE_M})
+    return PRIORS.meta(label)
 
 
 def class_size_m(label):
-    """Characteristic width for apparent-size ranging (what the bbox width maps to).
-
-    For an object of unknown yaw the bbox width is somewhere between the footprint's
-    minor and major axis, so the geometric mean is the least-wrong single number.
-    """
-    m = class_meta(label)
-    return float(math.sqrt(max(m["w_m"], 1e-3) * max(m["d_m"], 1e-3)))
+    """Characteristic width for apparent-size ranging (what the bbox width maps to)."""
+    return PRIORS.size_m(label)
 
 
 def class_height_m(label):
     """Vertical extent above the table — used for hover/grasp height."""
-    return float(class_meta(label)["h_m"])
+    return PRIORS.height_m(label)
 
 
 # ---------------- monocular size + orientation measurement ----------------
@@ -3064,7 +2941,7 @@ def _cube_range_m(tr):
     fingertip pixel, which is why descending on pixel-alignment alone landed the
     gripper on bare board half way out)."""
     w = float(max(4.0, tr.bbox_xyxy[2] - tr.bbox_xyxy[0]))
-    return float(fx * CUBE_EDGE_M / w)
+    return float(fx * PRIORS.fallback_edge_m / w)
 
 
 def _tip(q):
@@ -3356,7 +3233,7 @@ def _picked_height(label, gx, gy):
     for cand in (label, f"{label} cube"):
         if str(cand).strip().lower() in CLASS_META:
             return class_height_m(cand)
-    return CUBE_EDGE_M
+    return PRIORS.fallback_edge_m
 
 
 def _dest_geometry(tag=None, xy=None):
@@ -4336,9 +4213,9 @@ def setrelaxidle():
 
 @app.route("/floor")
 def r_floor():
-    a, b, c = FLOOR_PLANE
+    a, b, c = FLOOR.as_list()
     return jsonify(a=a, b=b, c=c,
-                   tilt_deg=round(math.degrees(math.atan(math.hypot(a, b))), 3),
+                   tilt_deg=round(FLOOR.tilt_deg, 3),
                    at_18cm=round(floor_z(0.18, 0.0), 4),
                    at_34cm=round(floor_z(0.34, 0.0), 4),
                    grasp_clear=FLOOR_GRASP_CLEAR,
@@ -4451,7 +4328,7 @@ def status():
         "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
         "back_cm": round(TARGET_BACK_M * 100, 2),
         "approach_steps": APPROACH_STEPS,
-        "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
+        "cube_edge_cm": round(PRIORS.fallback_edge_m * 100, 2),
         "range_scale": round(float(RANGE_SCALE[0]), 2),
         "bearing_deg": round(float(MAP_BEARING_OFFSET_DEG[0]), 1),
     }
@@ -4558,7 +4435,7 @@ def geom():
                "label": o["label"], "tag": o["tag"]}
               for o in world2d_snapshot()]
     return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl,
-                   obj_size=round(float(CUBE_EDGE_M), 3), objs2d=objs2d)
+                   obj_size=round(float(PRIORS.fallback_edge_m), 3), objs2d=objs2d)
 
 
 @app.route("/stream")
@@ -4900,14 +4777,7 @@ def setquery():
     return jsonify(ok=True, query=q)
 
 
-# Query presets. "coco" is every class YOLO knows; "table" is the subset this arm
-# can physically pick, which detects faster and keeps street furniture out of the map.
-TABLE_CLASSES = [
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana",
-    "apple", "orange", "book", "clock", "vase", "scissors", "teddy bear",
-    "cell phone", "mouse", "remote", "keyboard", "laptop", "toothbrush",
-    "pen", "pencil", "marker", "tape", "can", "box", "red cube", "green cube",
-]
+# Query presets ("coco" / "table") come from perception/object_priors.py.
 
 
 @app.route("/preset")
@@ -5089,9 +4959,8 @@ def setcubesize():
         cm = float(request.args.get("cm", request.form.get("cm", 5.08)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global CUBE_EDGE_M
     cm = float(np.clip(cm, 1.0, 30.0))
-    CUBE_EDGE_M = cm / 100.0
+    PRIORS.fallback_edge_m = cm / 100.0
     say(f"cube edge size set to {cm:.2f}cm")
     return jsonify(ok=True, cm=cm)
 
@@ -5837,6 +5706,7 @@ def main():
         except Exception:
             pass
     fx, fy, cx0, cy0 = (float(intr[k]) for k in ("fx", "fy", "cx", "cy"))
+    _sync_geometry()          # the camera reported its real intrinsics
 
     # A hand-eye TF we FITTED (see calibrate_handeye) overrides the constant.
     load_floor_plane()
