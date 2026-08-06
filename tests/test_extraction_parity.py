@@ -1,0 +1,335 @@
+"""Golden-value parity tests for the functions being extracted out of ``stack_mission2``.
+
+The modularization moves ~3,300 lines of proven logic out of the monolith and into
+packages. Most of that logic is *pure* — it maps numbers to numbers — and much of it
+encodes specific, expensively-learned corrections (the limit-clamping in
+``_ik_hold_pitch``, the elongated-object branch in ``obj_xy_2d``). Moving it is only
+safe if "the extracted version does exactly what the original did" is a fact we can
+check, not a hope.
+
+So: before touching anything, run every one of those functions over a fixed grid of
+inputs and freeze the answers in ``tests/golden/extraction_parity.json``. After each
+extraction phase, run this again. Any drift is a bug in the move, and it names the
+function.
+
+The fixture pins every module global the functions read (intrinsics, hand-eye TF,
+table height, the live-tunable knobs) so the goldens do not depend on whatever
+``handeye_tf.json`` / ``floor_plane.json`` happen to hold on disk.
+
+Runs headless: lerobot falls back to pure-numpy URDF kinematics when placo is absent,
+so no robot and no placo are needed.
+
+    python tests/test_extraction_parity.py --record    # freeze goldens (do this ONCE, on known-good code)
+    python tests/test_extraction_parity.py             # check against the goldens
+    pytest tests/test_extraction_parity.py             # same, under pytest if installed
+
+Re-baselines
+------------
+Deliberate behaviour changes are recorded here, with what moved and by how much.
+Anything not on this list is a bug in an extraction.
+
+* Phase 1 — joint limits now read from the URDF instead of the hand-transcribed
+  table at the old ``stack_mission2.py:4661``. The transcription was rounded to one
+  decimal, so the true bounds differ slightly and in both directions: elbow_flex
+  ``96.8 -> 96.8299`` (looser), wrist_flex ``95.0 -> 94.9998`` and shoulder_pan
+  ``110.0 -> 109.9999`` (tighter). Effect, measured over this grid: joint angles move
+  by at most 0.03 deg, ``plan_grasp_pitch`` residuals by 1e-7 m, and only the three
+  limit-dependent groups (``ik_hold_pitch``, ``slave_wflex``, ``plan_grasp_pitch``)
+  changed at all — every geometry and class-prior group stayed bit-identical.
+  0.03 deg is below one STS3215 servo step (0.088 deg), so no commanded pose changes.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import pathlib
+import sys
+
+import numpy as np
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+GOLDEN = REPO / "tests" / "golden" / "extraction_parity.json"
+
+# The IK and the geometry are deterministic, so a faithful extraction should be
+# bit-identical. Allow only enough slack to absorb numpy reduction-order changes.
+ATOL = 1e-9
+
+# Pinned fixture values ------------------------------------------------------------
+# The documented intrinsics fallback (stack_mission2.py:5822), so the goldens do not
+# depend on which OAK-D happens to be plugged in.
+FX = FY = 517.0
+CX = 329.5
+CY = 231.4
+URDF = REPO / "SO101" / "so101_new_calib.urdf"
+EE_FRAME = "gripper_frame_link"
+ARM_MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+
+def _load_module():
+    """Import ``stack_mission2`` and pin every global the pure functions read."""
+    import stack_mission2 as S
+    from lerobot.model.kinematics import RobotKinematics
+
+    S.kin = RobotKinematics(str(URDF), EE_FRAME, ARM_MOTORS)
+    S.fx, S.fy, S.cx0, S.cy0 = FX, FY, CX, CY
+    # Pin the hand-eye to the in-source constant, NOT to handeye_tf.json — that file
+    # is re-fitted by /calib and would silently move every golden.
+    S.T_ee_cam = S.parse_tf_string(S.TF)
+    S.TABLE_Z[0] = S.Z_TABLE
+    S.FLOOR_PLANE = [0.0, 0.0, -0.022]
+    S.PUSH_OUT[0] = 0.0
+    S.RANGE_SCALE[0] = 1.0
+    S.MAP_BEARING_OFFSET_DEG[0] = 0.0
+    S.CUBE_EDGE_M = 0.0508
+    return S
+
+
+# Deterministic input grids ---------------------------------------------------------
+JOINT_POSES = [
+    [-14.1, -99.1, 90.8, 33.2, -4.7],   # HOME
+    [5.0, 37.1, 48.1, -40.4, 90.0],     # VIEW
+    [0.0, 0.0, 0.0, 0.0, 0.0],
+    [30.0, -20.0, 40.0, 10.0, 45.0],
+    [-45.0, 60.0, -30.0, 25.0, -90.0],
+]
+
+TARGET_POINTS = [
+    [0.22, 0.05, 0.02],
+    [0.15, 0.00, 0.05],
+    [0.30, -0.10, 0.02],
+    [0.12, 0.12, 0.08],
+    [0.40, 0.05, 0.02],   # near the edge of reach
+]
+
+PIXELS = [(320.0, 240.0), (440.0, 394.0), (100.0, 80.0), (600.0, 450.0), (10.0, 470.0)]
+
+LABELS = [
+    "red cube", "green cube", "blue cube", "cup", "bottle", "pen", "knife",
+    "scissors", "banana", "apple", "mouse", "cell phone", "book", "spoon",
+    "unknown thing that is not in the table",
+]
+
+BBOXES = [
+    (300.0, 220.0, 340.0, 260.0),   # small, square
+    (200.0, 150.0, 400.0, 350.0),   # large, square
+    (100.0, 200.0, 380.0, 240.0),   # wide and flat -> the elongated branch
+    (300.0, 100.0, 340.0, 400.0),   # tall and thin -> the elongated branch
+    (0.0, 0.0, 6.0, 6.0),           # degenerate, below the 4 px floor
+]
+
+
+# Case generation -------------------------------------------------------------------
+def collect(S) -> dict:
+    """Run every pinned function over its grid and return a JSON-able result tree."""
+    out: dict[str, object] = {}
+
+    # --- _slave_wflex: the pitch-slaving identity ---
+    out["slave_wflex"] = [
+        S._slave_wflex(j1, j2, pitch)
+        for j1 in (-99.1, -20.0, 0.0, 40.0)
+        for j2 in (90.8, 0.0, -30.0)
+        for pitch in (0.0, 45.0, 70.0, 90.0, -30.0)
+    ]
+
+    # --- class priors ---
+    out["class_size_m"] = [S.class_size_m(l) for l in LABELS]
+    out["class_height_m"] = [S.class_height_m(l) for l in LABELS]
+    out["class_meta"] = [
+        {k: (list(v) if isinstance(v, (list, tuple)) else v)
+         for k, v in sorted(S.class_meta(l).items())}
+        for l in LABELS
+    ]
+
+    # --- floor plane ---
+    out["floor_z"] = [
+        S.floor_z(x, y)
+        for x in (0.0, 0.1, 0.25, 0.4) for y in (-0.2, 0.0, 0.15)
+    ]
+
+    # --- push_out_radial (identity at PUSH_OUT=0, and a non-zero probe) ---
+    push = []
+    for val in (0.0, 0.05):
+        S.PUSH_OUT[0] = val
+        push += [S.push_out_radial(np.array(p)).tolist() for p in TARGET_POINTS]
+    S.PUSH_OUT[0] = 0.0
+    out["push_out_radial"] = push
+
+    # --- grasp roll from yaw ---
+    out["grasp_roll_for_yaw"] = [
+        S.grasp_roll_for_yaw(yaw, (x, y))
+        for yaw in (0.0, 30.0, 90.0, 135.0, -45.0)
+        for (x, y) in ((0.25, 0.0), (0.15, 0.15), (0.2, -0.1))
+    ]
+
+    # --- camera geometry: FK -> T_base_cam -> project / backproject / ray ---
+    tcam = {}
+    proj, loc3d, ray, tips = [], [], [], []
+    for q in JOINT_POSES:
+        qa = np.array(q, dtype=np.float64)
+        T = np.asarray(S.T_cam_of(qa))
+        tcam[str(q)] = T.tolist()
+        tips.append(S.tip_pixel(qa))
+        for p in TARGET_POINTS:
+            proj.append(S.project_base(np.array(p), T))
+        for uv in PIXELS:
+            loc3d.append(S.locate_3d(uv, 0.25, T).tolist())
+            r = S.ray_to_table(uv, T)
+            ray.append(None if r is None else np.asarray(r).tolist())
+    out["T_cam_of"] = tcam
+    out["tip_pixel"] = tips
+    out["project_base"] = proj
+    out["locate_3d"] = loc3d
+    out["ray_to_table"] = ray
+
+    # --- obj_xy_2d: apparent-size AND the elongated long-axis branch ---
+    objxy = []
+    for q in JOINT_POSES[:3]:
+        T = np.asarray(S.T_cam_of(np.array(q, dtype=np.float64)))
+        for bbox in BBOXES:
+            for label in ("red cube", "cup", "pen", "knife", None):
+                for z_m in (None, 0.30):
+                    xy, rng, size = S.obj_xy_2d(bbox, T, z_m=z_m, label=label)
+                    objxy.append({
+                        "xy": None if xy is None else np.asarray(xy).tolist(),
+                        "rng": None if (rng is None or math.isnan(rng)) else float(rng),
+                        "size": float(size),
+                    })
+    out["obj_xy_2d"] = objxy
+
+    # --- _ik_hold_pitch: the solver the whole approach rides on ---
+    ik = []
+    for q in JOINT_POSES[:3]:
+        qa = np.array(q, dtype=np.float64)
+        for p in TARGET_POINTS:
+            for pitch in (0.0, 45.0, 70.0, 90.0):
+                qs, e = S._ik_hold_pitch(qa, np.array(p), pitch, float(qa[4]), ret_err=True)
+                ik.append({"q": np.asarray(qs).tolist(), "e": float(e)})
+    out["ik_hold_pitch"] = ik
+
+    # --- plan_grasp_pitch: which pitch the arm commits to, and the residual ---
+    plans = []
+    for q in JOINT_POSES[:2]:
+        qa = np.array(q, dtype=np.float64)
+        for p in TARGET_POINTS:
+            pitch, e = S.plan_grasp_pitch(np.array(p), qa)
+            plans.append({"pitch": None if pitch is None else float(pitch), "e": float(e)})
+    out["plan_grasp_pitch"] = plans
+
+    return out
+
+
+# Comparison ------------------------------------------------------------------------
+def _jsonable(x):
+    """Normalize to what a JSON round-trip would yield, so a freshly-collected tree and
+    a loaded golden compare structurally (tuples and ndarrays both become lists)."""
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, np.ndarray):
+        return _jsonable(x.tolist())
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, (np.floating, np.integer)):
+        return x.item()
+    return x
+
+
+def _diff(path, a, b, bad):
+    """Recursively compare two JSON trees, appending human-readable diffs to ``bad``."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b)):
+            if k not in a or k not in b:
+                bad.append(f"{path}.{k}: present in only one side")
+            else:
+                _diff(f"{path}.{k}", a[k], b[k], bad)
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            bad.append(f"{path}: length {len(a)} != {len(b)}")
+            return
+        for i, (x, y) in enumerate(zip(a, b)):
+            _diff(f"{path}[{i}]", x, y, bad)
+    elif isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        if not (math.isnan(a) and math.isnan(b)) and abs(a - b) > ATOL:
+            bad.append(f"{path}: {a!r} != {b!r}  (delta {a - b:+.3e})")
+    elif a != b:
+        bad.append(f"{path}: {a!r} != {b!r}")
+
+
+def compare(current: dict, golden: dict) -> list[str]:
+    bad: list[str] = []
+    _diff("", _jsonable(current), _jsonable(golden), bad)
+    return bad
+
+
+def test_extraction_parity():
+    """The pinned functions still produce the frozen answers."""
+    assert GOLDEN.exists(), (
+        f"no goldens at {GOLDEN} — run `python {__file__} --record` on known-good code first"
+    )
+    S = _load_module()
+    bad = compare(collect(S), json.loads(GOLDEN.read_text()))
+    assert not bad, "extraction changed behaviour:\n  " + "\n  ".join(bad[:40])
+
+
+def test_urdf_limits_match_hardcoded():
+    """The hand-transcribed J_LO/J_HI really are the URDF's limits.
+
+    ``stack_mission2.py:4661`` transcribes the joint limits by hand and the comment
+    above it explains that an IK which does not know them "is not an IK, it is a
+    wish". The extraction reads them from the URDF instead — so first prove the two
+    agree, rather than assuming it.
+    """
+    import xml.etree.ElementTree as ET
+
+    S = _load_module()
+    root = ET.parse(URDF).getroot()
+    lim = {}
+    for j in root.findall("joint"):
+        node = j.find("limit")
+        if node is not None:
+            lim[j.get("name")] = (
+                math.degrees(float(node.get("lower", 0.0))),
+                math.degrees(float(node.get("upper", 0.0))),
+            )
+    missing = [m for m in ARM_MOTORS if m not in lim]
+    assert not missing, f"URDF has no <limit> for {missing}"
+
+    lo = np.array([lim[m][0] for m in ARM_MOTORS])
+    hi = np.array([lim[m][1] for m in ARM_MOTORS])
+    # The transcription is rounded to 1 decimal (96.8 vs 96.83), so compare at that.
+    assert np.allclose(lo, S.J_LO, atol=0.05), f"lower: urdf {lo} vs J_LO {S.J_LO}"
+    assert np.allclose(hi, S.J_HI, atol=0.05), f"upper: urdf {hi} vs J_HI {S.J_HI}"
+
+
+def main(argv):
+    record = "--record" in argv
+    S = _load_module()
+    current = collect(S)
+    if record:
+        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN.write_text(json.dumps(_jsonable(current), indent=1, sort_keys=True))
+        n = sum(len(v) if isinstance(v, (list, dict)) else 1 for v in current.values())
+        print(f"recorded {len(current)} groups / {n} cases -> {GOLDEN.relative_to(REPO)}")
+        return 0
+    if not GOLDEN.exists():
+        print(f"no goldens at {GOLDEN}; run with --record first", file=sys.stderr)
+        return 2
+    bad = compare(current, json.loads(GOLDEN.read_text()))
+    if bad:
+        print(f"PARITY FAILED — {len(bad)} difference(s):", file=sys.stderr)
+        for line in bad[:40]:
+            print("  " + line, file=sys.stderr)
+        if len(bad) > 40:
+            print(f"  ... and {len(bad) - 40} more", file=sys.stderr)
+        return 1
+    test_urdf_limits_match_hardcoded()
+    print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
