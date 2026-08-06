@@ -27,7 +27,6 @@
 # out too shallow — so absolute ranges are compressed and the map's positions are
 # approximate. Most of the localization care in here works around that.
 import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
-import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
 from collections import deque
 
 import cv2
@@ -39,7 +38,7 @@ sys.path.insert(0, r"C:\Users\labot\Documents\lerobot\src")
 
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.perception.yolo_world import YoloWorldDetector
-from lerobot.manipulation.visual_servo.gaze_engine import ARM_MOTORS, parse_tf_string
+from lerobot.manipulation.visual_servo.gaze_engine import parse_tf_string
 from lerobot.manipulation.yolo_track.motion_primitives import send_joint_target_smoothly
 from lerobot.robots.utils import make_robot_from_config
 from lerobot.robots.so_follower import SO101FollowerConfig
@@ -56,52 +55,39 @@ _FTBus._handshake = lambda self: None
 LEROBOT = r"C:\Users\labot\Documents\lerobot"
 OUT = os.path.join(tempfile.gettempdir(), "rax_stack_mission")  # debug-image dumps
 os.makedirs(OUT, exist_ok=True)
-TF = "-0.0503,0.0906,-0.1730,-0.2921,1.0770,-2.1688"
-# [shoulder_pan, shoulder_lift, elbow, wrist_flex, wrist_roll]
-# pan  -6.7 -> +5.0 : turn the whole robot a few degrees LEFT, so the view swings RIGHT
-# roll -28.4 -> 90  : twist the wrist 90deg so the jaws are square to the cube
-GRASP_ROLL = 90.0
-# Display-only: degrees added to wrist_roll before drawing the URDF, because the
-# URDF's roll zero is rotated from the servo's zero. If the rendered gripper is now
-# twisted the OTHER way, flip this sign.
-WRIST_RENDER_OFFSET = 90.0
-VIEW = np.array([5.0, 37.1, 48.1, -40.4, GRASP_ROLL])
-# New home: captured from the physically-correct folded pose (2026-07-20).
-HOME = np.array([-14.1, -99.1, 90.8, 33.2, -4.7])
-HAND_UV = (440.0, 394.0)   # measured via /caltip against the real black fingertip
-# MEASURED FROM THE URDF + JAW MESH (2026-07-13), do not guess this:
-#   moving_jaw_so101_v1.stl, expressed in gripper_frame_link coords, spans
-#   X -38.1..-15.8, Y -23.9..+24.1, Z -84.7..+7.3 mm.
-# So the jaws hinge 75-85 mm BEHIND gripper_frame_link and the fingertips reach
-# only +7 mm past it: `gripper_frame_link` IS the fingertip / grasp centre (it is
-# a TCP frame, 98 mm out past gripper_link, the wrist). `kin.forward_kinematics`
-# therefore already returns the FINGERTIP, and `T_ee[:3,3]` is the right thing to
-# gate the approach on. lookat_engine's `gripper_tip_offset_m = 0.10` does NOT
-# transfer to this FK -- applying it pushed the "tip" 10 cm out into empty air
-# (TIP->cube read LARGER than grip->cube, which is what exposed the error).
-GRIP_TIP_OFFSET_M = 0.007
-# The camera sits BEHIND the fingertips on the gripper — measured on the real mount at
-# ~10 cm. The shipped hand-eye TF puts it at 20.2 cm, i.e. wrong by 2x in translation on
-# top of being ~370 px wrong in rotation. Used to seed/bound calibrate_handeye.
-CAM_TIP_M = 0.10
-PORT = 8484
+
+# ---- the arm, described as data ------------------------------------------------
+# Everything that used to be a literal here now comes from a profile, so pointing
+# this server at a different arm is a matter of writing one (URDF + extrinsics +
+# which joint does what) rather than editing the algorithms. The measurements and
+# the reasons behind them live in robots/profiles/so101.py; the aliases below keep
+# the existing names so the rest of this file is unchanged.
+#   RAX_ARM=<name> selects a profile; see robots/profiles/available_profiles().
+from robots.profiles import load_profile
+
+ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
+
+ARM_MOTORS = list(ARM.joint_names)     # was imported from lerobot's gaze_engine
+TF = ARM.camera.extrinsics
+GRASP_ROLL = ARM.gripper.grasp_roll_deg
+WRIST_RENDER_OFFSET = ARM.gripper.render_offset_deg
+VIEW = np.array(ARM.view_deg)
+HOME = np.array(ARM.home_deg)
+HAND_UV = ARM.gripper.hand_uv
+GRIP_TIP_OFFSET_M = ARM.gripper.tip_offset_m
+CAM_TIP_M = ARM.camera.cam_tip_m
+ARM_PORT = ARM.port                    # the arm's serial port (was "COM4", 3 places)
+PORT = 8484                            # this server's HTTP port
 CAMSURV = ("http://127.0.0.1:5000", "camsurv123")
 
-JOINT_RATE_MAX = 25.0     # deg/s per joint hard clamp (lower = less jerk at stop)
+JOINT_RATE_MAX = ARM.joint_rate_max_dps   # deg/s per joint hard clamp
 
 # gaze-engine approach: point at the target (direct-joint pixel P-control, no
 # IK, so it can't swing) then step straight down the line of sight, decreasing
 # the radius, toward the object's back-projected 3D point (radial-to-object —
 # descends ONTO the cube instead of hovering above it).
-Z_TABLE = 0.02            # base-frame height of the cube CENTRE. THE sightline is
-                          # intersected with THIS plane to localize the cube, so it
-                          # must match the real cube-centre height. A 3 cm cube on
-                          # the table sits ~1.5–2 cm up; the old 0.05 was ~3 cm too
-                          # high, which put the cube too CLOSE + too HIGH (floating
-                          # inside the robot in the 3D view) and made the grasp
-                          # close ~3 cm ABOVE the cube (contact=False). >>> If the
-                          # grasp stops short/high, raise this a few mm; if it
-                          # drives into the table, lower it. <<<
+Z_TABLE = ARM.table_z_m   # base-frame height of the object CENTRE; the sightline is
+                          # intersected with THIS plane to localize. See the profile.
 TARGET_SIZE_M = 0.03      # cube edge — pinhole range from bbox size (survives close range)
 
 state = {
@@ -1076,28 +1062,35 @@ def triangulate(finder, tracker, label):
     return p
 
 
-def close_with_current(step=5.0, delay=0.05):
+def close_with_current(step=None, delay=None):
     """Close the gripper in small increments, watching the servo current, and
     stop the instant it rises (torque change = fingers on the object). Smaller
-    step / longer delay = the slow, gentle close the user asked for."""
+    step / longer delay = the slow, gentle close the user asked for.
+
+    The thresholds come from the profile's GripperProfile, so a different gripper
+    (different gearing, different current scale) declares its own.
+    """
+    g = ARM.gripper
+    step = g.close_step_pct if step is None else step
+    delay = g.close_delay_s if delay is None else delay
     idle = [c for c in (gripper_current() for _ in range(5)) if c is not None]
     i_idle = float(np.mean(idle)) if idle else 0.0
-    pct = 95.0
-    while pct > 2.0:
+    pct = g.open_pct
+    while pct > g.closed_pct:
         checkpoint()
         pct -= step
         joints = observe(overlay=True)[0]
         send_joints(joints, gripper=pct)
         time.sleep(delay)
         c = gripper_current()
-        if c is not None and abs(c - i_idle) >= 8.0:
+        if c is not None and abs(c - i_idle) >= g.contact_current_delta:
             # firmer squeeze — ΔI=1.8 holds slipped the cube during transit
-            send_joints(joints, gripper=max(0.0, pct - 14.0))
+            send_joints(joints, gripper=max(0.0, pct - g.squeeze_extra_pct))
             time.sleep(0.18)
             return True, i_idle
     # Closed on air: DO NOT stay stalled shut (that's what tripped the servo's
     # overload protection earlier) — relax to a neutral opening.
-    send_joints(observe(overlay=False)[0], gripper=40.0)
+    send_joints(observe(overlay=False)[0], gripper=g.relax_on_miss_pct)
     time.sleep(0.18)
     return False, i_idle
 
@@ -1179,8 +1172,8 @@ TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise
 # a "cube" localized at 92 cm is a broken solve, not a distant object — and letting
 # those into the map is what filled it with ghosts strung out along the sightline.
 # Gate every localization on this before it is ever stored.
-MAP_R_MIN = 0.08
-MAP_R_MAX = 0.55
+MAP_R_MIN = ARM.reach_min_m
+MAP_R_MAX = ARM.reach_max_m
 # An entry not re-observed for this long is STALE: the object was moved or taken
 # away, and the map should stop asserting it is there. Without this the map keeps
 # reporting a scene that no longer exists - and worse, a stale high-n entry sits in
@@ -2223,7 +2216,7 @@ PICK_LIFT_M = 0.10
 PLACE_CLEAR_M = 0.008      # gap left under the carried object at release
 PLACE_HOVER_M = 0.07       # hover this far above z_release before descending
 PLACE_TRANSIT_Z = 0.16     # carry the object at this height while traversing
-PLACE_OPEN_PCT = 62.0      # gripper opening that releases without flicking
+PLACE_OPEN_PCT = ARM.gripper.place_open_pct   # releases without flicking the object
 PLACE_RETREAT_M = 0.09     # straight-up retreat after releasing
 
 # Detection resolution. 320 is what the approach trims (AIM_DU, TARGET_RIGHT_TRIM_M,
@@ -3234,7 +3227,7 @@ def _center_on_cube(finder, gp, j5):
 # VIEW's tilt gave "0 good reads" three times in a row while the map, built at
 # HOME's tilt, saw the same cube at r=36.8cm. VIEW's lift is +37 against HOME's
 # -99, so the camera is pointing somewhere else entirely.
-SURVEY_TILT = HOME[1:].copy()   # lift, elbow, wrist_flex, wrist_roll - always these
+SURVEY_TILT = np.array(ARM.survey_tilt_deg)   # every joint after the pan — always these
 SURVEY_READS = 9                # reads to median over (rejects detector jitter)
 SURVEY_SPREAD_MAX = 0.05        # m; if reads disagree by more than this from ONE
                                 # pose the detector is unstable - say so rather
@@ -4652,15 +4645,19 @@ JOG_VEC_TTL = 0.30
 # => to hold the gripper angle we algebraically slave wrist_flex:
 #        j3 = pitch_target - j1 - j2
 # This is exact — no IK convergence needed — so the angle never drifts.
-# THE REAL JOINT LIMITS, read from so101_new_calib.urdf. An IK that does not know
-# these is not an IK, it is a wish: it returns elbow_flex=+162 deg on a joint that
-# stops at +96.8, the servo silently clamps, the arm parks at the stop, and the
-# solver reports a 0.2 mm residual on a pose the robot cannot hold. That is exactly
+# Which joints those are is now declared by the profile (pan_joint / pitch_chain /
+# roll_joint), so an arm with a different layout describes itself instead of being
+# assumed here.
+#
+# THE REAL JOINT LIMITS, now READ FROM THE URDF rather than transcribed. An IK that
+# does not know these is not an IK, it is a wish: it returns elbow_flex=+162 deg on a
+# joint that stops at +96.8, the servo silently clamps, the arm parks at the stop, and
+# the solver reports a 0.2 mm residual on a pose the robot cannot hold. That is exactly
 # what froze the approach for 21 identical hops at pitch 65 while being commanded
 # to 80 (2026-07-13). CLAMP EVERY ITERATION AND SCORE THE CLAMPED POSE.
-J_LO = np.array([-110.0, -100.0, -96.8, -95.0, -157.2])
-J_HI = np.array([+110.0, +100.0, +96.8, +95.0, +162.8])
-WFLEX_MIN, WFLEX_MAX = float(J_LO[3]), float(J_HI[3])   # wrist_flex safe range (deg)
+J_LO, J_HI = ARM.limits()
+_WFLEX = ARM.slaved_joint                               # the algebraically-slaved joint
+WFLEX_MIN, WFLEX_MAX = float(J_LO[_WFLEX]), float(J_HI[_WFLEX])
 
 
 def _slave_wflex(j1, j2, pitch_tgt):
@@ -4948,7 +4945,7 @@ def yolo_approach():
             cmd = [
                 "lerobot-yolo-track-approach",
                 "--robot.type=so101_follower",
-                "--robot.port=COM4",
+                f"--robot.port={ARM_PORT}",
                 "--robot.cameras={\"front\": {\"type\": \"oakd\", \"fps\": 30, \"width\": 640, \"height\": 480, \"use_depth\": true}}",
                 f"--query={q}",
                 "--model-path=./yolov8s-worldv2.pt",
@@ -5656,7 +5653,7 @@ def idle_view():
         time.sleep(0.25)
 
 
-def clear_gripper_overload(ids=(1, 2, 3, 4, 5, 6)):
+def clear_gripper_overload(ids=None):
     """Clear a latched overload on ANY motor with a raw torque cycle, before
     lerobot's handshake reads hit the error.
 
@@ -5664,21 +5661,29 @@ def clear_gripper_overload(ids=(1, 2, 3, 4, 5, 6)):
     but shoulder_lift (id 2) latches too after sustained holding, and THAT is what
     kills the server: `Failed to read 'Min_Position_Limit' on id_=2 ... Overload
     error!` at connect, before anything is running to catch it. Cycle them all.
+
+    The bus layout (ids, baud, register numbers) comes from the profile, so an arm on
+    a different servo bus declares its own instead of inheriting Feetech's.
     """
+    bus = ARM.bus
+    if bus is None:
+        return                      # this arm exposes no raw servo bus
+    if ids is None:
+        ids = bus.motor_ids
     try:
         import scservo_sdk as scs
-        ph = scs.PortHandler("COM4")
+        ph = scs.PortHandler(ARM_PORT)
         if not ph.openPort():
             return
-        ph.setBaudRate(1000000)
+        ph.setBaudRate(bus.baud)
         pk = scs.PacketHandler(0)
         cleared = []
         for mid in ids:
-            pk.write1ByteTxRx(ph, mid, 40, 0)   # torque off
+            pk.write1ByteTxRx(ph, mid, bus.torque_register, 0)   # torque off
             time.sleep(0.12)
-            pk.write1ByteTxRx(ph, mid, 40, 1)   # torque on (clears latched error)
+            pk.write1ByteTxRx(ph, mid, bus.torque_register, 1)   # on: clears the latch
             time.sleep(0.06)
-            _pos, _c, err = pk.read2ByteTxRx(ph, mid, 56)
+            _pos, _c, err = pk.read2ByteTxRx(ph, mid, bus.status_register)
             cleared.append(f"{mid}:{err:#04x}")
         ph.closePort()
         say("overload cleared — " + " ".join(cleared))
@@ -5778,7 +5783,7 @@ def main():
     # leaves the bus in a half-open state that refuses reconnection).
     for attempt in range(6):
         robot = make_robot_from_config(SO101FollowerConfig(
-            port="COM4", id="so101_follower",
+            port=ARM_PORT, id="so101_follower",
             # DEPTH OFF. The pick locates the cube purely geometrically (cast its
             # pixel ray onto the table plane), so stereo depth buys us nothing — and
             # the stereo pipeline is what kept crashing the OAK-D mid-run
@@ -5786,7 +5791,8 @@ def main():
             # Dropping it also roughly halves the USB bandwidth. read_depth_m()
             # degrades gracefully to None.
             cameras={"front": OAKDCameraConfig(
-                fps=30, width=640, height=480, use_depth=False)},
+                fps=ARM.camera.fps, width=ARM.camera.width,
+                height=ARM.camera.height, use_depth=ARM.camera.use_depth)},
         ))
         try:
             robot.connect()
@@ -5816,10 +5822,15 @@ def main():
             except Exception:
                 pass
             time.sleep(2.0)
-    kin = RobotKinematics(LEROBOT + r"\SO101\so101_new_calib.urdf", "gripper_frame_link", ARM_MOTORS)
+    # The arm's own URDF, from the profile. This used to reach into the external
+    # lerobot checkout; that copy only adds two FIXED camera frames, so FK to
+    # gripper_frame_link is bit-identical (verified over 300 random poses) — and
+    # owning the file here is what lets a non-lerobot arm supply its own.
+    kin = RobotKinematics(ARM.urdf_path, ARM.ee_frame, list(ARM.joint_names))
     cam = robot.cameras["front"]
     say("colour stream only (depth OFF) — the pick works by eye, not by stereo")
-    intr = {"fx": 517.0, "fy": 517.0, "cx": 329.5, "cy": 231.4}
+    _fb = ARM.camera.intrinsics_fallback
+    intr = {"fx": _fb[0], "fy": _fb[1], "cx": _fb[2], "cy": _fb[3]}
     if hasattr(cam, "get_depth_intrinsics"):
         try:
             intr = dict(cam.get_depth_intrinsics())
