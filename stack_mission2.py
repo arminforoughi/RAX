@@ -69,6 +69,7 @@ from perception.camera_geometry import (
 from perception.object_priors import (
     PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES, MAX_TABLE_OBJ_M)
 from perception.table_plane import Plane, fit_plane
+from manipulation.arms.ik_strategy import make_ik
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -152,6 +153,19 @@ GEOM = CameraGeometry(
     if ARM.camera.eye_in_hand else FixedCamera(parse_tf(ARM.camera.extrinsics)),
 )
 FLOOR = Plane()          # the measured table surface; re-fitted by calibrate_floor
+
+_IK = [None]
+
+
+def ik_strategy():
+    """The profile's IK strategy, built once the robot model exists.
+
+    Rebuilt if `kin` is swapped (tests construct one after import), so there is no
+    stale solver silently holding a different robot's kinematics.
+    """
+    if _IK[0] is None or _IK[0].kin is not kin:
+        _IK[0] = make_ik(kin, ARM, grasp_pitches=GRASP_PITCH, standoff_m=STANDOFF_H)
+    return _IK[0]
 
 
 def _sync_geometry():
@@ -2169,25 +2183,7 @@ def plan_grasp_pitch(p_obj, q_seed):
     [-10, 55] -- it aimed straight into the dead band. At 70-90 the whole 10-28cm working
     range solves to under 0.3 mm.
     """
-    p_above = np.array([p_obj[0], p_obj[1], p_obj[2] + STANDOFF_H])
-    best = None
-    for pitch in GRASP_PITCH:
-        _, e_hi = _ik_hold_pitch(q_seed, p_above, pitch, float(q_seed[4]), ret_err=True)
-        _, e_lo = _ik_hold_pitch(q_seed, p_obj, pitch, float(q_seed[4]), ret_err=True)
-        worst = max(float(e_hi), float(e_lo))
-        # At the workspace edge (shallow pitch / far reach) the IK residual can be a
-        # few mm larger and still be a valid pose. Use a sliding tolerance so we do
-        # not throw away the arm's real reach; the visual centering pass then fine-tunes.
-        tol = 0.025 if pitch <= 15.0 else 0.004
-        if worst <= tol:
-            return pitch, worst
-        if best is None or worst < best[1]:
-            best = (pitch, worst)
-    # Last resort: if nothing solved tightly but the best residual is still usable,
-    # return it rather than declaring the cube unreachable at the edge of reach.
-    if best is not None and best[1] <= 0.030:
-        return best
-    return None, best[1]
+    return ik_strategy().plan_pitch(p_obj, q_seed)
 
 
 def detect_now(finder, tries=12):
@@ -4538,73 +4534,28 @@ WFLEX_MIN, WFLEX_MAX = float(J_LO[_WFLEX]), float(J_HI[_WFLEX])
 
 
 def _slave_wflex(j1, j2, pitch_tgt):
-    return float(np.clip(pitch_tgt - j1 - j2, WFLEX_MIN, WFLEX_MAX))
+    """Hold the tool pitch by slaving the last pitch joint. See PitchHoldIK.slave."""
+    q = np.zeros(ARM.n_joints, dtype=np.float64)
+    q[1], q[2] = j1, j2
+    return ik_strategy().slave(q, pitch_tgt)
 
 
 def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=80, tol=2e-3,
                    ret_err=False, _retry=True):
-    """Position IK on servos 1-3 (pan, lift, elbow) with wrist_flex (servo 4)
-    ALGEBRAICALLY SLAVED to hold the gripper pitch, and wrist_roll (servo 5) fixed.
+    """Position IK holding the tool pitch — now manipulation/arms/ik_strategy.py.
 
-    THIS SOLVER USED TO SILENTLY NOT CONVERGE, and that was the "the arm grabs at
-    air / just moves out" bug (fixed 2026-07-13). It ran a FIXED 10 iterations with
-    a +-4 deg/iter clamp -- a total travel budget of 40 deg -- while a perfectly
-    ordinary reach like tip -> (0.15, 0, 0.02) needs 80-160 deg of elbow. Measured
-    residual for that exact target with the old code: 107 mm at pitch 0, 93 mm at
-    pitch 20, 35 mm at pitch 60 -- for a point THIS code hits to 0.2 mm. It returned
-    a half-solved pose, goto_smooth faithfully drove to it, the next hop re-seeded
-    from there, and the fingertip crept outward and UPWARD forever
-    (`descend: tip_z +61mm -> +114mm` while being commanded DOWN to +15mm).
+    The solver moved out verbatim (verified bit-identical over a 120-case grid); only
+    the joint indices are read from the profile instead of being literals, which is
+    what lets a different arm use it. The comments explaining WHY it looks the way it
+    does — the fixed-10-iteration bug that made the arm grab at air, the Jacobian
+    reuse, and the two invariants about clamping to the joint limits — live with the
+    code there.
 
-    Why 10 iterations: FK here costs 790 us and a fresh numeric Jacobian is 3 more
-    FK, so 10 iters was already 32 ms -- near the 70 ms jog tick. Fix is to stop
-    rebuilding J every step: over a <=3 cm step it barely rotates, so reuse it for
-    8 iterations. That buys convergence AND is faster than before (16 ms worst case,
-    9 ms for a jog-sized step).
-
-    It now RETURNS THE RESIDUAL (ret_err=True). Callers MUST check it: a target the
-    arm cannot reach is a fact to report, not a pose to drive to.
+    Callers MUST check the residual: a target the arm cannot reach is a fact to
+    report, not a pose to drive to.
     """
-    q = np.array(q_seed, dtype=np.float64)
-    q[4] = float(np.clip(j5_fixed, J_LO[4], J_HI[4]))
-    q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    J = None
-    for it in range(iters):
-        T = np.asarray(kin.forward_kinematics(q))
-        err = p_tgt - T[:3, 3]
-        if np.linalg.norm(err) < 3e-4:
-            break
-        if J is None or it % 8 == 0:
-            J = np.empty((3, 3))
-            for c, ji in enumerate((0, 1, 2)):
-                dq = q.copy()
-                dq[ji] = float(np.clip(dq[ji] + 0.5, J_LO[ji], J_HI[ji]))
-                if ji in (1, 2):                      # keep pitch held while
-                    dq[3] = _slave_wflex(dq[1], dq[2], pitch_tgt)   # perturbing
-                J[:, c] = (np.asarray(kin.forward_kinematics(dq))[:3, 3] - T[:3, 3]) / 0.5
-        dth = np.clip(J.T @ np.linalg.solve(J @ J.T + 1e-6 * np.eye(3), err), -8.0, 8.0)
-        q[:3] = np.clip(q[:3] + dth, J_LO[:3], J_HI[:3])   # <-- STAY INSIDE THE ROBOT
-        q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    # Score the CLAMPED pose, and only call the pitch "held" if wrist_flex did not
-    # saturate -- otherwise we are reporting success on a pose the servos will not hold.
-    e = float(np.linalg.norm(p_tgt - np.asarray(kin.forward_kinematics(q))[:3, 3]))
-    if abs((q[1] + q[2] + q[3]) - pitch_tgt) > 2.0:
-        e = max(e, 0.05)          # pitch could not be held here: treat as unreachable
-    if e > tol and _retry:
-        # Wrong IK branch. There is a genuine elbow-flip dead band (mapped 2026-07-13):
-        # at r=10-15cm the arm simply cannot hold a shallow pitch at all. Re-seed.
-        # The last two seeds extend the arm forward for far / shallow-pitch targets.
-        for alt in ([q_seed[0], -95.0, 90.0, 30.0, j5_fixed],
-                    [q_seed[0], -30.0, 50.0, 60.0, j5_fixed],
-                    [q_seed[0], -60.0, 20.0, 80.0, j5_fixed],
-                    [q_seed[0], -20.0, 75.0, 0.0, j5_fixed],
-                    [q_seed[0], -10.0, 85.0, 0.0, j5_fixed]):
-            q2, e2 = _ik_hold_pitch(np.array(alt, np.float64), p_tgt, pitch_tgt,
-                                    j5_fixed, iters, tol, ret_err=True, _retry=False)
-            if e2 < e:
-                q, e = q2, e2
-            if e <= tol:
-                break
+    q, e = ik_strategy().solve(q_seed, p_tgt, pitch_deg=pitch_tgt, roll_deg=j5_fixed,
+                               iters=iters, tol=tol, _retry=_retry)
     return (q, e) if ret_err else q
 
 

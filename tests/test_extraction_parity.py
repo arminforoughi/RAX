@@ -339,6 +339,38 @@ def test_geometry_sync_is_live():
     assert not np.allclose(np.asarray(S.T_cam_of(q)), T), "hand-eye change did not reach GEOM"
 
 
+def test_pose_ik_branch_runs():
+    """The generic-6DOF IK branch must actually solve, not just import.
+
+    The SO-101 exercises PitchHoldIK, so without this the PoseIK path would be dead
+    code that only breaks the day someone plugs in a different arm. Declare the same
+    arm as a generic wrist and require it to reach.
+    """
+    import dataclasses
+
+    from lerobot.model.kinematics import RobotKinematics
+
+    from manipulation.arms.ik_strategy import PoseIK, make_ik
+    from robots.profiles import load_profile
+
+    p = load_profile("so101")
+    kin = RobotKinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
+    generic = dataclasses.replace(p, name="generic", ik="pose", pan_joint=None,
+                                  pitch_chain=(), roll_joint=None, ik_seeds=())
+    generic.validate()
+    ik = make_ik(kin, generic)
+    assert isinstance(ik, PoseIK)
+
+    seed = np.array(p.home_deg, dtype=np.float64)
+    for tgt in ([0.22, 0.05, 0.05], [0.28, -0.08, 0.04]):
+        q, e = ik.solve(seed, np.array(tgt), pitch_deg=70.0, roll_deg=0.0)
+        assert e < 0.005, f"PoseIK missed {tgt} by {e * 1000:.1f} mm"
+        lo, hi = generic.limits()
+        assert np.all(q >= lo - 1e-9) and np.all(q <= hi + 1e-9), "solution outside limits"
+    pitch, e = ik.plan_pitch(np.array([0.22, 0.05, 0.02]), seed)
+    assert pitch is not None and e < 0.005
+
+
 def test_fixed_camera_pose_is_supported():
     """The geometry must serve a world-mounted camera too, not just eye-in-hand —
     with tip_pixel correctly reporting that it has no answer for that rig."""
@@ -386,8 +418,9 @@ def main(argv):
     test_urdf_limits_match_hardcoded()
     test_geometry_sync_is_live()
     test_fixed_camera_pose_is_supported()
+    test_pose_ik_branch_runs()
     print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI, "
-          f"geometry sync live, fixed-camera path works")
+          f"geometry sync live, fixed-camera and pose-IK branches work")
     return 0
 
 
