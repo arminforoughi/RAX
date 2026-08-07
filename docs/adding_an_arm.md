@@ -123,10 +123,16 @@ both behaviours.
 | FK/IK backends | `manipulation/arms/kinematics.py` |
 | Pitch-hold and pose IK | `manipulation/arms/ik_strategy.py` |
 | Trajectory profiles | `manipulation/arms/motion.py` |
+| Mission phase / log / stop flag | `common/mission_state.py` |
 | Pixels ↔ base frame | `perception/camera_geometry.py` |
 | Detection → position | `perception/locate.py` |
+| Size, height and yaw from one frame | `perception/measure.py` |
 | Table plane | `perception/table_plane.py` |
 | Class size priors | `perception/object_priors.py` |
+| Following between detections | `models/detection/tracking.py` |
 | Object map | `mobility/slam/object_map.py` |
 | Approach tunables and geometry | `manipulation/approach/` |
 | HTTP server, UI, guest sessions | `stack_mission2.py` |
+
+Each package's `__init__.py` lists its public surface, so `from perception import
+CameraGeometry, ObjectMeasurer` and similar work directly.

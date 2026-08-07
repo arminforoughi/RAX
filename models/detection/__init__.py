@@ -5,6 +5,7 @@ Public surface:
     make_detector(backend=...)      YOLO-World, or ColorBlob fallback (no weights)
     MaskTracker                     per-frame mask of the focused object
     make_mask_tracker(backend=...)  SAM2, or ellipse-mask fallback (no weights)
+    AnchorTracker / PixelTracker    follow an object BETWEEN detection cycles
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from models.detection.prompt_detector import (
     YoloWorldDetector,
     make_detector,
 )
+from models.detection.tracking import AnchorTracker, PixelTracker, Track
 from models.detection.sam2_tracker import (
     EllipseMaskTracker,
     MaskTracker,
@@ -24,6 +26,9 @@ from models.detection.sam2_tracker import (
 )
 
 __all__ = [
+    "AnchorTracker",
+    "PixelTracker",
+    "Track",
     "Detection",
     "PromptDetector",
     "YoloWorldDetector",
