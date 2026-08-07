@@ -10,6 +10,7 @@ Public surface:
     ObjectPriors / PRIORS          per-class size and shape priors
     Localizer / Fix                detection -> base-frame position, three strategies
     ObjectMeasurer                 monocular size, height and yaw from one frame
+    fit_reprojection / fit_consistency   hand-eye calibration from arm motion
 
 Subpackages:
     vision/       Camera frame pipeline: capture -> detection -> labeled scene.
@@ -25,6 +26,9 @@ from perception.camera_geometry import (
     parse_tf, tf_to_string)
 from perception.locate import (
     ApparentSizeLocalizer, Fix, Localizer, PlaneRayLocalizer, StereoLocalizer, chain)
+from perception.handeye import (
+    HandEyeFit, HandEyeSample, fit_consistency, fit_reprojection,
+    load_hand_eye, save_hand_eye)
 from perception.measure import ObjectMeasurer
 from perception.object_priors import PRIORS, ObjectPriors
 from perception.table_plane import Plane, PlaneFit, fit_plane
@@ -37,4 +41,6 @@ __all__ = [
     "Localizer", "Fix", "ApparentSizeLocalizer", "PlaneRayLocalizer",
     "StereoLocalizer", "chain",
     "ObjectMeasurer",
+    "HandEyeSample", "HandEyeFit", "fit_reprojection", "fit_consistency",
+    "load_hand_eye", "save_hand_eye",
 ]

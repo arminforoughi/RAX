@@ -103,6 +103,33 @@ problem before the next:
 5. **Scan → 2D map.** Confirms detection and localization before anything moves at speed.
 6. **One pick**, with a hand near the stop button.
 
+## Calibrating the hand-eye
+
+Two fitters live in `perception/handeye.py`, with different objectives:
+
+* **`fit_reprojection`** (`/calib`) — every sightline to one static target must meet at
+  a point, and the fingertip must land on its measured pixel. Solves the transform and
+  the target position together.
+* **`fit_consistency`** (`/calibmount`) — a stationary object must map to the same table
+  position from every viewpoint.
+
+Judge a reprojection fit by the **fingertip gap**, not the reprojection RMS. The gap is
+a hard geometric constraint — the camera is rigid to the end effector, so FK's fingertip
+*must* land on the measured pixel — while a colour-blob centroid has a 50–80 px noise
+floor that more poses do not lower. Gating tightly on RMS rejects good fits and keeps
+broken transforms.
+
+**`fit_reprojection` has a flat direction, and it does not announce itself.** With one
+point target the camera can slide along its viewing direction and the target follow it,
+reproducing every observed pixel; only parallax between poses pins it down. Measured on
+noise-free data seeded with the exact truth, it settles ~14 mm and ~3° away while
+reporting 0.5 px RMS and 0.01 px fingertip error — the numbers look excellent because
+what they measure is excellent.
+
+So: re-running `/calib` on an already-good robot can move the transform. Use
+`/calibmount` to *check* a calibration, and widen the pose spread if you need the
+reprojection fit to be better determined.
+
 ## Known issue to check on a new rig
 
 `ApparentSizeLocalizer` places objects using the size-derived distance as a *range along

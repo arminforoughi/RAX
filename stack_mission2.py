@@ -73,6 +73,8 @@ from manipulation.arms.ik_strategy import make_ik
 from manipulation.arms.motion import MotionLimits, quintic_waypoints
 from perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
 from perception.measure import ObjectMeasurer, classify_shape, silhouette_mask
+from perception.handeye import (
+    HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye)
 from models.detection.tracking import (
     AnchorTracker, PixelTracker, Track, HSV_BANDS, HSV_BANDS_SOFT)
 from mobility.slam.object_map import (
@@ -1370,16 +1372,15 @@ def load_tf_override():
     """A TF we FITTED beats the TF we were handed. Written by calibrate_handeye()."""
     global T_ee_cam
     try:
-        with open(TF_FILE) as f:
-            d = json.load(f)
-        T_ee_cam = parse_tf_string(d["tf"])
-        _sync_geometry()
-        return d
-    except FileNotFoundError:
+        d = load_hand_eye(TF_FILE)
+    except ValueError as e:
+        say(f"hand-eye: ignoring {e}")
         return None
-    except Exception as e:
-        say(f"hand-eye: ignoring bad {os.path.basename(TF_FILE)} ({e})")
+    if d is None:
         return None
+    T_ee_cam = parse_tf_string(d["tf"])
+    _sync_geometry()
+    return d
 
 
 def calibrate_mount_multiview(finder, label="red", n_pan=5):
@@ -1399,8 +1400,6 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
     an anchor so the solution cannot slide off into a mirrored/degenerate pose.
     """
     global T_ee_cam
-    from scipy.optimize import least_squares
-    from scipy.spatial.transform import Rotation
     set_phase("CALIB", "multi-view mount calibration: sampling the cube")
     q0 = observe()[0].astype(np.float64)
     samples = []
@@ -1426,77 +1425,21 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
         raise Abort(f"only {len(samples)} views - need at least 5. "
                     f"Keep the cube visible while the arm pans.")
 
-    t0 = T_ee_cam[:3, 3].copy()
-
-    def unpack(x):
-        T = np.eye(4)
-        T[:3, :3] = Rotation.from_rotvec(x[:3]).as_matrix()
-        T[:3, 3] = x[3:6]
-        return T
-
-    def table_pts(T_cam_ee):
-        pts = []
-        for T_ee, uv in samples:
-            T = T_ee @ T_cam_ee
-            o = T[:3, 3]
-            d = T[:3, :3] @ np.array([(uv[0]-cx0)/fx, (uv[1]-cy0)/fy, 1.0])
-            if d[2] >= -1e-3:
-                return None
-            t = (TABLE_Z0 - o[2]) / d[2]
-            if not (0.02 < t < 2.0):
-                return None
-            pts.append((o + t*d)[:2])
-        return np.array(pts) if pts else None
-
-    def resid(x):
-        T = unpack(x)
-        pts = table_pts(T)
-        if pts is None:
-            return np.full(2*len(samples) + 2, 10.0)
-        spread = (pts - pts.mean(axis=0)).ravel() * 40.0      # metres -> weighted
-        # fingertip anchor: it must still reproject to its measured pixel
-        T_ee, _ = samples[0]
-        tip = T_ee[:3, 3] + T_ee[:3, :3] @ np.array([0, 0, GRIP_TIP_OFFSET_M])
-        Tbc = T_ee @ T
-        pc = np.linalg.inv(Tbc) @ np.append(tip, 1.0)
-        if pc[2] <= 1e-6:
-            anchor = np.array([10.0, 10.0])
-        else:
-            u = fx*pc[0]/pc[2] + cx0
-            v = fy*pc[1]/pc[2] + cy0
-            anchor = np.array([u - HAND_UV[0], v - HAND_UV[1]]) * 0.02
-        return np.concatenate([spread, anchor])
-
-    x0 = np.concatenate([Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(), t0])
-    lo = np.concatenate([x0[:3] - 1.2, t0 - 0.06])
-    hi = np.concatenate([x0[:3] + 1.2, t0 + 0.06])
-    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
-                        max_nfev=3000, ftol=1e-10, xtol=1e-10)
-
-    def spread_cm(x):
-        pts = table_pts(unpack(x))
-        if pts is None:
-            return 999.0
-        return float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).mean() * 100)
-
-    before, after = spread_cm(x0), spread_cm(sol.x)
-    say(f"multi-view spread: {before:.1f}cm -> {after:.1f}cm "
+    # The consistency fit lives in perception/handeye.py; this owns the pan sweep.
+    fit = fit_consistency(
+        [HandEyeSample(T_ee, uv) for T_ee, uv in samples],
+        GEOM, tip_uv=HAND_UV, T_seed=T_ee_cam, z_plane=TABLE_Z0,
+        tip_offset_m=GRIP_TIP_OFFSET_M)
+    say(f"multi-view spread: {fit.before['spread_m']*100:.1f}cm -> {fit.spread_m*100:.1f}cm "
         f"(how much the same cube moves between viewpoints)")
-    if after > before or after > 4.0:
-        raise Abort(f"multi-view calibration did not converge "
-                    f"(spread {after:.1f}cm) - mount NOT changed")
-    T_new = unpack(sol.x)
-    rv = Rotation.from_matrix(T_new[:3, :3]).as_rotvec()
-    tf_str = ",".join(f"{v:.4f}" for v in list(T_new[:3, 3]) + list(rv))
-    T_ee_cam = T_new
+    if not fit.converged:
+        raise Abort(f"multi-view calibration {fit.reason}")
+    T_ee_cam = fit.T_ee_cam
     _sync_geometry()
-    with open(TF_FILE, "w") as f:
-        json.dump({"tf": tf_str, "rms_px": 0, "tip_px": 0,
-                   "spread_cm": after, "views": len(samples),
-                   "source": "multi-view consistency", "fitted": time.strftime("%Y-%m-%d %H:%M:%S")},
-                  f, indent=2)
-    say(f"mount CALIBRATED (multi-view) -> {tf_str}")
-    set_phase("IDLE", f"mount calibrated - same cube now agrees to {after:.1f}cm across views")
+    save_hand_eye(TF_FILE, fit)
+    say(f"mount CALIBRATED (multi-view) -> {fit.tf}")
+    set_phase("IDLE",
+              f"mount calibrated - same cube now agrees to {fit.spread_m*100:.1f}cm across views")
 
 
 
@@ -1526,8 +1469,6 @@ def calibrate_handeye(finder, n_target=14):
     Residuals: 2 + 2N. Seeded from the current TF, so a good TF stays put.
     """
     global T_ee_cam
-    from scipy.optimize import least_squares
-    from scipy.spatial.transform import Rotation
 
     set_phase("CALIB", "hand-eye: sampling the cube from several poses")
     q0 = observe()[0].astype(np.float64)
@@ -1565,89 +1506,31 @@ def calibrate_handeye(finder, n_target=14):
         raise Abort(f"hand-eye: only {len(samples)} usable views (need 6) — "
                     "keep the cube in the gripper view for the whole sweep")
 
-    T_ee = [np.asarray(kin.forward_kinematics(j)) for j, _ in samples]
-    uvs = [uv for _, uv in samples]
-    # The fingertip anchor is pose-independent (the camera is rigid to the ee), so it
-    # is ONE constraint however many poses we took. Weight it like sqrt(N) samples so
-    # it is not drowned out by the noisier cube pixels.
-    w_tip = math.sqrt(len(samples))
+    # The fit itself lives in perception/handeye.py — this owns the motion that
+    # collected the views, which is the part that needs a robot.
+    T_ee0 = np.asarray(kin.forward_kinematics(samples[0][0]))
+    fit = fit_reprojection(
+        [HandEyeSample(np.asarray(kin.forward_kinematics(j)), uv) for j, uv in samples],
+        GEOM, tip_uv=HAND_UV, T_seed=T_ee_cam,
+        target_seed=_measure_point(tr0, T_ee0 @ T_ee_cam), cam_tip_m=CAM_TIP_M)
 
-    def unpack(x):
-        tf = np.eye(4)
-        tf[:3, 3] = x[:3]
-        tf[:3, :3] = Rotation.from_rotvec(x[3:6]).as_matrix()
-        return tf, np.array(x[6:9])
+    say(f"hand-eye BEFORE: cube reprojection RMS={fit.before['rms_px']:.0f}px  "
+        f"fingertip off by {fit.before['tip_gap_px']:.0f}px  ({fit.n_views} views)")
+    say(f"hand-eye AFTER:  cube reprojection RMS={fit.rms_px:.0f}px  "
+        f"fingertip off by {fit.tip_gap_px:.0f}px")
+    if not fit.converged:
+        raise Abort(f"hand-eye: {fit.reason} — TF NOT changed.")
 
-    def resid(x):
-        tf, p = unpack(x)
-        r = []
-        for T, uv in zip(T_ee, uvs):
-            pu = project_base(p, T @ tf)
-            r += [400.0, 400.0] if pu is None else [pu[0] - uv[0], pu[1] - uv[1]]
-        pt = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)      # the fingertip anchor
-        r += ([400.0, 400.0] if pt is None else
-              [w_tip * (pt[0] - HAND_UV[0]), w_tip * (pt[1] - HAND_UV[1])])
-        return r
-
-    p_seed = _measure_point(tr0, T_ee[0] @ T_ee_cam)
-    if p_seed is None:
-        p_seed = np.array([0.18, 0.0, 0.02])
-
-    # SEED THE TRANSLATION AT THE MEASURED MOUNT DISTANCE, not at the old TF's value.
-    # The old TF puts the camera 20.2 cm from the fingertip; the mount was measured at
-    # ~10 cm. Starting a nonlinear fit 2x off in translation invites a bad local minimum,
-    # so keep the old direction (the mount geometry is roughly right) and rescale it, and
-    # bound |t| to something a camera bolted to this gripper can physically be.
-    t_old = np.asarray(T_ee_cam[:3, 3], np.float64)
-    t_seed = t_old / max(1e-6, np.linalg.norm(t_old)) * CAM_TIP_M
-    x0 = np.concatenate([t_seed,
-                         Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(),
-                         np.asarray(p_seed, np.float64)])
-    lo = np.array([-0.16, -0.16, -0.16, -4.0, -4.0, -4.0, -0.45, -0.45, 0.005])
-    hi = np.array([0.16, 0.16, 0.16, 4.0, 4.0, 4.0, 0.45, 0.45, 0.050])
-    x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
-
-    def rms(x):
-        r = np.array(resid(x))[: 2 * len(samples)]
-        return float(np.sqrt((r ** 2).reshape(-1, 2).sum(1).mean()))
-
-    def tipgap(x):
-        tf, _ = unpack(x)
-        pu = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)
-        return 999.0 if pu is None else math.hypot(pu[0] - HAND_UV[0], pu[1] - HAND_UV[1])
-
-    say(f"hand-eye BEFORE: cube reprojection RMS={rms(x0):.0f}px  "
-        f"fingertip off by {tipgap(x0):.0f}px  ({len(samples)} views)")
-
-    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
-                        max_nfev=4000, ftol=1e-10, xtol=1e-10)
-    tf, p = unpack(sol.x)
-    say(f"hand-eye AFTER:  cube reprojection RMS={rms(sol.x):.0f}px  "
-        f"fingertip off by {tipgap(sol.x):.0f}px")
-
-    # Gate on the FINGERTIP gap — a HARD geometric constraint (the camera is bolted
-    # to the gripper, so FK's fingertip must reproject to the measured HAND_UV), which
-    # locks to ~0px on a good fit. Do NOT gate tightly on the cube RMS: a colour-blob
-    # centroid has a ~50-80px noise floor that MORE poses do not lower, so a 25px bar
-    # rejected a GOOD fit (tip 0px, rms 49px) and kept the broken CAD TF. Accept when
-    # the fingertip nails it and the cube RMS is merely sane.
-    if tipgap(sol.x) > 12.0 or rms(sol.x) > 100.0:
-        raise Abort(f"hand-eye: fit did not converge (RMS {rms(sol.x):.0f}px, "
-                    f"tip {tipgap(sol.x):.0f}px) — TF NOT changed. More pose spread needed.")
-
-    rv = Rotation.from_matrix(tf[:3, :3]).as_rotvec()
-    tf_str = ",".join(f"{v:.4f}" for v in list(tf[:3, 3]) + list(rv))
-    with open(TF_FILE, "w") as f:
-        json.dump({"tf": tf_str, "rms_px": rms(sol.x), "tip_px": tipgap(sol.x),
-                   "views": len(samples), "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
-    T_ee_cam = tf
+    save_hand_eye(TF_FILE, fit)
+    T_ee_cam = fit.T_ee_cam
     _sync_geometry()
-    say(f"hand-eye CALIBRATED -> {tf_str}")
+    p = fit.target_p
+    say(f"hand-eye CALIBRATED -> {fit.tf}")
     say(f"  (saved to {os.path.basename(TF_FILE)}; loaded automatically on every restart)")
     say(f"  cube now solves to r={np.hypot(p[0], p[1])*100:.1f}cm "
         f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm")
-    set_phase("CALIB", f"hand-eye fixed — reprojection {rms(sol.x):.0f}px")
-    return tf
+    set_phase("CALIB", f"hand-eye fixed — reprojection {fit.rms_px:.0f}px")
+    return fit.T_ee_cam
 
 
 def bbox_range_m(tr):
