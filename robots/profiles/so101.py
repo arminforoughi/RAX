@@ -105,6 +105,11 @@ PROFILE = ArmProfile(
     survey_tilt_deg=HOME_DEG[1:],   # lift, elbow, wrist_flex, wrist_roll — always these
 
     joint_rate_max_dps=25.0,        # lower = less jerk at stop
+    # The base carries the most inertia and causes the visible jump at motion
+    # start/stop, so it gets the gentlest limits; the wrist can move faster.
+    goto_vmax_dps=(38.0, 55.0, 55.0, 75.0, 90.0),
+    goto_amax_dps2=(75.0, 110.0, 110.0, 150.0, 180.0),
+    goto_dt_s=0.02,                 # 50 Hz command rate
     # Base-frame height of a table object's CENTRE; the sightline is intersected with
     # this plane to localize. If the grasp stops short/high, raise it a few mm; if it
     # drives into the table, lower it.

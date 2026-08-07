@@ -70,6 +70,7 @@ from perception.object_priors import (
     PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES, MAX_TABLE_OBJ_M)
 from perception.table_plane import Plane, fit_plane
 from manipulation.arms.ik_strategy import make_ik
+from manipulation.arms.motion import MotionLimits, quintic_waypoints
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -890,12 +891,7 @@ def send_joints(q, gripper=None):
         robot.send_action(act)
 
 
-# Per-joint velocity / acceleration limits for smooth transit moves (deg/s, deg/s^2).
-# The base carries the most inertia and causes the visible jump, so it gets the
-# gentlest limits. Wrist joints can move faster.
-_GOTO_VMAX = np.array([38.0, 55.0, 55.0, 75.0, 90.0])
-_GOTO_AMAX = np.array([75.0, 110.0, 110.0, 150.0, 180.0])
-_GOTO_DT = 0.02  # 50 Hz command rate
+_GOTO_LIMITS = MotionLimits.from_profile(ARM)
 
 
 def goto_smooth(target, settle=0.15, step=2.0):
@@ -905,36 +901,21 @@ def goto_smooth(target, settle=0.15, step=2.0):
     The old send_joint_target_smoothly moved at a fixed step per tick, which is
     just a velocity cap — it still commanded abrupt starts and stops. Here the
     velocity ramps up and down smoothly, so the camera/gripper "head" glides.
+
+    The profile maths lives in manipulation/arms/motion.py; this owns the send loop
+    and its real-time pacing.
     """
     joints, _r, obs = observe(overlay=False)
     gp = float(obs.get("gripper.pos", 50.0))
-    q0 = np.asarray(joints, dtype=np.float64)
-    q1 = np.asarray(target, dtype=np.float64)
-    delta = q1 - q0
-
     # step=2.0 was the old default degrees/tick; use it as a speed scale.
-    speed = float(step) / 2.0
-    vmax = _GOTO_VMAX * speed
-    amax = _GOTO_AMAX * speed
+    limits = _GOTO_LIMITS.scaled(float(step) / 2.0)
+    waypoints, _T = quintic_waypoints(joints, target, limits)
 
-    # Quintic p(u) = 10u^3 - 15u^4 + 6u^5  ->  max vel 1.875/T, max acc 5.78/T^2
-    abs_d = np.abs(delta)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        T_v = np.where(abs_d > 0.001, 1.875 * abs_d / np.maximum(vmax, 1e-6), 0.0)
-        T_a = np.where(abs_d > 0.001, np.sqrt(5.78 * abs_d / np.maximum(amax, 1e-6)), 0.0)
-    T = float(np.max(np.maximum(T_v, T_a)))
-    T = max(T, 0.12)  # always at least 120 ms for tiny moves
-
-    n = int(np.ceil(T / _GOTO_DT))
     t0 = time.time()
-    for k in range(n + 1):
-        t = min(k * _GOTO_DT, T)
-        u = t / T
-        s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
-        q_cmd = q0 + delta * s
+    for k, q_cmd in enumerate(waypoints):
         send_joints(q_cmd, gripper=gp)
-        # sleep to maintain 50 Hz, accounting for command overhead
-        to_sleep = t0 + (k + 1) * _GOTO_DT - time.time()
+        # sleep to maintain the command rate, accounting for command overhead
+        to_sleep = t0 + (k + 1) * limits.dt_s - time.time()
         if to_sleep > 0:
             time.sleep(to_sleep)
 

@@ -153,6 +153,12 @@ class ArmProfile:
 
     # --- motion / workspace ---------------------------------------------------------
     joint_rate_max_dps: float = 25.0
+    # Per-joint ceilings for smooth transit moves. Per-joint because the joints do not
+    # carry equal inertia: the base swings the whole arm, the wrist swings almost
+    # nothing. Empty tuples fall back to joint_rate_max_dps for every joint.
+    goto_vmax_dps: tuple[float, ...] = ()
+    goto_amax_dps2: tuple[float, ...] = ()
+    goto_dt_s: float = 0.02
     table_z_m: float = 0.0
     reach_min_m: float = 0.08
     reach_max_m: float = 0.55
@@ -214,6 +220,13 @@ class ArmProfile:
         if prof.limits_deg is None:
             lo, hi = joint_limits_deg(prof.urdf_path, list(prof.joint_names))
             prof = replace(prof, limits_deg=(lo, hi))
+        # An arm that has not been characterized per joint moves every joint at its
+        # single overall rate cap — slow and even, rather than guessed and uneven.
+        n = prof.n_joints
+        if not prof.goto_vmax_dps:
+            prof = replace(prof, goto_vmax_dps=(prof.joint_rate_max_dps,) * n)
+        if not prof.goto_amax_dps2:
+            prof = replace(prof, goto_amax_dps2=(prof.joint_rate_max_dps * 2.0,) * n)
         prof.validate()
         return prof
 
@@ -252,6 +265,10 @@ class ArmProfile:
                 raise ValueError(
                     f"{self.name}: ik_seed {seed} has {len(seed)} values, need {n}"
                 )
+        for lim, what in ((self.goto_vmax_dps, "goto_vmax_dps"),
+                          (self.goto_amax_dps2, "goto_amax_dps2")):
+            if lim and len(lim) != n:
+                raise ValueError(f"{self.name}: {what} has {len(lim)} values, need {n}")
         if self.limits_deg is not None:
             lo, hi = self.limits_deg
             if len(lo) != n or len(hi) != n:
