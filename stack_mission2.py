@@ -80,6 +80,7 @@ from models.detection.tracking import (
 from mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 from manipulation.approach import ApproachConfig, approach_target, shift_right
+from manipulation.approach.visual_center import center_on_object
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -2037,101 +2038,54 @@ def _move_tip(p_tgt, pitch, j5, settle=0.12, step=2.5):
     return None
 
 
-ALIGN_TOL_PX = 40.0        # cube this close to the gripper pixel = aligned
-ALIGN_ITERS = 3            # approach already gets close, so quick final centering
+# ALIGN_TOL_PX / ALIGN_ITERS are CFG.align_tol_px / CFG.align_iters now.
+
+
+class _CenteringOps:
+    """Binds this server's arm to the visual servo's interface.
+
+    The servo itself is arm-agnostic (manipulation/approach/visual_center.py); this is
+    the thin layer that knows about `finder`, the grasp pitch being held, and the wrist
+    roll that must not twist mid-approach.
+    """
+
+    def __init__(self, finder, pitch_deg, roll_deg):
+        self.finder, self.pitch, self.roll = finder, pitch_deg, roll_deg
+
+    def joints(self):
+        return observe()[0].astype(np.float64)
+
+    def tip(self, q=None):
+        return _tip(self.joints() if q is None else q)
+
+    def track(self, tries=3):
+        return _cube_track(self.finder, tries=tries)
+
+    def range_m(self, track):
+        return _cube_range_m(track)
+
+    def move_pan(self, delta_deg, *, settle, step):
+        q = self.joints()
+        lo, hi = J_LO[ARM.pan_joint], J_HI[ARM.pan_joint]
+        q[ARM.pan_joint] = float(np.clip(q[ARM.pan_joint] + float(delta_deg), lo, hi))
+        goto_smooth(q, settle=settle, step=step)
+
+    def move_tip(self, p_base, *, settle, step):
+        return _move_tip(np.asarray(p_base, np.float64), self.pitch, self.roll,
+                         settle=settle, step=step) is not None
+
+    say = staticmethod(say)
+    checkpoint = staticmethod(checkpoint)
 
 
 def _center_on_cube(finder, gp, j5):
-    """Center the cube under the jaws with DECOUPLED single-DOF servos:
+    """Center the object under the jaws — manipulation/approach/visual_center.py.
 
-      * horizontal pixel error  ->  rotate the BASE (shoulder_pan)
-      * vertical pixel error    ->  reach RADIALLY in/out
-
-    Each axis is one joint and monotonic, so the sign is trivial to measure and the
-    loop is stable. The previous 2D-Cartesian Jacobian oscillated (109->96->119px)
-    because base rotation, reach and an auto-swept wrist pitch all mixed into it.
-    Pitch is held FIXED here. Returns the final (x, y), or None."""
-    tgt_u = HAND_UV[0] + CFG.aim_du_px
-    tgt_v = HAND_UV[1] + CFG.aim_dv_px
-    tr = _cube_track(finder, tries=5)
-    if tr is None:
-        say("center: cube not in view")
-        return None
-    uv0 = np.array(tr.uv, np.float64)
-    q0 = observe()[0].astype(np.float64)
-    p0 = _tip(q0)
-
-    # Small, slow probe moves so the measurement is clean and the arm does not jerk.
-    PAN_PROBE = 3.0      # deg
-    RAD_PROBE = 0.015    # m
-    # Speed is scaled by estimated cube range so the arm slows down as it gets close.
-    # The BASE is the main source of jerk, so its max step scales the most.
-    r_m = _cube_range_m(tr)
-    close = r_m < 0.12          # within ~12 cm -> slow/close mode
-    speed = 0.9 if close else 1.6
-    # The BASE carries the whole arm's inertia and is what visibly jerks, so it gets
-    # its own slower rate rather than sharing the reach rate.
-    CENTER_STEP = 1.8 * speed   # deg per goto_smooth tick
-    CENTER_SETTLE = 0.12 if close else 0.08  # s
-    MAX_PAN_STEP = (4.5 if close else 8.0)  # deg per iteration
-    MAX_RAD_STEP = (0.020 if close else 0.040)  # m per iteration
-
-    # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
-    qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
-    goto_smooth(qp, settle=CENTER_SETTLE, step=CENTER_STEP)
-    trp = _cube_track(finder, tries=4)
-    goto_smooth(q0, settle=CENTER_SETTLE, step=CENTER_STEP)
-    if trp is None or abs(float(qp[0] - q0[0])) < 0.5:
-        say("center: horizontal probe failed")
-        return _tip(observe()[0])[:2]
-    du_dpan = (float(trp.uv[0]) - uv0[0]) / (qp[0] - q0[0])       # px per deg
-    if abs(du_dpan) < 3.0:
-        say("center: base rotation barely moves the cube")
-        return _tip(observe()[0])[:2]
-
-    # --- probe the VERTICAL sign: cube_v change per +RAD_PROBE radial reach ---
-    r0 = float(np.hypot(p0[0], p0[1])); uo = np.array([p0[0], p0[1]]) / max(r0, 1e-6)
-    dv_dr = None
-    if _move_tip(np.array([p0[0] + uo[0]*RAD_PROBE, p0[1] + uo[1]*RAD_PROBE, p0[2]]),
-                 gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
-        trr = _cube_track(finder, tries=4)
-        _move_tip(np.array([p0[0], p0[1], p0[2]]), gp, j5,
-                  settle=CENTER_SETTLE, step=CENTER_STEP)
-        if trr is not None:
-            dv_dr = (float(trr.uv[1]) - uv0[1]) / RAD_PROBE        # px per metre
-    say(f"center: du/dpan={du_dpan:.1f}px/deg" +
-        (f", dv/dr={dv_dr:.0f}px/m" if dv_dr else ", (no vertical probe)"))
-
-    for it in range(ALIGN_ITERS):
-        checkpoint()
-        tr = _cube_track(finder, tries=3)
-        if tr is None:
-            say("center: cube gone (likely under the jaws) - stopping")
-            break
-        du = float(tr.uv[0]) - tgt_u
-        dv = float(tr.uv[1]) - tgt_v
-        say(f"center {it}: {abs(du):.0f}px {'right' if du > 0 else 'left'}, "
-            f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the jaws")
-        if abs(du) < ALIGN_TOL_PX and abs(dv) < ALIGN_TOL_PX * 1.3:
-            say("centered on the cube")
-            break
-        moved = False
-        q = observe()[0].astype(np.float64)
-        if abs(du) >= ALIGN_TOL_PX:                # horizontal via base rotation
-            dpan = float(np.clip(-du / du_dpan, -MAX_PAN_STEP, MAX_PAN_STEP))
-            q[0] = float(np.clip(q[0] + dpan, -100, 100))
-            goto_smooth(q, settle=CENTER_SETTLE, step=CENTER_STEP); moved = True
-        if dv_dr and abs(dv) >= ALIGN_TOL_PX * 1.3:   # vertical via radial reach
-            p = _tip(observe()[0]); r = float(np.hypot(p[0], p[1]))
-            uo = np.array([p[0], p[1]]) / max(r, 1e-6)
-            dr = float(np.clip(-dv / dv_dr, -MAX_RAD_STEP, MAX_RAD_STEP))
-            if _move_tip(np.array([p[0] + uo[0]*dr, p[1] + uo[1]*dr, p[2]]),
-                         gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
-                moved = True
-        if not moved:
-            break
-    tip = _tip(observe()[0])
-    return np.array([tip[0], tip[1]], np.float64)
+    Returns the final (x, y), or None if the object was never in view.
+    """
+    aim = (HAND_UV[0] + CFG.aim_du_px, HAND_UV[1] + CFG.aim_dv_px)
+    res = center_on_object(_CenteringOps(finder, gp, j5), aim, CFG)
+    return res.xy
 
 
 # ---------------- locate from ONE fixed pose ----------------

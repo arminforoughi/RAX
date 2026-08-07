@@ -86,7 +86,10 @@ class ApproachConfig:
     # --- visual centering ---------------------------------------------------------
     aim_du_px: float = -45.0
     aim_dv_px: float = 0.0
-    align_tol_px: float = 12.0
+    # Object this close to the aim pixel counts as centred. Deliberately loose: the
+    # staged approach already gets close, and chasing a tight pixel tolerance with
+    # coarse radial reach moves costs iterations without improving the grasp.
+    align_tol_px: float = 40.0
     align_iters: int = 3
 
     # --- localization corrections -------------------------------------------------
