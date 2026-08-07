@@ -154,12 +154,27 @@ both behaviours.
 | Pixels ↔ base frame | `perception/camera_geometry.py` |
 | Detection → position | `perception/locate.py` |
 | Size, height and yaw from one frame | `perception/measure.py` |
+| Hand-eye calibration | `perception/handeye.py` |
 | Table plane | `perception/table_plane.py` |
 | Class size priors | `perception/object_priors.py` |
 | Following between detections | `models/detection/tracking.py` |
 | Object map | `mobility/slam/object_map.py` |
-| Approach tunables and geometry | `manipulation/approach/` |
+| Approach tunables, staging, centring | `manipulation/approach/` |
 | HTTP server, UI, guest sessions | `stack_mission2.py` |
 
 Each package's `__init__.py` lists its public surface, so `from perception import
 CameraGeometry, ObjectMeasurer` and similar work directly.
+
+### What deliberately stays in the server
+
+`run_mission` and `place_at` are not extracted, and that is a decision rather than an
+omission. Measured, `run_mission` touches 23 distinct module-level names, and roughly a
+third of its statements are `say`/`set_phase` calls. What remains in it after the
+extractions is narration, phase transitions, retry policy, and abort handling wrapped
+around pieces that already live in packages. Hoisting that out would need an interface
+of 23 members — a facade over the whole robot, not an abstraction — and would make the
+sequence harder to read, not easier.
+
+The reusable parts of the approach *are* extracted: the staging geometry, the tunables,
+and the centring servo. A new arm reuses those and writes its own mission sequence, which
+is the part that legitimately differs between robots.
