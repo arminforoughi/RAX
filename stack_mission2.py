@@ -71,6 +71,9 @@ from perception.object_priors import (
 from perception.table_plane import Plane, fit_plane
 from manipulation.arms.ik_strategy import make_ik
 from manipulation.arms.motion import MotionLimits, quintic_waypoints
+from perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
+from mobility.slam.object_map import (
+    ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -1220,154 +1223,63 @@ W2D_MERGE = 0.14          # detections of the same label within this = same obje
                           # Tightened because objects were being merged too
                           # aggressively in the compressed map. Increase if you get
                           # duplicate ghosts for one cube.
-W2D = {"objs": {}, "next": 1}
-w2d_lock = threading.Lock()
+# The bird's-eye object map. Its association rules, the support-ring footprint fit
+# and the consolidation pass live in mobility/slam/object_map.py; the callables below
+# are injected because they depend on things the map does not own — the active query,
+# and how a measured footprint maps to a shape name. They are wrapped in lambdas
+# because they are defined further down this file.
+WORLD = ObjectMap(
+    merge_m=W2D_MERGE,
+    ttl_s=MAP_TTL_S,
+    may_merge_labels=lambda a, b: _may_merge_labels(a, b),
+    classify_shape=lambda w, d, h, prior: _classify_shape(w, d, h, prior),
+    prior_shape=lambda label: class_meta(label)["shape"],
+    log=say,
+)
+w2d_lock = WORLD.lock
 
 
-def _rotate_xy(xy, deg):
-    """Rotate a base-frame (x, y) point about the origin by deg degrees."""
-    th = math.radians(float(deg))
-    c, s = math.cos(th), math.sin(th)
-    return np.array([xy[0] * c - xy[1] * s, xy[0] * s + xy[1] * c], dtype=np.float64)
+_rotate_xy = rotate_xy      # now perception/locate.py
+
+_LOC = [None]
+
+
+def localizers():
+    """The localization strategies, with the live-tunable corrections refreshed.
+
+    RANGE_SCALE and MAP_BEARING_OFFSET_DEG are dialled from the UI against the 3D
+    view, so they are pushed on every call rather than captured at construction.
+    """
+    if _LOC[0] is None:
+        reach = (MAP_R_MIN, MAP_R_MAX)
+        _LOC[0] = (
+            ApparentSizeLocalizer(GEOM, PRIORS, reach_m=reach),
+            # The table solve is used by callers that judge the raw point themselves,
+            # so it does not additionally gate on the workspace.
+            PlaneRayLocalizer(GEOM, PRIORS, reach_m=reach, z_plane=TABLE_Z0,
+                              gate_reach=False),
+        )
+    for loc in _LOC[0]:
+        loc.range_scale = float(RANGE_SCALE[0])
+        loc.bearing_offset_deg = float(MAP_BEARING_OFFSET_DEG[0])
+    return _LOC[0]
 
 
 def obj_xy_2d(bbox, T_cam, z_m=None, label=None):
-    """Where the object is, base-frame (x, y).
+    """Where the object is, base-frame (x, y) — see perception/locate.py.
 
-    RANGE COMES FROM STEREO DEPTH when it is available and sane; otherwise it
-    falls back to apparent size:
-
-        range = focal * real_object_width / bbox_width_px
-
-    The real width is looked up from CLASS_META by label. Stereo depth is
-    independent of the object's size, so it anchors the range and kills the
-    random jumps.
+    Returns (xy | None, range_m, assumed_size_m). The strategy, including the
+    elongated-object long-axis branch and why it exists, lives with the code there.
     """
-    x1, y1, x2, y2 = bbox
-    w, h = x2 - x1, y2 - y1
-    if w < 4 or h < 4:
-        return None, float("nan"), class_size_m(label)
-
-    real_w = class_size_m(label)
-
-    # APPARENT-SIZE RANGING IS ONLY VALID FOR OBJECTS THAT LOOK THE SAME FROM EVERY
-    # SIDE. range = fx * assumed_width / bbox_width treats the bbox width as the
-    # object's real width. For a cube or a cup that holds at any angle. For an
-    # elongated object it is nonsense: measured, a 14 cm pen 40 cm away reports
-    # 150 cm when it lies across the view, 14 cm when diagonal and 11 cm end-on -
-    # a 13x swing driven purely by an angle nobody measured. Each frame it rotates
-    # slightly, the range jumps, and the map grows another ghost somewhere new.
-    #
-    # So: refuse to place elongated objects from apparent size alone. Better a gap
-    # in the map than a confident wrong coordinate the arm will then drive at.
-    pm = class_meta(label)
-    aspect = max(pm["w_m"], pm["d_m"]) / max(min(pm["w_m"], pm["d_m"]), 1e-4)
-    if aspect > 2.2 and (z_m is None or not (0.03 < z_m < 1.20)):
-        # ELONGATED OBJECT: measure against its LONG axis, not its width.
-        # class_size_m returns the geometric mean of w and d (3.7 cm for a pen) and
-        # comparing that to the bbox WIDTH is meaningless - the width is whatever
-        # angle the pen happens to lie at, which is why the overlay read "15cm" for
-        # a pen 30 cm away. The bbox's LONGEST side, however, always corresponds to
-        # the object's LONGEST axis, foreshortened by the viewing angle. That over-
-        # estimates range when foreshortened, but it is bounded and roughly right,
-        # instead of being wrong by a factor that swings with rotation.
-        #
-        # (The table-plane methods would be better still, but they need the hand-eye
-        # rotation to be correct and it is not - rays from the upper frame graze out
-        # to ~5.8 m. Apparent size is the only range that does not go through it.)
-        long_px = float(max(w, h))
-        rng = float(fx * max(pm["w_m"], pm["d_m"]) / max(long_px, 4.0))
-        if not (0.05 < rng < 1.20):
-            return None, float("nan"), real_w
-        rng *= float(RANGE_SCALE[0])
-        rng = float(np.clip(rng, 0.03, 1.50))
-        u = (x1 + x2) / 2.0
-        v = (y1 + y2) / 2.0
-        d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
-        d /= np.linalg.norm(d)
-        pt = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
-        xy = pt[:2]
-        if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
-            return None, float("nan"), real_w
-        return _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0]), float(rng), real_w
-
-    # Prefer stereo depth if the caller passed a valid metric range.
-    if z_m is not None and 0.03 < z_m < 1.20:
-        rng = float(z_m)
-    else:
-        rng = float(fx * real_w / float(w))
-        if not (0.05 < rng < 1.20):
-            return None, float("nan"), real_w
-
-    rng *= float(RANGE_SCALE[0])
-    rng = float(np.clip(rng, 0.03, 1.50))
-
-    u = (x1 + x2) / 2.0
-    v = (y1 + y2) / 2.0
-    d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
-    d /= np.linalg.norm(d)
-    p = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
-    xy = p[:2]
-    if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
-        return None, float("nan"), real_w
-    # Correct heading/yaw error in the hand-eye by rotating the bearing.
-    xy = _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0])
-    return xy, float(rng), real_w
+    apparent, _plane = localizers()
+    fix = apparent.locate(bbox, T_cam, label=label, z_m=z_m)
+    return (fix.xy if fix.ok else None), fix.range_m, fix.size_m
 
 
 def _consolidate_2d():
-    """Collapse map entries that are really ONE physical object.
-
-    MERGING ONLY WITHIN A LABEL WAS THE BUG. An open vocabulary gives one object
-    several names - a single pen fired as pen, knife, scissors, toothbrush AND
-    remote, so it became five "objects" that could never combine no matter how
-    close together they sat (measured: five entries within 6-9 cm of each other).
-    Two detections at the same place ARE the same thing; the label is the least
-    reliable part of the observation, so position decides and the best-supported
-    name wins. Weighted by observation count. Caller holds w2d_lock.
-    """
-    objs = W2D["objs"]
-    changed = True
-    while changed:
-        changed = False
-        items = list(objs.items())
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                ta, a = items[i]
-                tb, b = items[j]
-                if ta not in objs or tb not in objs:
-                    continue
-                if not _may_merge_labels(a["label"], b["label"]):
-                    continue
-                if float(np.hypot(*(a["xy"] - b["xy"]))) < _merge_radius(a, b):
-                    keep, drop = (ta, tb) if a["n"] >= b["n"] else (tb, ta)
-                    ko, do = objs[keep], objs[drop]
-                    wsum = ko["n"] + do["n"]
-                    ko["xy"] = (ko["n"] * ko["xy"] + do["n"] * do["xy"]) / wsum
-                    for k in ("w_m", "d_m", "h_m"):
-                        ko[k] = (ko["n"] * ko[k] + do["n"] * do[k]) / wsum
-                    ko["yaw"] = _yaw_blend(ko["yaw"], do["yaw"], do["n"] / wsum)
-                    # a measurement beats a prior, whichever entry it came from
-                    if do.get("measured") and not ko.get("measured"):
-                        ko["shape"], ko["measured"] = do["shape"], True
-                    # two ghosts of one object each hold caliper readings from the
-                    # bearings they were seen from — pooling them is exactly the
-                    # extra evidence the footprint fit wants
-                    for bk, bv in do.get("sup", {}).items():
-                        ko["sup"][bk] = 0.5 * (ko["sup"][bk] + bv) if bk in ko["sup"] else bv
-                    fit = _fit_rect_from_support(ko["sup"])
-                    if fit is not None:
-                        ko["w_m"], ko["d_m"], ko["yaw"] = fit
-                    if ko["label"] != do["label"]:
-                        alt = set(ko.get("aka", ())) | set(do.get("aka", ())) | {do["label"]}
-                        ko["aka"] = sorted(alt - {ko["label"]})
-                    ko["n"] = wsum
-                    ko["t"] = max(ko["t"], do["t"])
-                    del objs[drop]
-                    changed = True
-                    break
-            if changed:
-                break
+    """Collapse map entries that are really ONE physical object — ObjectMap.consolidate.
+    Caller holds w2d_lock."""
+    WORLD.consolidate()
 
 
 # Wrist roll that lines the JAWS UP ACROSS an object's long axis — the only way a
@@ -1396,112 +1308,25 @@ def grasp_roll_for_yaw(yaw_deg, xy):
 
 
 def _merge_radius(a, b=None):
-    """How close two same-label detections must be to count as one object.
-
-    THE FLOOR IS SET BY LOCALIZATION NOISE, NOT BY OBJECT SIZE. Scaling this down
-    to 0.55x the object's own footprint (3.5 cm for a cube) was wrong and produced
-    the 16-ghost map: consecutive views of ONE cube land 5-15 cm apart, so every
-    observation spawned a fresh tag. Object size may only ever WIDEN the radius —
-    a laptop needs more than 14 cm — never narrow it below what the jitter demands.
-    """
-    r = W2D_MERGE
-    for o in (a, b):
-        if o is not None:
-            r = max(r, 0.55 * max(o["w_m"], o["d_m"]))
-    return float(np.clip(r, W2D_MERGE, 0.30))
+    """How close two detections must be to count as one object — see ObjectMap."""
+    return WORLD.merge_radius(a, b)
 
 
-def _yaw_blend(y_old, y_new, w_new):
-    """Circular mean of two axis angles. A footprint rectangle has no front, so
-    yaw lives mod 180 deg — averaging -89 and +89 naively gives 0, which is a
-    right angle away from both. Average the doubled angle instead."""
-    a = math.radians(2.0 * float(y_old))
-    b = math.radians(2.0 * float(y_new))
-    s = (1 - w_new) * math.sin(a) + w_new * math.sin(b)
-    c = (1 - w_new) * math.cos(a) + w_new * math.cos(b)
-    if abs(s) < 1e-9 and abs(c) < 1e-9:
-        return float(y_new)
-    return float(((math.degrees(math.atan2(s, c)) / 2.0 + 90.0) % 180.0) - 90.0)
+_yaw_blend = yaw_blend      # circular mean of two axis angles; now object_map.py
 
 
 def world2d_update(label, xy, stereo, w_m, d_m, h_m, shape, yaw, measured,
                    across_m=None, u_deg=None):
-    """Fold one observation of one object into the map.
+    """Fold one observation of one object into the map — ObjectMap.update.
 
     across_m / u_deg are one caliper reading of the footprint (its width along the
     across-view direction u_deg) — the only footprint fact a single view actually
-    establishes. They accumulate per direction bin, and once three bearings are in,
-    the footprint and yaw are re-fitted from all of them.
+    establishes. The association rules, and the two bugs that shaped them, are
+    documented in mobility/slam/object_map.py.
     """
-    xy = np.asarray(xy, float)
-    obs = {"w_m": float(w_m), "d_m": float(d_m)}
-    with w2d_lock:
-        # Match on POSITION, not on the label: the same object arrives under
-        # different names from an open vocabulary, and a new name must land on the
-        # existing entry rather than spawn a rival ghost beside it.
-        best, bd = None, None
-        for t, o in W2D["objs"].items():
-            if not _may_merge_labels(o["label"], label):
-                continue
-            dist = float(np.hypot(*(o["xy"] - xy)))
-            if dist < _merge_radius(o, obs) and (bd is None or dist < bd):
-                best, bd = t, dist
-        if best is None:
-            best = W2D["next"]; W2D["next"] += 1
-            W2D["objs"][best] = {"label": label, "xy": xy,
-                                 "w_m": float(w_m), "d_m": float(d_m), "h_m": float(h_m),
-                                 "shape": str(shape), "yaw": float(yaw),
-                                 "measured": bool(measured), "sup": {},
-                                 "n": 1, "stereo": stereo, "t": time.time()}
-        else:
-            o = W2D["objs"][best]
-            # A DIFFERENT label landing on a STALE entry means the thing at this
-            # spot changed - the old name is not evidence any more, however many
-            # times it was seen. Take the position over outright rather than let a
-            # stale n=1793 "red cube" swallow every new observation of the green one
-            # that is actually sitting there now.
-            # Compare against when this entry was last confirmed UNDER ITS OWN
-            # NAME, not when it was last touched at all. Touch-time never goes
-            # stale: every incoming green observation refreshed the leftover "red
-            # cube" entry it was being merged into, so the relabel that would have
-            # fixed it could never fire - the wrong label kept itself alive.
-            seen_as_itself = o.get("label_t", o["t"])
-            if o["label"] != label and (time.time() - seen_as_itself) > LABEL_TAKEOVER_S:
-                say(f"map: {o['label']}#{best} not confirmed as '{o['label']}' for "
-                    f"{time.time() - seen_as_itself:.0f}s — relabelling as '{label}'")
-                o["label"], o["aka"], o["n"] = label, [], 0
-                o["measured"] = False
-            if o["label"] == label:
-                o["label_t"] = time.time()
-            # Give fresh observations more weight so the map converges faster and
-            # does not stay stuck on an early bad localization.
-            o["xy"] = 0.55 * o["xy"] + 0.45 * xy
-            if measured and not o.get("measured"):
-                o["w_m"], o["d_m"], o["h_m"] = float(w_m), float(d_m), float(h_m)
-                o["yaw"], o["shape"], o["measured"] = float(yaw), str(shape), True
-            elif measured or not o.get("measured"):
-                o["h_m"] = 0.7 * o["h_m"] + 0.3 * float(h_m)
-                if not o["sup"]:            # no caliper readings yet — keep blending
-                    o["w_m"] = 0.7 * o["w_m"] + 0.3 * float(w_m)
-                    o["d_m"] = 0.7 * o["d_m"] + 0.3 * float(d_m)
-                    o["yaw"] = _yaw_blend(o["yaw"], yaw, 0.3)
-            if o["label"] != label:
-                o["aka"] = sorted(set(o.get("aka", ())) | {label} - {o["label"]})
-            o["n"] += 1
-            o["stereo"] = stereo
-            o["t"] = time.time()
-
-        o = W2D["objs"][best]
-        if across_m is not None and u_deg is not None:
-            k = _sup_bin(u_deg)
-            o["sup"][k] = (0.6 * o["sup"][k] + 0.4 * float(across_m)
-                           if k in o["sup"] else float(across_m))
-            fit = _fit_rect_from_support(o["sup"])
-            if fit is not None:
-                o["w_m"], o["d_m"], o["yaw"] = fit
-                o["shape"] = _classify_shape(o["w_m"], o["d_m"], o["h_m"],
-                                             class_meta(label)["shape"])
-        _consolidate_2d()
+    return WORLD.update(label, xy, stereo=stereo, w_m=w_m, d_m=d_m, h_m=h_m,
+                        shape=shape, yaw=yaw, measured=measured,
+                        across_m=across_m, u_deg=u_deg)
 
 
 def sense_2d(joints=None, rgb=None):
@@ -1574,14 +1399,12 @@ def _map_tracks(rgb, label, T):
 
 
 def world2d_snapshot():
-    now = time.time()
+    # forget objects that have not been seen in a while: the map should describe the
+    # table as it is, not as it once was
+    WORLD.prune()
     with w2d_lock:
-        # forget objects that have not been seen in a while: the map should
-        # describe the table as it is, not as it once was
-        for t in [t for t, o in W2D["objs"].items() if now - o["t"] > MAP_TTL_S]:
-            del W2D["objs"][t]
         out = []
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             w_m, d_m, h_m = float(o["w_m"]), float(o["d_m"]), float(o["h_m"])
             out.append({"tag": t, "label": o["label"],
                         "x": round(float(o["xy"][0]), 3), "y": round(float(o["xy"][1]), 3),
@@ -1689,7 +1512,7 @@ def _scan_sweep():
 def goto_2d(tag):
     """Fly the gripper on top of a mapped object (hover ~6 cm above its (x,y))."""
     with w2d_lock:
-        o = W2D["objs"].get(tag)
+        o = WORLD.objs.get(tag)
     if o is None:
         raise Abort(f"tag {tag} not in the 2D map")
     xy, label = o["xy"], o["label"]
@@ -1744,20 +1567,11 @@ def solve_on_table(tr, T_base_cam):
     is exactly the "it should be further out" error. Here the size falls out of
     the solve instead of being assumed, so it is self-correcting.
     """
-    x1, y1, x2, y2 = tr.bbox_xyxy
-    w = float(max(4.0, x2 - x1))          # horizontal extent ~ the cube edge
-    o = T_base_cam[:3, 3]
-    d_cam = np.array([(tr.uv[0] - cx0) / fx, (tr.uv[1] - cy0) / fy, 1.0])
-    dirv = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
-    den = w / (2.0 * fx) - float(dirv[2])
-    if den <= 1e-6:
+    _apparent, plane = localizers()
+    fix = plane.locate(tr.bbox_xyxy, T_base_cam, uv=tr.uv)
+    if not fix.ok:
         return None, None
-    d = (float(o[2]) - TABLE_Z0) / den
-    if not (0.03 < d < 0.80):
-        return None, None
-    p = o + d * dirv
-    S = d * w / fx                        # the cube edge this implies
-    return p, float(S)
+    return np.array([fix.xy[0], fix.xy[1], fix.z_m], dtype=np.float64), fix.size_m
 
 
 def locate_on_table(finder, tracker, label):
@@ -2828,53 +2642,13 @@ def measure_object(rgb, bbox, T_base_cam, label, z_plane=None):
 # axis). That is the footprint's SUPPORT WIDTH along that direction, and a convex
 # shape is determined by its support widths — so a scan sweep, which sees each
 # object from a spread of bearings, measures the whole footprint between them.
-SUP_BINS = 12              # direction bins over 180 deg (15 deg each)
-SUP_MIN_BINS = 3           # fit a rectangle only once this many bearings are in
+# SUP_BINS / SUP_MIN_BINS now live with the fit in mobility/slam/object_map.py
 
 
-def _sup_bin(u_deg):
-    return int(((float(u_deg) % 180.0) / 180.0) * SUP_BINS) % SUP_BINS
+_sup_bin = sup_bin                              # now mobility/slam/object_map.py
+_fit_rect_from_support = fit_rect_from_support  # least-squares footprint rectangle
 
 
-def _fit_rect_from_support(sup):
-    """Least-squares rectangle through the accumulated support widths.
-
-    A rectangle with half-sides (a, b) at yaw phi has support width
-        s(theta) = 2a|cos(theta - phi)| + 2b|sin(theta - phi)|
-    Sweep phi over 1 deg steps; for each, a and b fall out of a 2x2 linear solve.
-    Keep the phi with the smallest residual. Returns (w_m, d_m, yaw_deg) with d_m
-    the long side and yaw along it, or None when too few bearings have been seen.
-    """
-    obs = [(math.radians((k + 0.5) * 180.0 / SUP_BINS), s)
-           for k, s in sorted(sup.items()) if s > 0]
-    if len(obs) < SUP_MIN_BINS:
-        return None
-    th = np.array([o[0] for o in obs])
-    s = np.array([o[1] for o in obs])
-    best = None
-    for phi_deg in range(0, 180):
-        phi = math.radians(phi_deg)
-        A = np.stack([np.abs(np.cos(th - phi)), np.abs(np.sin(th - phi))], axis=1)
-        try:
-            x, *_ = np.linalg.lstsq(A, s, rcond=None)
-        except np.linalg.LinAlgError:
-            continue
-        if x[0] <= 0 or x[1] <= 0:
-            continue
-        r = float(np.linalg.norm(A @ x - s))
-        if best is None or r < best[0]:
-            best = (r, float(x[0]), float(x[1]), phi_deg)
-    if best is None:
-        return None
-    _r, e1, e2, phi_deg = best
-    # e1 is the extent along phi, e2 across it; report the long side as d/yaw
-    if e1 >= e2:
-        d_m, w_m, yaw = e1, e2, phi_deg
-    else:
-        d_m, w_m, yaw = e2, e1, phi_deg + 90.0
-    if not (0.004 < w_m < MAX_TABLE_OBJ_M and 0.004 < d_m < MAX_TABLE_OBJ_M):
-        return None
-    return float(w_m), float(d_m), float(((yaw + 90.0) % 180.0) - 90.0)
 # Lateral aim trim, in pixels, applied to the fingertip aim point. The gripper was
 # consistently ending up LEFT of the cube. Moving the aim point LEFT (negative)
 # makes the arm travel FURTHER RIGHT before it thinks it is lined up, because
@@ -3187,7 +2961,7 @@ def _mapped_xy(label):
     want = label.split()[0].lower()
     best = None
     with w2d_lock:
-        for o in W2D["objs"].values():
+        for o in WORLD.objs.values():
             if want in o["label"].lower():
                 if best is None or o["n"] > best["n"]:
                     best = o
@@ -3200,13 +2974,13 @@ def _picked_height(label, gx, gy):
     marks that entry so the place can retire it. Falls back to the class prior."""
     with w2d_lock:
         best, bd = None, 0.10
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             d = float(np.hypot(o["xy"][0] - gx, o["xy"][1] - gy))
             if d < bd and label.split()[0] in o["label"]:
                 best, bd = t, d
         if best is not None:
-            W2D["objs"][best]["picked"] = True
-            return float(max(W2D["objs"][best]["h_m"], 0.005))
+            WORLD.objs[best]["picked"] = True
+            return float(max(WORLD.objs[best]["h_m"], 0.005))
     for cand in (label, f"{label} cube"):
         if str(cand).strip().lower() in CLASS_META:
             return class_height_m(cand)
@@ -3222,7 +2996,7 @@ def _dest_geometry(tag=None, xy=None):
     """
     if tag is not None:
         with w2d_lock:
-            o = W2D["objs"].get(int(tag))
+            o = WORLD.objs.get(int(tag))
             if o is None:
                 raise Abort(f"destination tag {tag} is not on the 2D map")
             return (np.array(o["xy"], np.float64),
@@ -3318,7 +3092,7 @@ def place_at(tag=None, xy=None, recenter=True):
     # ---- 6. the stack got taller: record it, or the next place lands INSIDE it ----
     if tag is not None and h_carry > 0:
         with w2d_lock:
-            o = W2D["objs"].get(int(tag))
+            o = WORLD.objs.get(int(tag))
             if o is not None:
                 o["h_m"] = float(h_top + h_carry)
                 o["t"] = time.time()
@@ -3326,9 +3100,9 @@ def place_at(tag=None, xy=None, recenter=True):
     if carry_label:
         # the carried object is no longer where it was picked from
         with w2d_lock:
-            for t, o in list(W2D["objs"].items()):
+            for t, o in list(WORLD.objs.items()):
                 if o["label"] == carry_label and o.get("picked"):
-                    del W2D["objs"][t]
+                    del WORLD.objs[t]
     set_phase("DONE", f"placed {carry_label} on {where}")
 
 
@@ -5356,7 +5130,7 @@ def _find_map_tag(label):
     want = str(label).strip().lower()
     with w2d_lock:
         best, bn = None, -1
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             if o.get("picked"):
                 continue
             if want in o["label"].lower() or o["label"].lower() in want:
@@ -5432,9 +5206,7 @@ def r_pickplace():
 
 @app.route("/clearmap2d", methods=["POST"])
 def r_clearmap2d():
-    global W2D
-    with w2d_lock:
-        W2D = {"objs": {}, "next": 1}
+    WORLD.clear()
     say("2D map cleared")
     return jsonify(ok=True)
 
