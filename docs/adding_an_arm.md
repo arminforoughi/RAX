@@ -130,6 +130,43 @@ So: re-running `/calib` on an already-good robot can move the transform. Use
 `/calibmount` to *check* a calibration, and widen the pose spread if you need the
 reprojection fit to be better determined.
 
+## Solving the localization knobs instead of dialling them
+
+`push_out_cm`, `range_scale` and `bearing_deg` are not preferences. Each is a
+compensation for a systematic error, historically found by turning a dial until grasps
+stopped missing — which is why they needed retuning whenever anything moved.
+
+They can be solved, because **the arm can generate its own ground truth**. While the
+gripper holds an object, forward kinematics says exactly where that object is. Show it to
+the camera at a spread of radii and bearings, localize it normally, and the difference is
+the error — measured, everywhere you care about, with no ruler.
+
+**The procedure** (`perception/selfcal.py`):
+
+1. Grasp any object whose label the detector reports reliably.
+2. For each of ~6 radii (15–40 cm) × ~5 bearings (−40°…+40°), move the held object there
+   and record `LocalizationSample(xy_true=FK_tip_xy, xy_observed=localizer_result,
+   off_axis_deg=...)`.
+3. `fit = fit_localization(samples)` → `print(fit.summary())`.
+4. `apply_to_config(fit, CFG)` — which **refuses** unless the fit is trustworthy.
+
+Radial and angular spread both matter. All samples at one radius makes scale and offset
+inseparable (any scale trades against any offset); a narrow bearing span leaves the
+rotation poorly observed. The fit says so rather than returning confident numbers.
+
+**It vetoes itself when a known bug explains the error.** Measured on a synthetic
+overhead rig, the axial-depth projection error produces 40 mm RMS, and the three knobs
+absorb 80% of it — a 5× improvement any operator would accept, with a fitted
+`range_scale` of 1.32 that is not a range scale at all but a lie about the object's size.
+Install it and the knobs now depend on camera height, object, and table position, so they
+need retuning forever. That is the trap. So the fit reports `DO NOT APPLY` and names the
+bug. With the projection corrected, the same rig measures **0.0 mm before any
+correction** — the knobs have nothing left to do.
+
+On real hardware they will not go to exactly zero: hand-eye residual, encoder error and
+detector noise remain. But they should end up small and *stable*, and if a knob is still
+carrying centimetres, that is a bug worth finding rather than a number worth tuning.
+
 ## Known issue to check on a new rig
 
 `ApparentSizeLocalizer` places objects using the size-derived distance as a *range along

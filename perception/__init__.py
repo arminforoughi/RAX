@@ -11,6 +11,7 @@ Public surface:
     Localizer / Fix                detection -> base-frame position, three strategies
     ObjectMeasurer                 monocular size, height and yaw from one frame
     fit_reprojection / fit_consistency   hand-eye calibration from arm motion
+    fit_localization / diagnose    solve the localization knobs from FK ground truth
 
 Subpackages:
     vision/       Camera frame pipeline: capture -> detection -> labeled scene.
@@ -30,6 +31,9 @@ from perception.handeye import (
     HandEyeFit, HandEyeSample, fit_consistency, fit_reprojection,
     load_hand_eye, save_hand_eye)
 from perception.measure import ObjectMeasurer
+from perception.selfcal import (
+    LocalizationFit, LocalizationModel, LocalizationSample, apply_to_config,
+    diagnose, fit_localization)
 from perception.object_priors import PRIORS, ObjectPriors
 from perception.table_plane import Plane, PlaneFit, fit_plane
 
@@ -43,4 +47,6 @@ __all__ = [
     "ObjectMeasurer",
     "HandEyeSample", "HandEyeFit", "fit_reprojection", "fit_consistency",
     "load_hand_eye", "save_hand_eye",
+    "LocalizationSample", "LocalizationModel", "LocalizationFit",
+    "fit_localization", "diagnose", "apply_to_config",
 ]
