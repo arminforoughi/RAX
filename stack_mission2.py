@@ -74,6 +74,7 @@ from manipulation.arms.motion import MotionLimits, quintic_waypoints
 from perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
 from mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
+from manipulation.approach import ApproachConfig, approach_target, shift_right
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -157,6 +158,11 @@ GEOM = CameraGeometry(
     if ARM.camera.eye_in_hand else FixedCamera(parse_tf(ARM.camera.extrinsics)),
 )
 FLOOR = Plane()          # the measured table surface; re-fitted by calibrate_floor
+
+# Every tunable of the approach, in one object. Replaces two competing idioms for the
+# same job (`global X` rebinds and the `X[0]` one-element-list trick) and gives the
+# autotuner and the UI a real get/set-by-name API. See manipulation/approach/config.py.
+CFG = ApproachConfig()
 
 _IK = [None]
 
@@ -1147,17 +1153,17 @@ TABLE_Z = [Z_TABLE]
 # DEFAULT 0: once the hand-eye TF is CALIBRATED, the 10 cm camera-behind-gripper
 # offset lives in the TF translation, so this fudge double-counts and pushes the
 # cube OUT OF REACH (seen live: raw r=34.6cm + 10cm = 44.6cm -> "cannot reach").
-PUSH_OUT = [0.0]
+# Localization push-out lives on CFG now (see manipulation/approach/config.py).
 
 
 def push_out_radial(p):
-    """Move a base-frame point radially OUTWARD (away from base z-axis) by PUSH_OUT[0].
+    """Move a base-frame point radially OUTWARD (away from base z-axis) by CFG.push_out_m.
     Applied to EVERY localization (initial lock AND every approach refine) so the
     correction is consistent — otherwise a raw re-measure would drag the target back
     inward and undo the push. See PUSH_OUT."""
     p = np.asarray(p, np.float64).copy()
     r = float(np.hypot(p[0], p[1]))
-    push = float(PUSH_OUT[0])
+    push = float(CFG.push_out_m)
     if r > 1e-3 and push != 0.0:
         p[0] += p[0] / r * push
         p[1] += p[1] / r * push
@@ -1260,8 +1266,8 @@ def localizers():
                               gate_reach=False),
         )
     for loc in _LOC[0]:
-        loc.range_scale = float(RANGE_SCALE[0])
-        loc.bearing_offset_deg = float(MAP_BEARING_OFFSET_DEG[0])
+        loc.range_scale = float(CFG.range_scale)
+        loc.bearing_offset_deg = float(CFG.bearing_offset_deg)
     return _LOC[0]
 
 
@@ -1357,11 +1363,11 @@ def sense_2d(joints=None, rgb=None):
             # fully-visible box; the position fallbacks below do not.
             m = measure_object(rgb, tr.bbox_xyxy, T, label) if full_view else None
             if m is not None:
-                xy = _rotate_xy(m["xy"], MAP_BEARING_OFFSET_DEG[0])
+                xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
                 world2d_update(label, xy, m["rng_m"], m["w_m"], m["d_m"], m["h_m"],
                                m["shape"], m["yaw_deg"], True,
                                across_m=m["across_m"],
-                               u_deg=m["u_deg"] + MAP_BEARING_OFFSET_DEG[0])
+                               u_deg=m["u_deg"] + CFG.bearing_offset_deg)
                 continue
             # fallback 1: apparent-size range against the class prior
             zs = [z for z in (read_depth_m(tr.uv) for _ in range(3)) if z is not None]
@@ -1379,7 +1385,7 @@ def sense_2d(joints=None, rgb=None):
                 x1, y1, x2, y2 = tr.bbox_xyxy
                 p3 = ray_to_table(((x1 + x2) / 2.0, y2), T, TABLE_Z0)
                 if p3 is not None:
-                    cand = _rotate_xy(p3[:2], MAP_BEARING_OFFSET_DEG[0])
+                    cand = _rotate_xy(p3[:2], CFG.bearing_offset_deg)
                     if MAP_R_MIN < float(np.hypot(*cand)) < MAP_R_MAX:
                         xy, st = cand, float("nan")
             if xy is not None:
@@ -1605,7 +1611,7 @@ def locate_on_table(finder, tracker, label):
     r_final = float(np.hypot(p[0], p[1]))
     say(f"{label} located: r={r_final*100:.1f}cm "
         f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm "
-        f"| raw r={r_raw*100:.1f}cm + pushed out {PUSH_OUT[0]*100:.0f}cm "
+        f"| raw r={r_raw*100:.1f}cm + pushed out {CFG.push_out_m*100:.0f}cm "
         f"| cube edge solved={S*100:.1f}cm")
     tracker.p_anchor = p.copy()
     tracker.anchor_t = time.time()
@@ -2030,8 +2036,8 @@ PLACE_TRANSIT_Z = 0.16     # carry the object at this height while traversing
 PLACE_OPEN_PCT = ARM.gripper.place_open_pct   # releases without flicking the object
 PLACE_RETREAT_M = 0.09     # straight-up retreat after releasing
 
-# Detection resolution. 320 is what the approach trims (AIM_DU, TARGET_RIGHT_TRIM_M,
-# TARGET_BACK_M) were tuned against, and range comes straight from bbox width
+# Detection resolution. 320 is what the approach trims (CFG.aim_du_px, CFG.right_trim_m,
+# CFG.back_m) were tuned against, and range comes straight from bbox width
 #     range = fx * real_width / bbox_width
 # so changing this SHIFTS EVERY RANGE and silently invalidates that tuning. Raising
 # it to 640 found the pen but made cube picking worse; the pen is a scan-time
@@ -2655,17 +2661,14 @@ _fit_rect_from_support = fit_rect_from_support  # least-squares footprint rectan
 # swinging the camera right slides the cube left in the picture. If it now
 # overshoots to the right, make this less negative; if still left, more negative.
 # The arm is still landing left, so push the aim point further left.
-AIM_DU = -45.0   # final centering bias: robot lands on the cube's RIGHT
-AIM_DV = 0.0
+# CFG.aim_du_px / CFG.aim_dv_px live on CFG now.
 # Global scale on computed range. Increase (>1.0) to push mapped objects FURTHER
 # OUT and spread them apart; decrease (<1.0) to pull them closer together. This
 # is a coarse calibration knob for when the apparent-size / stereo depth numbers
 # are consistently off in scale.
-RANGE_SCALE = [1.0]
 # Rotate all localized (x, y) positions in the base horizontal plane. Positive
 # = counter-clockwise. Use this when the camera shows objects on opposite sides
 # but the map clusters them on one side (a heading/yaw error in the hand-eye).
-MAP_BEARING_OFFSET_DEG = [0.0]
 
 
 def _cube_track(finder, tries=4):
@@ -2741,8 +2744,8 @@ def _center_on_cube(finder, gp, j5):
     loop is stable. The previous 2D-Cartesian Jacobian oscillated (109->96->119px)
     because base rotation, reach and an auto-swept wrist pitch all mixed into it.
     Pitch is held FIXED here. Returns the final (x, y), or None."""
-    tgt_u = HAND_UV[0] + AIM_DU
-    tgt_v = HAND_UV[1] + AIM_DV
+    tgt_u = HAND_UV[0] + CFG.aim_du_px
+    tgt_v = HAND_UV[1] + CFG.aim_dv_px
     tr = _cube_track(finder, tries=5)
     if tr is None:
         say("center: cube not in view")
@@ -2928,7 +2931,7 @@ def locate_from_survey(label, finder=None, bearing_deg=None):
             continue
         m = measure_object(rgb, tr.bbox_xyxy, T, label)
         if m is not None:
-            xy = _rotate_xy(m["xy"], MAP_BEARING_OFFSET_DEG[0])
+            xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
         else:
             xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=None, label=label)
             if xy is None:
@@ -3106,14 +3109,6 @@ def place_at(tag=None, xy=None, recenter=True):
     set_phase("DONE", f"placed {carry_label} on {where}")
 
 
-TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH hover target this far to the
-                            # cube's RIGHT, so the cube stays on the LEFT side of the
-                            # camera view during approach.
-TARGET_BACK_M = 0.010       # stop the approach hover target this far SHORT of the
-                            # cube radially. Tunable in the UI; 1 cm default.
-APPROACH_STEPS = 3          # step 1 closes ~90% of the gap, the rest are small
-                            # corrections. Tried 2 with a full-distance first move
-                            # and it missed more, so this is back to 3.
 
 
 def run_mission(target_label=None):
@@ -3139,16 +3134,16 @@ def run_mission(target_label=None):
     def _approach_target(cube_xy):
         """Hover position for the approach: short of the cube and to its right.
 
-        TARGET_BACK_M: stop this many metres radially BEFORE the cube (keeps it in view).
-        TARGET_RIGHT_TRIM_M: shift this far to the cube's right (tunable in the UI).
+        CFG.back_m: stop this many metres radially BEFORE the cube (keeps it in view).
+        CFG.right_trim_m: shift this far to the cube's right (tunable in the UI).
         """
         cube_xy = np.asarray(cube_xy, dtype=np.float64)
         r = float(np.hypot(*cube_xy))
         if r > 1e-6:
-            backed = cube_xy * ((r - TARGET_BACK_M) / r)
+            backed = cube_xy * ((r - CFG.back_m) / r)
         else:
             backed = cube_xy.copy()
-        return _shift_right(backed, TARGET_RIGHT_TRIM_M)
+        return _shift_right(backed, CFG.right_trim_m)
 
     try:
         stop_flag.clear()
@@ -3180,8 +3175,8 @@ def run_mission(target_label=None):
         say(f"  [2/7] target    x={cube_xy[0]*100:+.1f} y={cube_xy[1]*100:+.1f} cm  "
             f"r={np.hypot(*cube_xy)*100:.1f}cm "
             f"bearing={math.degrees(math.atan2(cube_xy[1], cube_xy[0])):+.0f}deg")
-        say(f"  [3/7] approach   {APPROACH_STEPS} stages, "
-            f"trim={TARGET_RIGHT_TRIM_M*100:.1f}cm right, back={TARGET_BACK_M*100:.1f}cm, "
+        say(f"  [3/7] approach   {CFG.steps} stages, "
+            f"trim={CFG.right_trim_m*100:.1f}cm right, back={CFG.back_m*100:.1f}cm, "
             f"hover z={PICK_HOVER_Z*100:.0f}cm")
         say("        opening the gripper")
         send_joints(observe()[0], gripper=95.0)
@@ -3190,7 +3185,7 @@ def run_mission(target_label=None):
         # The hover target is always computed from the latest cube estimate, so it
         # keeps the cube on the LEFT side of the image and stops before the arm
         # passes it. Refinements update the cube position, not the approach offset.
-        for i in range(APPROACH_STEPS):
+        for i in range(CFG.steps):
             checkpoint()
             q = observe()[0].astype(np.float64)
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
@@ -3206,7 +3201,7 @@ def run_mission(target_label=None):
                 say(f"approach {i+1}: already at approach hover")
                 break
 
-            last = (i == APPROACH_STEPS - 1)
+            last = (i == CFG.steps - 1)
             frac = 1.0 if last else 0.9
             # Step 1 closes 90% of the gap, then the remaining stages make small
             # corrections. REVERTED to this after trying a single full-distance
@@ -3226,7 +3221,7 @@ def run_mission(target_label=None):
             with lock:
                 state["obj3d"] = [float(cube_xy[0]), float(cube_xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
-            set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
+            set_phase("PICK", f"approach {i+1}/{CFG.steps} "
                               f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
             if _move_tip(np.array([wx, wy, PICK_HOVER_Z]), pitch, j5,
                          settle=0.15, step=1.4) is None:
@@ -3250,10 +3245,10 @@ def run_mission(target_label=None):
             if xy2 is not None:
                 adj = float(np.linalg.norm(xy2 - cube_xy))
                 if adj <= 0.05:
-                    say(f"check {i+1}/{APPROACH_STEPS}: refined cube by {adj*100:.1f}cm")
+                    say(f"check {i+1}/{CFG.steps}: refined cube by {adj*100:.1f}cm")
                     cube_xy = xy2
                 else:
-                    say(f"check {i+1}/{APPROACH_STEPS}: refined target jump {adj*100:.1f}cm - ignoring")
+                    say(f"check {i+1}/{CFG.steps}: refined target jump {adj*100:.1f}cm - ignoring")
 
         # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
         q = observe()[0].astype(np.float64)
@@ -3262,7 +3257,7 @@ def run_mission(target_label=None):
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
         say(f"  [4/7] centering  pitch={gp:.0f}deg wrist_roll={j5:.0f}deg "
-            f"aim=({HAND_UV[0]+AIM_DU:.0f},{HAND_UV[1]+AIM_DV:.0f})px")
+            f"aim=({HAND_UV[0]+CFG.aim_du_px:.0f},{HAND_UV[1]+CFG.aim_dv_px:.0f})px")
         aligned = _center_on_cube(finder, gp, j5)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
@@ -4074,15 +4069,8 @@ def status():
     s["relaxed"] = ARM_RELAXED[0]
     s["idle_relax_s"] = IDLE_RELAX_S[0]
     s["idle_for"] = round(time.time() - last_activity[0])
-    s["tune"] = {
-        "aim_du": round(AIM_DU, 1),
-        "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
-        "back_cm": round(TARGET_BACK_M * 100, 2),
-        "approach_steps": APPROACH_STEPS,
-        "cube_edge_cm": round(PRIORS.fallback_edge_m * 100, 2),
-        "range_scale": round(float(RANGE_SCALE[0]), 2),
-        "bearing_deg": round(float(MAP_BEARING_OFFSET_DEG[0]), 1),
-    }
+    s["tune"] = CFG.as_dict()
+    s["tune"]["cube_edge_cm"] = round(PRIORS.fallback_edge_m * 100, 2)
     return jsonify(s)
 
 
@@ -4596,8 +4584,7 @@ def pushout():
         cm = float((request.get_json(silent=True) or {}).get("cm", request.args.get("cm", 10)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    cm = float(np.clip(cm, -5.0, 30.0))
-    PUSH_OUT[0] = cm / 100.0
+    cm = CFG.set_knob("push_out_cm", cm)
     say(f"localization push-out set to {cm:.0f}cm — re-locate to apply")
     return jsonify(ok=True, cm=cm)
 
@@ -4610,10 +4597,9 @@ def setaimdu():
         px = float(request.args.get("px", request.form.get("px", 0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global AIM_DU
-    AIM_DU = float(np.clip(px, -300.0, 300.0))
-    say(f"AIM_DU set to {AIM_DU:.0f}px (left shift -> robot right)")
-    return jsonify(ok=True, px=AIM_DU)
+    px = CFG.set_knob("aim_du", px)
+    say(f"aim_du set to {px:.0f}px (left shift -> robot right)")
+    return jsonify(ok=True, px=px)
 
 
 @app.route("/settrim", methods=["POST"])
@@ -4624,10 +4610,9 @@ def settrim():
         cm = float(request.args.get("cm", request.form.get("cm", 0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global TARGET_RIGHT_TRIM_M
-    TARGET_RIGHT_TRIM_M = float(np.clip(cm, -10.0, 15.0)) / 100.0
-    say(f"approach right trim set to {TARGET_RIGHT_TRIM_M*100:.1f}cm")
-    return jsonify(ok=True, cm=TARGET_RIGHT_TRIM_M*100)
+    cm = CFG.set_knob("right_trim_cm", cm)
+    say(f"approach right trim set to {cm:.1f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/setback", methods=["POST"])
@@ -4637,10 +4622,9 @@ def setback():
         cm = float(request.args.get("cm", request.form.get("cm", 1.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global TARGET_BACK_M
-    TARGET_BACK_M = float(np.clip(cm, 0.0, 10.0)) / 100.0
-    say(f"approach back-off set to {TARGET_BACK_M*100:.1f}cm")
-    return jsonify(ok=True, cm=TARGET_BACK_M*100)
+    cm = CFG.set_knob("back_cm", cm)
+    say(f"approach back-off set to {cm:.1f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/setsteps", methods=["POST"])
@@ -4650,10 +4634,9 @@ def setsteps():
         n = int(request.args.get("n", request.form.get("n", 4)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need an integer")
-    global APPROACH_STEPS
-    APPROACH_STEPS = int(np.clip(n, 1, 12))
-    say(f"approach steps set to {APPROACH_STEPS}")
-    return jsonify(ok=True, n=APPROACH_STEPS)
+    n = CFG.set_knob("approach_steps", n)
+    say(f"approach steps set to {n}")
+    return jsonify(ok=True, n=n)
 
 
 @app.route("/setcubesize", methods=["POST"])
@@ -4680,8 +4663,7 @@ def setrangescale():
         scale = float(request.args.get("scale", request.form.get("scale", 1.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    scale = float(np.clip(scale, 0.3, 3.0))
-    RANGE_SCALE[0] = scale
+    scale = CFG.set_knob("range_scale", scale)
     say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, scale=scale)
 
@@ -4695,8 +4677,7 @@ def setbearing():
         deg = float(request.args.get("deg", request.form.get("deg", 0.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    deg = float(np.clip(deg, -180.0, 180.0))
-    MAP_BEARING_OFFSET_DEG[0] = deg
+    deg = CFG.set_knob("bearing_deg", deg)
     say(f"map bearing offset set to {deg:.1f}deg — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, deg=deg)
 

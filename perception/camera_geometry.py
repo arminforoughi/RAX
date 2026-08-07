@@ -178,9 +178,24 @@ class CameraGeometry:
         T_ee = self.pose.T_base_ee(q)
         return self.project(T_ee[:3, 3], self.pose.T_base_cam(q))
 
-    def range_from_width(self, width_px: float, real_width_m: float) -> float:
-        """Pinhole range from apparent size: ``range = fx * real_width / width_px``."""
+    def depth_from_width(self, width_px: float, real_width_m: float) -> float:
+        """Pinhole AXIAL DEPTH from apparent size: ``fx * real_width / width_px``.
+
+        Note what this is and is not. The pinhole relation ``w_px = fx * W / Z`` uses
+        Z, the depth along the optical axis — NOT the range along the sightline. The
+        two are equal only for an object on the optical axis, and differ by
+        ``cos(off-axis angle)`` elsewhere.
+
+        Feeding this value to :meth:`point_at_range` therefore places an off-axis
+        object systematically too close, always inward, by that cosine. Measured with
+        a camera 60 cm above the table: 1 mm at r=10 cm, 10 mm at 20 cm, 48 mm at
+        35 cm, 90 mm at 45 cm. Pair it with :meth:`backproject` to place it correctly.
+        """
         return float(self.fx * float(real_width_m) / max(float(width_px), 1e-6))
+
+    #: Historical name. Kept because callers read it as "the distance to the object",
+    #: which is exactly the confusion documented above.
+    range_from_width = depth_from_width
 
 
 # --- helpers ------------------------------------------------------------------------

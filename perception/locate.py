@@ -205,6 +205,18 @@ class ApparentSizeLocalizer(_Base):
 
     name = "apparent"
 
+    #: Whether to treat the size-derived distance as AXIAL DEPTH (correct) rather than
+    #: as range along the sightline (what the original did, and the default here so the
+    #: extraction stays behaviour-preserving).
+    #:
+    #: The pinhole relation gives depth, not range, so walking it along the ray places
+    #: an off-axis object too close by cos(off-axis angle) — always inward, growing with
+    #: the angle. Measured from 60 cm up: 10 mm at r=20 cm, 48 mm at 35 cm, 90 mm at
+    #: 45 cm. This is live on the real rig, because the approach deliberately keeps the
+    #: object off-centre, and an inward bias is what a radial push-out fudge corrects
+    #: for. Turn this on and re-check the trims on hardware before trusting it.
+    axial_depth = False
+
     def locate(self, bbox, T_base_cam, *, label=None, uv=None, z_m=None) -> Fix:
         size = self.priors.size_m(label)
         x1, y1, x2, y2 = bbox
@@ -230,7 +242,8 @@ class ApparentSizeLocalizer(_Base):
             return Fix.failed(size, method)
         rng = float(np.clip(rng * self.range_scale, *RANGE_CLIP_M))
         u, v = self._bbox_center(bbox, uv)
-        p = self.geom.point_at_range((u, v), rng, T_base_cam)
+        p = (self.geom.backproject((u, v), rng, T_base_cam) if self.axial_depth
+             else self.geom.point_at_range((u, v), rng, T_base_cam))
         return self._finish(p[:2], rng, size, method)
 
 

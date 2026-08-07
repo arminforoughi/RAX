@@ -87,9 +87,10 @@ def _load_module():
     S._sync_geometry()
     S.FLOOR.set(0.0, 0.0, -0.022)
     S.TABLE_Z[0] = S.Z_TABLE
-    S.PUSH_OUT[0] = 0.0
-    S.RANGE_SCALE[0] = 1.0
-    S.MAP_BEARING_OFFSET_DEG[0] = 0.0
+    # The approach tunables all live on one config object now.
+    S.CFG.push_out_m = 0.0
+    S.CFG.range_scale = 1.0
+    S.CFG.bearing_offset_deg = 0.0
     S.PRIORS.fallback_edge_m = 0.0508
     return S
 
@@ -159,9 +160,9 @@ def collect(S) -> dict:
     # --- push_out_radial (identity at PUSH_OUT=0, and a non-zero probe) ---
     push = []
     for val in (0.0, 0.05):
-        S.PUSH_OUT[0] = val
+        S.CFG.push_out_m = val
         push += [S.push_out_radial(np.array(p)).tolist() for p in TARGET_POINTS]
-    S.PUSH_OUT[0] = 0.0
+    S.CFG.push_out_m = 0.0
     out["push_out_radial"] = push
 
     # --- grasp roll from yaw ---
