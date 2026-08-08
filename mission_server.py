@@ -1,5 +1,31 @@
-# RAX robot-arm server: pick / place, an open-vocabulary object map, an admin UI
-# and a public guest UI, all on one Flask port (:8484).
+# RAX robot-arm server, MODULARIZED: pick / place, an open-vocabulary object map,
+# an admin UI and a public guest UI, all on one Flask port (:8484).
+#
+# RELATIONSHIP TO stack_mission2.py
+#  This is the same server with its reusable half moved into packages. The original
+#  is kept, unchanged and runnable, so the two can be compared on the same hardware
+#  rather than the old one being replaced on trust. Behaviour is intended to be
+#  identical: the extracted pieces were verified bit-identical against the original
+#  over a 447-case golden grid (tests/test_extraction_parity.py), and the knobs,
+#  routes and /status payload are unchanged.
+#
+#  What moved, and where:
+#    robots/profiles/          the arm as data — URDF, joint topology, camera mount,
+#                              gripper thresholds. Swapping arms is writing one of
+#                              these; see docs/adding_an_arm.md.
+#    manipulation/arms/        ik_strategy.py (pitch-hold and pose IK), motion.py
+#    manipulation/approach/    the tunables, approach staging, the centring servo
+#    perception/               camera geometry, table plane, class priors,
+#                              localization, measurement, hand-eye, self-calibration
+#    models/detection/         the between-detection trackers
+#    mobility/slam/            the object map
+#
+#  What deliberately stayed here: the Flask layer, guest sessions, the tunnel, the
+#  3D viewer, jog, and run_mission / place_at — which after the extractions are
+#  narration and orchestration over the packaged pieces, not reusable logic.
+#
+#  RAX_PORT=<n> runs this alongside the original for A/B comparison. Note only one
+#  process at a time can hold the arm's serial port and the camera.
 #
 # ARCHITECTURE
 #  * DETECT: YOLO-World (open vocabulary) runs in a PARALLEL thread (~2.5 s) so it
@@ -27,7 +53,6 @@
 # out too shallow — so absolute ranges are compressed and the map's positions are
 # approximate. Most of the localization care in here works around that.
 import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
-import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
 from collections import deque
 
 import cv2
@@ -39,7 +64,7 @@ sys.path.insert(0, r"C:\Users\labot\Documents\lerobot\src")
 
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.perception.yolo_world import YoloWorldDetector
-from lerobot.manipulation.visual_servo.gaze_engine import ARM_MOTORS, parse_tf_string
+from lerobot.manipulation.visual_servo.gaze_engine import parse_tf_string
 from lerobot.manipulation.yolo_track.motion_primitives import send_joint_target_smoothly
 from lerobot.robots.utils import make_robot_from_config
 from lerobot.robots.so_follower import SO101FollowerConfig
@@ -56,52 +81,56 @@ _FTBus._handshake = lambda self: None
 LEROBOT = r"C:\Users\labot\Documents\lerobot"
 OUT = os.path.join(tempfile.gettempdir(), "rax_stack_mission")  # debug-image dumps
 os.makedirs(OUT, exist_ok=True)
-TF = "-0.0503,0.0906,-0.1730,-0.2921,1.0770,-2.1688"
-# [shoulder_pan, shoulder_lift, elbow, wrist_flex, wrist_roll]
-# pan  -6.7 -> +5.0 : turn the whole robot a few degrees LEFT, so the view swings RIGHT
-# roll -28.4 -> 90  : twist the wrist 90deg so the jaws are square to the cube
-GRASP_ROLL = 90.0
-# Display-only: degrees added to wrist_roll before drawing the URDF, because the
-# URDF's roll zero is rotated from the servo's zero. If the rendered gripper is now
-# twisted the OTHER way, flip this sign.
-WRIST_RENDER_OFFSET = 90.0
-VIEW = np.array([5.0, 37.1, 48.1, -40.4, GRASP_ROLL])
-# New home: captured from the physically-correct folded pose (2026-07-20).
-HOME = np.array([-14.1, -99.1, 90.8, 33.2, -4.7])
-HAND_UV = (440.0, 394.0)   # measured via /caltip against the real black fingertip
-# MEASURED FROM THE URDF + JAW MESH (2026-07-13), do not guess this:
-#   moving_jaw_so101_v1.stl, expressed in gripper_frame_link coords, spans
-#   X -38.1..-15.8, Y -23.9..+24.1, Z -84.7..+7.3 mm.
-# So the jaws hinge 75-85 mm BEHIND gripper_frame_link and the fingertips reach
-# only +7 mm past it: `gripper_frame_link` IS the fingertip / grasp centre (it is
-# a TCP frame, 98 mm out past gripper_link, the wrist). `kin.forward_kinematics`
-# therefore already returns the FINGERTIP, and `T_ee[:3,3]` is the right thing to
-# gate the approach on. lookat_engine's `gripper_tip_offset_m = 0.10` does NOT
-# transfer to this FK -- applying it pushed the "tip" 10 cm out into empty air
-# (TIP->cube read LARGER than grip->cube, which is what exposed the error).
-GRIP_TIP_OFFSET_M = 0.007
-# The camera sits BEHIND the fingertips on the gripper — measured on the real mount at
-# ~10 cm. The shipped hand-eye TF puts it at 20.2 cm, i.e. wrong by 2x in translation on
-# top of being ~370 px wrong in rotation. Used to seed/bound calibrate_handeye.
-CAM_TIP_M = 0.10
-PORT = 8484
+
+# ---- the arm, described as data ------------------------------------------------
+# Everything that used to be a literal here now comes from a profile, so pointing
+# this server at a different arm is a matter of writing one (URDF + extrinsics +
+# which joint does what) rather than editing the algorithms. The measurements and
+# the reasons behind them live in robots/profiles/so101.py; the aliases below keep
+# the existing names so the rest of this file is unchanged.
+#   RAX_ARM=<name> selects a profile; see robots/profiles/available_profiles().
+from robots.profiles import load_profile
+from perception.camera_geometry import (
+    CameraGeometry, EyeInHand, FixedCamera, intrinsics_from_dict, parse_tf)
+from perception.object_priors import (
+    PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES, MAX_TABLE_OBJ_M)
+from perception.table_plane import Plane, fit_plane
+from manipulation.arms.ik_strategy import make_ik
+from manipulation.arms.motion import MotionLimits, quintic_waypoints
+from perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
+from perception.measure import ObjectMeasurer, classify_shape, silhouette_mask
+from perception.handeye import (
+    HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye)
+from models.detection.tracking import (
+    AnchorTracker, PixelTracker, Track, HSV_BANDS, HSV_BANDS_SOFT)
+from mobility.slam.object_map import (
+    ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
+from manipulation.approach import ApproachConfig, approach_target, shift_right
+from manipulation.approach.visual_center import center_on_object
+
+ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
+
+ARM_MOTORS = list(ARM.joint_names)     # was imported from lerobot's gaze_engine
+TF = ARM.camera.extrinsics
+GRASP_ROLL = ARM.gripper.grasp_roll_deg
+WRIST_RENDER_OFFSET = ARM.gripper.render_offset_deg
+VIEW = np.array(ARM.view_deg)
+HOME = np.array(ARM.home_deg)
+HAND_UV = ARM.gripper.hand_uv
+GRIP_TIP_OFFSET_M = ARM.gripper.tip_offset_m
+CAM_TIP_M = ARM.camera.cam_tip_m
+ARM_PORT = ARM.port                    # the arm's serial port (was "COM4", 3 places)
+PORT = int(os.environ.get("RAX_PORT", 8484))   # this server's HTTP port
 CAMSURV = ("http://127.0.0.1:5000", "camsurv123")
 
-JOINT_RATE_MAX = 25.0     # deg/s per joint hard clamp (lower = less jerk at stop)
+JOINT_RATE_MAX = ARM.joint_rate_max_dps   # deg/s per joint hard clamp
 
 # gaze-engine approach: point at the target (direct-joint pixel P-control, no
 # IK, so it can't swing) then step straight down the line of sight, decreasing
 # the radius, toward the object's back-projected 3D point (radial-to-object —
 # descends ONTO the cube instead of hovering above it).
-Z_TABLE = 0.02            # base-frame height of the cube CENTRE. THE sightline is
-                          # intersected with THIS plane to localize the cube, so it
-                          # must match the real cube-centre height. A 3 cm cube on
-                          # the table sits ~1.5–2 cm up; the old 0.05 was ~3 cm too
-                          # high, which put the cube too CLOSE + too HIGH (floating
-                          # inside the robot in the 3D view) and made the grasp
-                          # close ~3 cm ABOVE the cube (contact=False). >>> If the
-                          # grasp stops short/high, raise this a few mm; if it
-                          # drives into the table, lower it. <<<
+Z_TABLE = ARM.table_z_m   # base-frame height of the object CENTRE; the sightline is
+                          # intersected with THIS plane to localize. See the profile.
 TARGET_SIZE_M = 0.03      # cube edge — pinhole range from bbox size (survives close range)
 
 state = {
@@ -147,268 +176,55 @@ cam = None
 T_ee_cam = parse_tf_string(TF)
 fx = fy = cx0 = cy0 = 0.0
 
-# ---------------- strict HSV tracking + FK anchor ----------------
-HSV_BANDS = {
-    # saturation floor 110 keeps the warm wood grain out of "red"
-    "red": [((0, 110, 80), (9, 255, 255)), ((170, 110, 80), (179, 255, 255))],
-    "green": [((38, 80, 60), (85, 255, 255))],
-}
-# Relaxed bands for the second pass INSIDE a predicted window only — the
-# looming gripper shades the object (saturation/value drop) during approach.
-HSV_BANDS_SOFT = {
-    "red": [((0, 70, 45), (11, 255, 255)), ((168, 70, 45), (179, 255, 255))],
-    "green": [((36, 55, 40), (88, 255, 255))],
-}
+# ---- shared perception objects -------------------------------------------------
+# The camera geometry (project / back-project / ray-to-plane / tip pixel) and the
+# table plane now live in perception/, parameterized rather than reading globals.
+# GEOM's pose provider resolves `kin` at call time, so it is usable from module
+# scope even though the robot connects later in main(). A fixed (non-wrist) camera
+# swaps EyeInHand for FixedCamera and everything downstream is unchanged.
+GEOM = CameraGeometry(
+    intrinsics_from_dict(
+        dict(zip(("fx", "fy", "cx", "cy"), ARM.camera.intrinsics_fallback)),
+        width=ARM.camera.width, height=ARM.camera.height),
+    EyeInHand(lambda q: kin.forward_kinematics(q), T_ee_cam)
+    if ARM.camera.eye_in_hand else FixedCamera(parse_tf(ARM.camera.extrinsics)),
+)
+FLOOR = Plane()          # the measured table surface; re-fitted by calibrate_floor
+
+# Every tunable of the approach, in one object. Replaces two competing idioms for the
+# same job (`global X` rebinds and the `X[0]` one-element-list trick) and gives the
+# autotuner and the UI a real get/set-by-name API. See manipulation/approach/config.py.
+CFG = ApproachConfig()
+
+_IK = [None]
 
 
-class Track:
-    __slots__ = ("uv", "bbox_xyxy", "area_px", "clipped", "t")
+def ik_strategy():
+    """The profile's IK strategy, built once the robot model exists.
 
-    def __init__(self, uv, bbox, area, clipped, t):
-        self.uv, self.bbox_xyxy = uv, bbox
-        self.area_px, self.clipped, self.t = area, clipped, t
-
-
-class AnchorTracker:
-    """Strict-HSV blob tracker with window continuity and a base-frame anchor.
-
-    The anchor (EMA of back-projected fixes) predicts the pixel window through
-    detector dropouts using the CURRENT FK pose — the eye-in-hand insight.
+    Rebuilt if `kin` is swapped (tests construct one after import), so there is no
+    stale solver silently holding a different robot's kinematics.
     """
-
-    def __init__(self, color, min_area=900):
-        self.color = color
-        self.min_area = int(min_area)
-        self.last: Track | None = None
-        self.p_anchor: np.ndarray | None = None
-        self.anchor_t = 0.0
-
-    def reset(self):
-        self.last = None
-        self.p_anchor = None
-
-    def _mask(self, rgb, soft=False):
-        hsv = cv2.cvtColor(np.asarray(rgb, np.uint8), cv2.COLOR_RGB2HSV)
-        m = np.zeros(hsv.shape[:2], np.uint8)
-        bands = (HSV_BANDS_SOFT if soft else HSV_BANDS)[self.color]
-        for lo, hi in bands:
-            m |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
-        return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-    def _largest(self, mask, ox=0, oy=0, shape=None):
-        n, _l, stats, _c = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        best = None
-        for i in range(1, n):
-            a = int(stats[i, cv2.CC_STAT_AREA])
-            if a < self.min_area:
-                continue
-            if best is None or a > best[0]:
-                x, y, w, h = (int(stats[i, j]) for j in
-                              (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
-                best = (a, (x + ox, y + oy, x + w + ox, y + h + oy))
-        if best is None:
-            return None
-        a, (x1, y1, x2, y2) = best
-        H, W = shape
-        clipped = x1 <= 1 or y1 <= 1 or x2 >= W - 2 or y2 >= H - 2
-        return Track(((x1 + x2) / 2.0, (y1 + y2) / 2.0), (x1, y1, x2, y2), a, clipped, time.time())
-
-    def predict_uv(self, T_base_cam):
-        if self.p_anchor is None:
-            return None
-        p_cam = T_base_cam[:3, :3].T @ (self.p_anchor - T_base_cam[:3, 3])
-        if p_cam[2] < 0.02:
-            return None
-        return (cx0 + fx * p_cam[0] / p_cam[2], cy0 + fy * p_cam[1] / p_cam[2])
-
-    def update_anchor(self, uv, z_m, T_base_cam, now):
-        d = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
-        p = T_base_cam[:3, 3] + T_base_cam[:3, :3] @ (d * z_m)  # z along optical axis
-        if self.p_anchor is None:
-            self.p_anchor = p
-        else:
-            self.p_anchor = 0.6 * self.p_anchor + 0.4 * p
-        self.anchor_t = now
-
-    def track(self, rgb, T_base_cam=None):
-        H, W = rgb.shape[:2]
-        windows = []
-        centre = None
-        if self.last is not None and time.time() - self.last.t < 1.5:
-            centre = self.last.uv
-        elif T_base_cam is not None:
-            centre = self.predict_uv(T_base_cam)   # FK prediction after dropout
-        if centre is not None:
-            cxp, cyp = int(centre[0]), int(centre[1])
-            r = 140
-            windows.append((max(0, cxp - r), max(0, cyp - r), min(W, cxp + r), min(H, cyp + r)))
-        windows.append(None)
-        for w in windows:
-            if w is None:
-                tr = self._largest(self._mask(rgb), 0, 0, (H, W))
-            else:
-                x1, y1, x2, y2 = w
-                tr = self._largest(self._mask(rgb[y1:y2, x1:x2]), x1, y1, (H, W))
-                if tr is None:
-                    # shaded/blurred object inside a trusted window: relax bands
-                    tr = self._largest(self._mask(rgb[y1:y2, x1:x2], soft=True), x1, y1, (H, W))
-            if tr is not None:
-                self.last = tr
-                return tr
-        return None
+    if _IK[0] is None or _IK[0].kin is not kin:
+        _IK[0] = make_ik(kin, ARM, grasp_pitches=GRASP_PITCH, standoff_m=STANDOFF_H)
+    return _IK[0]
 
 
-red_tracker = AnchorTracker("red")
-green_tracker = AnchorTracker("green")
+def _sync_geometry():
+    """Push the current intrinsics + hand-eye into GEOM.
 
+    Both are discovered late (intrinsics when the camera connects, the hand-eye
+    whenever a calibration re-fits it), so every site that rebinds them calls this.
+    """
+    GEOM.set_intrinsics(intrinsics_from_dict(
+        {"fx": fx, "fy": fy, "cx": cx0, "cy": cy0},
+        width=ARM.camera.width, height=ARM.camera.height))
+    if isinstance(GEOM.pose, EyeInHand):
+        GEOM.pose.T_ee_cam = np.asarray(T_ee_cam, dtype=np.float64)
 
-# ---------------- generic per-object pixel tracker ----------------
-# WHY THIS EXISTS. YOLO only reports every ~2.5 s (yolo_worker's cycle), and for
-# any label other than the two cubes, find_label() was just handing back that SAME
-# cached box, unmoved, for the whole 2.5 s — then it JUMPS to wherever the object
-# is now. As the arm approaches and the camera moves, that reads as "the box can't
-# keep up" / shaky, because it isn't tracking anything between detections at all.
-#
-# The fix is the same idea AnchorTracker already uses for the cubes (window
-# continuity between confirmations) generalised to ANY appearance, via classic
-# CamShift: colour-histogram back-projection + mean-shift. This box's contrib
-# modules (CSRT/KCF/MOSSE) are not installed on this machine (checked: only
-# cv2.TrackerMIL is present, and CamShift needs nothing beyond core OpenCV), so
-# CamShift is also the pragmatic choice, not just the simple one.
-#
-# yolo_worker "tags" a tracker with a fresh ground-truth box every ~2.5 s;
-# find_label() then "tracks" it every call in between — every control-tick, not
-# every 2.5 s — so the box actually follows the object instead of teleporting.
-PIXEL_TRACK_MAX_AGE_S = 8.0   # no fresh YOLO tag within this long -> stop trusting
-                              # pure pixel tracking, it may have drifted onto
-                              # something else entirely
-PIXEL_TRACK_MIN_RESPONSE = 12.0  # mean back-projection value inside the tracked
-                                 # window; below this the histogram is no longer
-                                 # matching anything real (object left / occluded)
-
-
-class PixelTracker:
-    """CamShift tracker for one object instance, tagged from a YOLO box and then
-    followed frame-to-frame by colour-histogram mean-shift."""
-
-    def __init__(self, label):
-        self.label = label
-        self.hist = None
-        self.window = None        # (x, y, w, h)
-        self.tagged_t = 0.0
-        self.last: Track | None = None   # publish() reads this; it must never call
-                                          # track() itself, or CamShift runs twice
-                                          # per frame from two independent call sites
-        # The actual pixels driving the current track, for the FPV overlay — a
-        # boolean crop plus its (x, y) origin, refreshed every track() call.
-        # None until the first successful track.
-        self.pixel_mask = None
-        self.pixel_origin = (0, 0)
-
-    def tag(self, rgb, xyxy):
-        """(Re)acquire from a FRESH, trusted detection box.
-
-        CHOOSE PIXELS SMARTLY rather than histogramming the whole rectangular
-        box: a YOLO box is axis-aligned and a diagonal or round object often
-        fills only half of it, so histogramming the full box mixes in
-        background pixels from its corners — that is what let a track slide
-        onto the table the moment the object rotated. Reuse _silhouette_mask
-        (Lab colour-distance from a ring just outside the box, already used
-        elsewhere in this file to separate an object from the table) to find
-        the actual object pixels; it stays correct on a dark object because
-        Lab distance is not a saturation/value test.
-
-        THE TWO MASKS HAVE DIFFERENT JOBS AND MUST NOT BE MERGED BY INTERSECTION.
-        `sil` answers "is this pixel the object" (Lab colour-distance, works on a
-        black pen same as a bright one). The saturation/value gate answers "is
-        this pixel's HUE trustworthy enough to put in a hue histogram" — a black
-        or white pixel has essentially RANDOM hue, and CamShift keys on hue.
-        AND-ing them together was a real bug caught on a synthetic dark object:
-        the silhouette correctly found the pen (V~30), the sv gate rejected it
-        for being too dark, and the code fell back to the sv gate ALONE — which
-        happily kept the bright wood BACKGROUND instead. So: sv gate narrows the
-        HISTOGRAM only, never decides what the object is. And when an object is
-        genuinely achromatic and the narrowed set is too small to build a useful
-        histogram, widen it back to the full silhouette rather than drop to zero
-        — a noisy hue signal on the right pixels beats a clean one on the wrong
-        pixels, and it also avoids keying on "generic dark blob", which risks
-        matching our own black gripper the moment it enters frame.
-        """
-        x1, y1, x2, y2 = (int(round(v)) for v in xyxy)
-        H, W = rgb.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(W, x2), min(H, y2)
-        if x2 - x1 < 6 or y2 - y1 < 6:
-            return
-        rgb_u8 = np.asarray(rgb, np.uint8)
-        hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
-        roi = hsv[y1:y2, x1:x2]
-        sv_gate = cv2.inRange(roi, np.array((0, 60, 32), np.uint8),
-                              np.array((179, 255, 255), np.uint8)) > 0
-        sil = _silhouette_mask(rgb_u8, (x1, y1, x2, y2))
-        if sil is not None:
-            obj_mask = sil[y1:y2, x1:x2] > 0
-        else:
-            # no reliable silhouette (object same colour as the table, or the box
-            # too small for a background ring) — the sv gate is the only signal
-            # left, imperfect as it is
-            obj_mask = sv_gate
-        hist_mask = obj_mask & sv_gate
-        if int(np.count_nonzero(hist_mask)) < 0.15 * max(1, int(np.count_nonzero(obj_mask))):
-            hist_mask = obj_mask        # achromatic object: accept a noisy hue signal
-        mask_u8 = (hist_mask.astype(np.uint8)) * 255
-        hist = cv2.calcHist([roi], [0], mask_u8, [30], [0, 180])
-        cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
-        self.hist = hist
-        self.window = (x1, y1, x2 - x1, y2 - y1)
-        self.tagged_t = time.time()
-        self.pixel_mask = obj_mask
-        self.pixel_origin = (x1, y1)
-
-    def track(self, rgb):
-        """One CamShift step on the CURRENT frame. None if lost or never tagged."""
-        if self.hist is None or self.window is None:
-            return None
-        if time.time() - self.tagged_t > PIXEL_TRACK_MAX_AGE_S:
-            self.hist = None            # stale — force a re-tag before trusting this again
-            return None
-        H, W = rgb.shape[:2]
-        wx, wy, ww, wh = self.window
-        if ww < 4 or wh < 4 or wx >= W or wy >= H:
-            return None
-        hsv = cv2.cvtColor(np.asarray(rgb, np.uint8), cv2.COLOR_RGB2HSV)
-        backproj = cv2.calcBackProject([hsv], [0], self.hist, [0, 180], 1)
-        term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
-        try:
-            _rot, window = cv2.CamShift(backproj, self.window, term)
-        except cv2.error:
-            return None
-        x, y, w, h = window
-        if w < 6 or h < 6:
-            return None                 # collapsed — the object is not here
-        x1, y1, x2, y2 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
-        bp_roi = backproj[y1:y2, x1:x2]
-        response = float(np.mean(bp_roi)) if bp_roi.size else 0.0
-        if response < PIXEL_TRACK_MIN_RESPONSE:
-            return None                 # window found nothing that looks like the target
-        self.window = (x1, y1, x2 - x1, y2 - y1)
-        # WHICH PIXELS, RIGHT NOW, are actually driving this track — for the FPV
-        # overlay. Free: Otsu-threshold the back-projection crop CamShift just
-        # used, no extra frame work. This is the honest answer to "what is being
-        # tracked", since it moves and reshapes with the object every frame,
-        # unlike re-showing the mask captured at tag() time.
-        if bp_roi.size >= 16 and bp_roi.max() > 0:
-            _t, m = cv2.threshold(bp_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            self.pixel_mask = m > 0
-            self.pixel_origin = (x1, y1)
-        else:
-            self.pixel_mask = None
-        clipped = x1 <= 1 or y1 <= 1 or x2 >= W - 2 or y2 >= H - 2
-        tr = Track(((x1 + x2) / 2.0, (y1 + y2) / 2.0), (x1, y1, x2, y2),
-                   int((x2 - x1) * (y2 - y1)), clipped, time.time())
-        self.last = tr
-        return tr
-
+# The colour-anchor and CamShift trackers now live in models/detection/tracking.py.
+red_tracker = AnchorTracker("red", GEOM)
+green_tracker = AnchorTracker("green", GEOM)
 
 label_trackers = {}    # label -> PixelTracker, built lazily as labels are seen
 
@@ -667,7 +483,7 @@ def publish(rgb, joints=None):
             # Needs only the lens focal length and the cube's real size, so it stays
             # honest regardless of the camera-mount numbers.
             w_px = float(max(4, x2 - x1))
-            rng_cm = fx * CUBE_EDGE_M / w_px * 100.0
+            rng_cm = fx * PRIORS.fallback_edge_m / w_px * 100.0
             cv2.putText(img, f"{name} {rng_cm:.0f}cm", (x1, max(14, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     # EVERY OTHER YOLO DETECTION. Until now the overlay drew boxes for the two
@@ -857,12 +673,7 @@ def send_joints(q, gripper=None):
         robot.send_action(act)
 
 
-# Per-joint velocity / acceleration limits for smooth transit moves (deg/s, deg/s^2).
-# The base carries the most inertia and causes the visible jump, so it gets the
-# gentlest limits. Wrist joints can move faster.
-_GOTO_VMAX = np.array([38.0, 55.0, 55.0, 75.0, 90.0])
-_GOTO_AMAX = np.array([75.0, 110.0, 110.0, 150.0, 180.0])
-_GOTO_DT = 0.02  # 50 Hz command rate
+_GOTO_LIMITS = MotionLimits.from_profile(ARM)
 
 
 def goto_smooth(target, settle=0.15, step=2.0):
@@ -872,36 +683,21 @@ def goto_smooth(target, settle=0.15, step=2.0):
     The old send_joint_target_smoothly moved at a fixed step per tick, which is
     just a velocity cap — it still commanded abrupt starts and stops. Here the
     velocity ramps up and down smoothly, so the camera/gripper "head" glides.
+
+    The profile maths lives in manipulation/arms/motion.py; this owns the send loop
+    and its real-time pacing.
     """
     joints, _r, obs = observe(overlay=False)
     gp = float(obs.get("gripper.pos", 50.0))
-    q0 = np.asarray(joints, dtype=np.float64)
-    q1 = np.asarray(target, dtype=np.float64)
-    delta = q1 - q0
-
     # step=2.0 was the old default degrees/tick; use it as a speed scale.
-    speed = float(step) / 2.0
-    vmax = _GOTO_VMAX * speed
-    amax = _GOTO_AMAX * speed
+    limits = _GOTO_LIMITS.scaled(float(step) / 2.0)
+    waypoints, _T = quintic_waypoints(joints, target, limits)
 
-    # Quintic p(u) = 10u^3 - 15u^4 + 6u^5  ->  max vel 1.875/T, max acc 5.78/T^2
-    abs_d = np.abs(delta)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        T_v = np.where(abs_d > 0.001, 1.875 * abs_d / np.maximum(vmax, 1e-6), 0.0)
-        T_a = np.where(abs_d > 0.001, np.sqrt(5.78 * abs_d / np.maximum(amax, 1e-6)), 0.0)
-    T = float(np.max(np.maximum(T_v, T_a)))
-    T = max(T, 0.12)  # always at least 120 ms for tiny moves
-
-    n = int(np.ceil(T / _GOTO_DT))
     t0 = time.time()
-    for k in range(n + 1):
-        t = min(k * _GOTO_DT, T)
-        u = t / T
-        s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
-        q_cmd = q0 + delta * s
+    for k, q_cmd in enumerate(waypoints):
         send_joints(q_cmd, gripper=gp)
-        # sleep to maintain 50 Hz, accounting for command overhead
-        to_sleep = t0 + (k + 1) * _GOTO_DT - time.time()
+        # sleep to maintain the command rate, accounting for command overhead
+        to_sleep = t0 + (k + 1) * limits.dt_s - time.time()
         if to_sleep > 0:
             time.sleep(to_sleep)
 
@@ -909,7 +705,7 @@ def goto_smooth(target, settle=0.15, step=2.0):
 
 
 def T_cam_of(joints):
-    return np.asarray(kin.forward_kinematics(joints)) @ T_ee_cam
+    return GEOM.T_base_cam(np.asarray(joints, dtype=np.float64))
 
 
 def read_depth_m(uv, win=7):
@@ -939,20 +735,13 @@ def locate_3d(uv, z_m, T_base_cam):
     """Back-project pixel uv at metric depth z_m through the camera intrinsics,
     then transform by the camera pose -> object point in the BASE frame.
     This is single-shot metric localization (no multi-vantage triangulation)."""
-    x = (uv[0] - cx0) / fx * z_m
-    y = (uv[1] - cy0) / fy * z_m
-    p_cam = np.array([x, y, z_m, 1.0])
-    return (T_base_cam @ p_cam)[:3]
+    return GEOM.backproject(uv, z_m, T_base_cam)
 
 
 def project_base(p_base, T_base_cam):
     """Base-frame point -> pixel. The inverse of locate_3d; the ground truth test
     for the hand-eye TF."""
-    pc = np.linalg.inv(np.asarray(T_base_cam, np.float64)) @ np.append(
-        np.asarray(p_base, np.float64), 1.0)
-    if pc[2] <= 1e-4:
-        return None                      # behind the camera
-    return (float(fx * pc[0] / pc[2] + cx0), float(fy * pc[1] / pc[2] + cy0))
+    return GEOM.project(p_base, T_base_cam)
 
 
 def tip_pixel(joints):
@@ -971,8 +760,7 @@ def tip_pixel(joints):
     every cube is reported NEARER than it is -- the user's "it should be further out",
     arrived at independently. calibrate_handeye() re-fits the TF to kill this.
     """
-    T = np.asarray(kin.forward_kinematics(np.asarray(joints, np.float64)))
-    return project_base(T[:3, 3], T @ T_ee_cam)
+    return GEOM.tip_pixel(joints)
 
 
 def locate_object(finder, tracker, label, tries=6):
@@ -1076,28 +864,35 @@ def triangulate(finder, tracker, label):
     return p
 
 
-def close_with_current(step=5.0, delay=0.05):
+def close_with_current(step=None, delay=None):
     """Close the gripper in small increments, watching the servo current, and
     stop the instant it rises (torque change = fingers on the object). Smaller
-    step / longer delay = the slow, gentle close the user asked for."""
+    step / longer delay = the slow, gentle close the user asked for.
+
+    The thresholds come from the profile's GripperProfile, so a different gripper
+    (different gearing, different current scale) declares its own.
+    """
+    g = ARM.gripper
+    step = g.close_step_pct if step is None else step
+    delay = g.close_delay_s if delay is None else delay
     idle = [c for c in (gripper_current() for _ in range(5)) if c is not None]
     i_idle = float(np.mean(idle)) if idle else 0.0
-    pct = 95.0
-    while pct > 2.0:
+    pct = g.open_pct
+    while pct > g.closed_pct:
         checkpoint()
         pct -= step
         joints = observe(overlay=True)[0]
         send_joints(joints, gripper=pct)
         time.sleep(delay)
         c = gripper_current()
-        if c is not None and abs(c - i_idle) >= 8.0:
+        if c is not None and abs(c - i_idle) >= g.contact_current_delta:
             # firmer squeeze — ΔI=1.8 holds slipped the cube during transit
-            send_joints(joints, gripper=max(0.0, pct - 14.0))
+            send_joints(joints, gripper=max(0.0, pct - g.squeeze_extra_pct))
             time.sleep(0.18)
             return True, i_idle
     # Closed on air: DO NOT stay stalled shut (that's what tripped the servo's
     # overload protection earlier) — relax to a neutral opening.
-    send_joints(observe(overlay=False)[0], gripper=40.0)
+    send_joints(observe(overlay=False)[0], gripper=g.relax_on_miss_pct)
     time.sleep(0.18)
     return False, i_idle
 
@@ -1131,17 +926,17 @@ TABLE_Z = [Z_TABLE]
 # DEFAULT 0: once the hand-eye TF is CALIBRATED, the 10 cm camera-behind-gripper
 # offset lives in the TF translation, so this fudge double-counts and pushes the
 # cube OUT OF REACH (seen live: raw r=34.6cm + 10cm = 44.6cm -> "cannot reach").
-PUSH_OUT = [0.0]
+# Localization push-out lives on CFG now (see manipulation/approach/config.py).
 
 
 def push_out_radial(p):
-    """Move a base-frame point radially OUTWARD (away from base z-axis) by PUSH_OUT[0].
+    """Move a base-frame point radially OUTWARD (away from base z-axis) by CFG.push_out_m.
     Applied to EVERY localization (initial lock AND every approach refine) so the
     correction is consistent — otherwise a raw re-measure would drag the target back
     inward and undo the push. See PUSH_OUT."""
     p = np.asarray(p, np.float64).copy()
     r = float(np.hypot(p[0], p[1]))
-    push = float(PUSH_OUT[0])
+    push = float(CFG.push_out_m)
     if r > 1e-3 and push != 0.0:
         p[0] += p[0] / r * push
         p[1] += p[1] / r * push
@@ -1152,16 +947,8 @@ def ray_to_table(uv, T_base_cam, z_plane=None):
     """Intersect the pixel's back-projected sightline with the table plane. The
     plane height is TABLE_Z[0], which locate_on_table MEASURES from the bbox
     pinhole range rather than assuming."""
-    o = T_base_cam[:3, 3]
     z = TABLE_Z[0] if z_plane is None else float(z_plane)
-    d_cam = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
-    d = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
-    if abs(d[2]) < 1e-6:
-        return None
-    t = (z - o[2]) / d[2]
-    if t <= 0:
-        return None
-    return o + t * d
+    return GEOM.ray_to_plane(uv, T_base_cam, z)
 
 
 TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise:
@@ -1179,8 +966,8 @@ TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise
 # a "cube" localized at 92 cm is a broken solve, not a distant object — and letting
 # those into the map is what filled it with ghosts strung out along the sightline.
 # Gate every localization on this before it is ever stored.
-MAP_R_MIN = 0.08
-MAP_R_MAX = 0.55
+MAP_R_MIN = ARM.reach_min_m
+MAP_R_MAX = ARM.reach_max_m
 # An entry not re-observed for this long is STALE: the object was moved or taken
 # away, and the map should stop asserting it is there. Without this the map keeps
 # reporting a scene that no longer exists - and worse, a stale high-n entry sits in
@@ -1215,154 +1002,63 @@ W2D_MERGE = 0.14          # detections of the same label within this = same obje
                           # Tightened because objects were being merged too
                           # aggressively in the compressed map. Increase if you get
                           # duplicate ghosts for one cube.
-W2D = {"objs": {}, "next": 1}
-w2d_lock = threading.Lock()
+# The bird's-eye object map. Its association rules, the support-ring footprint fit
+# and the consolidation pass live in mobility/slam/object_map.py; the callables below
+# are injected because they depend on things the map does not own — the active query,
+# and how a measured footprint maps to a shape name. They are wrapped in lambdas
+# because they are defined further down this file.
+WORLD = ObjectMap(
+    merge_m=W2D_MERGE,
+    ttl_s=MAP_TTL_S,
+    may_merge_labels=lambda a, b: _may_merge_labels(a, b),
+    classify_shape=classify_shape,
+    prior_shape=lambda label: class_meta(label)["shape"],
+    log=say,
+)
+w2d_lock = WORLD.lock
 
 
-def _rotate_xy(xy, deg):
-    """Rotate a base-frame (x, y) point about the origin by deg degrees."""
-    th = math.radians(float(deg))
-    c, s = math.cos(th), math.sin(th)
-    return np.array([xy[0] * c - xy[1] * s, xy[0] * s + xy[1] * c], dtype=np.float64)
+_rotate_xy = rotate_xy      # now perception/locate.py
+
+_LOC = [None]
+
+
+def localizers():
+    """The localization strategies, with the live-tunable corrections refreshed.
+
+    RANGE_SCALE and MAP_BEARING_OFFSET_DEG are dialled from the UI against the 3D
+    view, so they are pushed on every call rather than captured at construction.
+    """
+    if _LOC[0] is None:
+        reach = (MAP_R_MIN, MAP_R_MAX)
+        _LOC[0] = (
+            ApparentSizeLocalizer(GEOM, PRIORS, reach_m=reach),
+            # The table solve is used by callers that judge the raw point themselves,
+            # so it does not additionally gate on the workspace.
+            PlaneRayLocalizer(GEOM, PRIORS, reach_m=reach, z_plane=TABLE_Z0,
+                              gate_reach=False),
+        )
+    for loc in _LOC[0]:
+        loc.range_scale = float(CFG.range_scale)
+        loc.bearing_offset_deg = float(CFG.bearing_offset_deg)
+    return _LOC[0]
 
 
 def obj_xy_2d(bbox, T_cam, z_m=None, label=None):
-    """Where the object is, base-frame (x, y).
+    """Where the object is, base-frame (x, y) — see perception/locate.py.
 
-    RANGE COMES FROM STEREO DEPTH when it is available and sane; otherwise it
-    falls back to apparent size:
-
-        range = focal * real_object_width / bbox_width_px
-
-    The real width is looked up from CLASS_META by label. Stereo depth is
-    independent of the object's size, so it anchors the range and kills the
-    random jumps.
+    Returns (xy | None, range_m, assumed_size_m). The strategy, including the
+    elongated-object long-axis branch and why it exists, lives with the code there.
     """
-    x1, y1, x2, y2 = bbox
-    w, h = x2 - x1, y2 - y1
-    if w < 4 or h < 4:
-        return None, float("nan"), class_size_m(label)
-
-    real_w = class_size_m(label)
-
-    # APPARENT-SIZE RANGING IS ONLY VALID FOR OBJECTS THAT LOOK THE SAME FROM EVERY
-    # SIDE. range = fx * assumed_width / bbox_width treats the bbox width as the
-    # object's real width. For a cube or a cup that holds at any angle. For an
-    # elongated object it is nonsense: measured, a 14 cm pen 40 cm away reports
-    # 150 cm when it lies across the view, 14 cm when diagonal and 11 cm end-on -
-    # a 13x swing driven purely by an angle nobody measured. Each frame it rotates
-    # slightly, the range jumps, and the map grows another ghost somewhere new.
-    #
-    # So: refuse to place elongated objects from apparent size alone. Better a gap
-    # in the map than a confident wrong coordinate the arm will then drive at.
-    pm = class_meta(label)
-    aspect = max(pm["w_m"], pm["d_m"]) / max(min(pm["w_m"], pm["d_m"]), 1e-4)
-    if aspect > 2.2 and (z_m is None or not (0.03 < z_m < 1.20)):
-        # ELONGATED OBJECT: measure against its LONG axis, not its width.
-        # class_size_m returns the geometric mean of w and d (3.7 cm for a pen) and
-        # comparing that to the bbox WIDTH is meaningless - the width is whatever
-        # angle the pen happens to lie at, which is why the overlay read "15cm" for
-        # a pen 30 cm away. The bbox's LONGEST side, however, always corresponds to
-        # the object's LONGEST axis, foreshortened by the viewing angle. That over-
-        # estimates range when foreshortened, but it is bounded and roughly right,
-        # instead of being wrong by a factor that swings with rotation.
-        #
-        # (The table-plane methods would be better still, but they need the hand-eye
-        # rotation to be correct and it is not - rays from the upper frame graze out
-        # to ~5.8 m. Apparent size is the only range that does not go through it.)
-        long_px = float(max(w, h))
-        rng = float(fx * max(pm["w_m"], pm["d_m"]) / max(long_px, 4.0))
-        if not (0.05 < rng < 1.20):
-            return None, float("nan"), real_w
-        rng *= float(RANGE_SCALE[0])
-        rng = float(np.clip(rng, 0.03, 1.50))
-        u = (x1 + x2) / 2.0
-        v = (y1 + y2) / 2.0
-        d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
-        d /= np.linalg.norm(d)
-        pt = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
-        xy = pt[:2]
-        if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
-            return None, float("nan"), real_w
-        return _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0]), float(rng), real_w
-
-    # Prefer stereo depth if the caller passed a valid metric range.
-    if z_m is not None and 0.03 < z_m < 1.20:
-        rng = float(z_m)
-    else:
-        rng = float(fx * real_w / float(w))
-        if not (0.05 < rng < 1.20):
-            return None, float("nan"), real_w
-
-    rng *= float(RANGE_SCALE[0])
-    rng = float(np.clip(rng, 0.03, 1.50))
-
-    u = (x1 + x2) / 2.0
-    v = (y1 + y2) / 2.0
-    d = np.array([(u - cx0) / fx, (v - cy0) / fy, 1.0], dtype=np.float64)
-    d /= np.linalg.norm(d)
-    p = T_cam[:3, 3] + T_cam[:3, :3] @ (d * rng)
-    xy = p[:2]
-    if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
-        return None, float("nan"), real_w
-    # Correct heading/yaw error in the hand-eye by rotating the bearing.
-    xy = _rotate_xy(xy, MAP_BEARING_OFFSET_DEG[0])
-    return xy, float(rng), real_w
+    apparent, _plane = localizers()
+    fix = apparent.locate(bbox, T_cam, label=label, z_m=z_m)
+    return (fix.xy if fix.ok else None), fix.range_m, fix.size_m
 
 
 def _consolidate_2d():
-    """Collapse map entries that are really ONE physical object.
-
-    MERGING ONLY WITHIN A LABEL WAS THE BUG. An open vocabulary gives one object
-    several names - a single pen fired as pen, knife, scissors, toothbrush AND
-    remote, so it became five "objects" that could never combine no matter how
-    close together they sat (measured: five entries within 6-9 cm of each other).
-    Two detections at the same place ARE the same thing; the label is the least
-    reliable part of the observation, so position decides and the best-supported
-    name wins. Weighted by observation count. Caller holds w2d_lock.
-    """
-    objs = W2D["objs"]
-    changed = True
-    while changed:
-        changed = False
-        items = list(objs.items())
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                ta, a = items[i]
-                tb, b = items[j]
-                if ta not in objs or tb not in objs:
-                    continue
-                if not _may_merge_labels(a["label"], b["label"]):
-                    continue
-                if float(np.hypot(*(a["xy"] - b["xy"]))) < _merge_radius(a, b):
-                    keep, drop = (ta, tb) if a["n"] >= b["n"] else (tb, ta)
-                    ko, do = objs[keep], objs[drop]
-                    wsum = ko["n"] + do["n"]
-                    ko["xy"] = (ko["n"] * ko["xy"] + do["n"] * do["xy"]) / wsum
-                    for k in ("w_m", "d_m", "h_m"):
-                        ko[k] = (ko["n"] * ko[k] + do["n"] * do[k]) / wsum
-                    ko["yaw"] = _yaw_blend(ko["yaw"], do["yaw"], do["n"] / wsum)
-                    # a measurement beats a prior, whichever entry it came from
-                    if do.get("measured") and not ko.get("measured"):
-                        ko["shape"], ko["measured"] = do["shape"], True
-                    # two ghosts of one object each hold caliper readings from the
-                    # bearings they were seen from — pooling them is exactly the
-                    # extra evidence the footprint fit wants
-                    for bk, bv in do.get("sup", {}).items():
-                        ko["sup"][bk] = 0.5 * (ko["sup"][bk] + bv) if bk in ko["sup"] else bv
-                    fit = _fit_rect_from_support(ko["sup"])
-                    if fit is not None:
-                        ko["w_m"], ko["d_m"], ko["yaw"] = fit
-                    if ko["label"] != do["label"]:
-                        alt = set(ko.get("aka", ())) | set(do.get("aka", ())) | {do["label"]}
-                        ko["aka"] = sorted(alt - {ko["label"]})
-                    ko["n"] = wsum
-                    ko["t"] = max(ko["t"], do["t"])
-                    del objs[drop]
-                    changed = True
-                    break
-            if changed:
-                break
+    """Collapse map entries that are really ONE physical object — ObjectMap.consolidate.
+    Caller holds w2d_lock."""
+    WORLD.consolidate()
 
 
 # Wrist roll that lines the JAWS UP ACROSS an object's long axis — the only way a
@@ -1391,112 +1087,25 @@ def grasp_roll_for_yaw(yaw_deg, xy):
 
 
 def _merge_radius(a, b=None):
-    """How close two same-label detections must be to count as one object.
-
-    THE FLOOR IS SET BY LOCALIZATION NOISE, NOT BY OBJECT SIZE. Scaling this down
-    to 0.55x the object's own footprint (3.5 cm for a cube) was wrong and produced
-    the 16-ghost map: consecutive views of ONE cube land 5-15 cm apart, so every
-    observation spawned a fresh tag. Object size may only ever WIDEN the radius —
-    a laptop needs more than 14 cm — never narrow it below what the jitter demands.
-    """
-    r = W2D_MERGE
-    for o in (a, b):
-        if o is not None:
-            r = max(r, 0.55 * max(o["w_m"], o["d_m"]))
-    return float(np.clip(r, W2D_MERGE, 0.30))
+    """How close two detections must be to count as one object — see ObjectMap."""
+    return WORLD.merge_radius(a, b)
 
 
-def _yaw_blend(y_old, y_new, w_new):
-    """Circular mean of two axis angles. A footprint rectangle has no front, so
-    yaw lives mod 180 deg — averaging -89 and +89 naively gives 0, which is a
-    right angle away from both. Average the doubled angle instead."""
-    a = math.radians(2.0 * float(y_old))
-    b = math.radians(2.0 * float(y_new))
-    s = (1 - w_new) * math.sin(a) + w_new * math.sin(b)
-    c = (1 - w_new) * math.cos(a) + w_new * math.cos(b)
-    if abs(s) < 1e-9 and abs(c) < 1e-9:
-        return float(y_new)
-    return float(((math.degrees(math.atan2(s, c)) / 2.0 + 90.0) % 180.0) - 90.0)
+_yaw_blend = yaw_blend      # circular mean of two axis angles; now object_map.py
 
 
 def world2d_update(label, xy, stereo, w_m, d_m, h_m, shape, yaw, measured,
                    across_m=None, u_deg=None):
-    """Fold one observation of one object into the map.
+    """Fold one observation of one object into the map — ObjectMap.update.
 
     across_m / u_deg are one caliper reading of the footprint (its width along the
     across-view direction u_deg) — the only footprint fact a single view actually
-    establishes. They accumulate per direction bin, and once three bearings are in,
-    the footprint and yaw are re-fitted from all of them.
+    establishes. The association rules, and the two bugs that shaped them, are
+    documented in mobility/slam/object_map.py.
     """
-    xy = np.asarray(xy, float)
-    obs = {"w_m": float(w_m), "d_m": float(d_m)}
-    with w2d_lock:
-        # Match on POSITION, not on the label: the same object arrives under
-        # different names from an open vocabulary, and a new name must land on the
-        # existing entry rather than spawn a rival ghost beside it.
-        best, bd = None, None
-        for t, o in W2D["objs"].items():
-            if not _may_merge_labels(o["label"], label):
-                continue
-            dist = float(np.hypot(*(o["xy"] - xy)))
-            if dist < _merge_radius(o, obs) and (bd is None or dist < bd):
-                best, bd = t, dist
-        if best is None:
-            best = W2D["next"]; W2D["next"] += 1
-            W2D["objs"][best] = {"label": label, "xy": xy,
-                                 "w_m": float(w_m), "d_m": float(d_m), "h_m": float(h_m),
-                                 "shape": str(shape), "yaw": float(yaw),
-                                 "measured": bool(measured), "sup": {},
-                                 "n": 1, "stereo": stereo, "t": time.time()}
-        else:
-            o = W2D["objs"][best]
-            # A DIFFERENT label landing on a STALE entry means the thing at this
-            # spot changed - the old name is not evidence any more, however many
-            # times it was seen. Take the position over outright rather than let a
-            # stale n=1793 "red cube" swallow every new observation of the green one
-            # that is actually sitting there now.
-            # Compare against when this entry was last confirmed UNDER ITS OWN
-            # NAME, not when it was last touched at all. Touch-time never goes
-            # stale: every incoming green observation refreshed the leftover "red
-            # cube" entry it was being merged into, so the relabel that would have
-            # fixed it could never fire - the wrong label kept itself alive.
-            seen_as_itself = o.get("label_t", o["t"])
-            if o["label"] != label and (time.time() - seen_as_itself) > LABEL_TAKEOVER_S:
-                say(f"map: {o['label']}#{best} not confirmed as '{o['label']}' for "
-                    f"{time.time() - seen_as_itself:.0f}s — relabelling as '{label}'")
-                o["label"], o["aka"], o["n"] = label, [], 0
-                o["measured"] = False
-            if o["label"] == label:
-                o["label_t"] = time.time()
-            # Give fresh observations more weight so the map converges faster and
-            # does not stay stuck on an early bad localization.
-            o["xy"] = 0.55 * o["xy"] + 0.45 * xy
-            if measured and not o.get("measured"):
-                o["w_m"], o["d_m"], o["h_m"] = float(w_m), float(d_m), float(h_m)
-                o["yaw"], o["shape"], o["measured"] = float(yaw), str(shape), True
-            elif measured or not o.get("measured"):
-                o["h_m"] = 0.7 * o["h_m"] + 0.3 * float(h_m)
-                if not o["sup"]:            # no caliper readings yet — keep blending
-                    o["w_m"] = 0.7 * o["w_m"] + 0.3 * float(w_m)
-                    o["d_m"] = 0.7 * o["d_m"] + 0.3 * float(d_m)
-                    o["yaw"] = _yaw_blend(o["yaw"], yaw, 0.3)
-            if o["label"] != label:
-                o["aka"] = sorted(set(o.get("aka", ())) | {label} - {o["label"]})
-            o["n"] += 1
-            o["stereo"] = stereo
-            o["t"] = time.time()
-
-        o = W2D["objs"][best]
-        if across_m is not None and u_deg is not None:
-            k = _sup_bin(u_deg)
-            o["sup"][k] = (0.6 * o["sup"][k] + 0.4 * float(across_m)
-                           if k in o["sup"] else float(across_m))
-            fit = _fit_rect_from_support(o["sup"])
-            if fit is not None:
-                o["w_m"], o["d_m"], o["yaw"] = fit
-                o["shape"] = _classify_shape(o["w_m"], o["d_m"], o["h_m"],
-                                             class_meta(label)["shape"])
-        _consolidate_2d()
+    return WORLD.update(label, xy, stereo=stereo, w_m=w_m, d_m=d_m, h_m=h_m,
+                        shape=shape, yaw=yaw, measured=measured,
+                        across_m=across_m, u_deg=u_deg)
 
 
 def sense_2d(joints=None, rgb=None):
@@ -1527,11 +1136,11 @@ def sense_2d(joints=None, rgb=None):
             # fully-visible box; the position fallbacks below do not.
             m = measure_object(rgb, tr.bbox_xyxy, T, label) if full_view else None
             if m is not None:
-                xy = _rotate_xy(m["xy"], MAP_BEARING_OFFSET_DEG[0])
+                xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
                 world2d_update(label, xy, m["rng_m"], m["w_m"], m["d_m"], m["h_m"],
                                m["shape"], m["yaw_deg"], True,
                                across_m=m["across_m"],
-                               u_deg=m["u_deg"] + MAP_BEARING_OFFSET_DEG[0])
+                               u_deg=m["u_deg"] + CFG.bearing_offset_deg)
                 continue
             # fallback 1: apparent-size range against the class prior
             zs = [z for z in (read_depth_m(tr.uv) for _ in range(3)) if z is not None]
@@ -1549,7 +1158,7 @@ def sense_2d(joints=None, rgb=None):
                 x1, y1, x2, y2 = tr.bbox_xyxy
                 p3 = ray_to_table(((x1 + x2) / 2.0, y2), T, TABLE_Z0)
                 if p3 is not None:
-                    cand = _rotate_xy(p3[:2], MAP_BEARING_OFFSET_DEG[0])
+                    cand = _rotate_xy(p3[:2], CFG.bearing_offset_deg)
                     if MAP_R_MIN < float(np.hypot(*cand)) < MAP_R_MAX:
                         xy, st = cand, float("nan")
             if xy is not None:
@@ -1569,14 +1178,13 @@ def _map_tracks(rgb, label, T):
 
 
 def world2d_snapshot():
+    # forget objects that have not been seen in a while: the map should describe the
+    # table as it is, not as it once was
+    WORLD.prune()
     now = time.time()
     with w2d_lock:
-        # forget objects that have not been seen in a while: the map should
-        # describe the table as it is, not as it once was
-        for t in [t for t, o in W2D["objs"].items() if now - o["t"] > MAP_TTL_S]:
-            del W2D["objs"][t]
         out = []
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             w_m, d_m, h_m = float(o["w_m"]), float(o["d_m"]), float(o["h_m"])
             out.append({"tag": t, "label": o["label"],
                         "x": round(float(o["xy"][0]), 3), "y": round(float(o["xy"][1]), 3),
@@ -1596,7 +1204,12 @@ def world2d_snapshot():
                         "aka": list(o.get("aka", ())),
                         "r_cm": round(float(np.hypot(*o["xy"])) * 100, 1),
                         "ang": round(math.degrees(math.atan2(o["xy"][1], o["xy"][0]))),
-                        "stereo_cm": (round(o["stereo"] * 100) if o["stereo"] == o["stereo"] else None),
+                        # "no stereo reading" arrives as either None or NaN depending on
+                        # which path created the entry; both must serialize, not crash
+                        # the viewer. (`x == x` is the NaN test.)
+                        "stereo_cm": (round(o["stereo"] * 100)
+                                      if o["stereo"] is not None and o["stereo"] == o["stereo"]
+                                      else None),
                         "n": o["n"], "age": round(now - o["t"], 1)})
         return out
 
@@ -1684,7 +1297,7 @@ def _scan_sweep():
 def goto_2d(tag):
     """Fly the gripper on top of a mapped object (hover ~6 cm above its (x,y))."""
     with w2d_lock:
-        o = W2D["objs"].get(tag)
+        o = WORLD.objs.get(tag)
     if o is None:
         raise Abort(f"tag {tag} not in the 2D map")
     xy, label = o["xy"], o["label"]
@@ -1739,20 +1352,11 @@ def solve_on_table(tr, T_base_cam):
     is exactly the "it should be further out" error. Here the size falls out of
     the solve instead of being assumed, so it is self-correcting.
     """
-    x1, y1, x2, y2 = tr.bbox_xyxy
-    w = float(max(4.0, x2 - x1))          # horizontal extent ~ the cube edge
-    o = T_base_cam[:3, 3]
-    d_cam = np.array([(tr.uv[0] - cx0) / fx, (tr.uv[1] - cy0) / fy, 1.0])
-    dirv = T_base_cam[:3, :3] @ (d_cam / np.linalg.norm(d_cam))
-    den = w / (2.0 * fx) - float(dirv[2])
-    if den <= 1e-6:
+    _apparent, plane = localizers()
+    fix = plane.locate(tr.bbox_xyxy, T_base_cam, uv=tr.uv)
+    if not fix.ok:
         return None, None
-    d = (float(o[2]) - TABLE_Z0) / den
-    if not (0.03 < d < 0.80):
-        return None, None
-    p = o + d * dirv
-    S = d * w / fx                        # the cube edge this implies
-    return p, float(S)
+    return np.array([fix.xy[0], fix.xy[1], fix.z_m], dtype=np.float64), fix.size_m
 
 
 def locate_on_table(finder, tracker, label):
@@ -1786,7 +1390,7 @@ def locate_on_table(finder, tracker, label):
     r_final = float(np.hypot(p[0], p[1]))
     say(f"{label} located: r={r_final*100:.1f}cm "
         f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm "
-        f"| raw r={r_raw*100:.1f}cm + pushed out {PUSH_OUT[0]*100:.0f}cm "
+        f"| raw r={r_raw*100:.1f}cm + pushed out {CFG.push_out_m*100:.0f}cm "
         f"| cube edge solved={S*100:.1f}cm")
     tracker.p_anchor = p.copy()
     tracker.anchor_t = time.time()
@@ -1801,15 +1405,15 @@ def load_tf_override():
     """A TF we FITTED beats the TF we were handed. Written by calibrate_handeye()."""
     global T_ee_cam
     try:
-        with open(TF_FILE) as f:
-            d = json.load(f)
-        T_ee_cam = parse_tf_string(d["tf"])
-        return d
-    except FileNotFoundError:
+        d = load_hand_eye(TF_FILE)
+    except ValueError as e:
+        say(f"hand-eye: ignoring {e}")
         return None
-    except Exception as e:
-        say(f"hand-eye: ignoring bad {os.path.basename(TF_FILE)} ({e})")
+    if d is None:
         return None
+    T_ee_cam = parse_tf_string(d["tf"])
+    _sync_geometry()
+    return d
 
 
 def calibrate_mount_multiview(finder, label="red", n_pan=5):
@@ -1829,8 +1433,6 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
     an anchor so the solution cannot slide off into a mirrored/degenerate pose.
     """
     global T_ee_cam
-    from scipy.optimize import least_squares
-    from scipy.spatial.transform import Rotation
     set_phase("CALIB", "multi-view mount calibration: sampling the cube")
     q0 = observe()[0].astype(np.float64)
     samples = []
@@ -1856,76 +1458,21 @@ def calibrate_mount_multiview(finder, label="red", n_pan=5):
         raise Abort(f"only {len(samples)} views - need at least 5. "
                     f"Keep the cube visible while the arm pans.")
 
-    t0 = T_ee_cam[:3, 3].copy()
-
-    def unpack(x):
-        T = np.eye(4)
-        T[:3, :3] = Rotation.from_rotvec(x[:3]).as_matrix()
-        T[:3, 3] = x[3:6]
-        return T
-
-    def table_pts(T_cam_ee):
-        pts = []
-        for T_ee, uv in samples:
-            T = T_ee @ T_cam_ee
-            o = T[:3, 3]
-            d = T[:3, :3] @ np.array([(uv[0]-cx0)/fx, (uv[1]-cy0)/fy, 1.0])
-            if d[2] >= -1e-3:
-                return None
-            t = (TABLE_Z0 - o[2]) / d[2]
-            if not (0.02 < t < 2.0):
-                return None
-            pts.append((o + t*d)[:2])
-        return np.array(pts) if pts else None
-
-    def resid(x):
-        T = unpack(x)
-        pts = table_pts(T)
-        if pts is None:
-            return np.full(2*len(samples) + 2, 10.0)
-        spread = (pts - pts.mean(axis=0)).ravel() * 40.0      # metres -> weighted
-        # fingertip anchor: it must still reproject to its measured pixel
-        T_ee, _ = samples[0]
-        tip = T_ee[:3, 3] + T_ee[:3, :3] @ np.array([0, 0, GRIP_TIP_OFFSET_M])
-        Tbc = T_ee @ T
-        pc = np.linalg.inv(Tbc) @ np.append(tip, 1.0)
-        if pc[2] <= 1e-6:
-            anchor = np.array([10.0, 10.0])
-        else:
-            u = fx*pc[0]/pc[2] + cx0
-            v = fy*pc[1]/pc[2] + cy0
-            anchor = np.array([u - HAND_UV[0], v - HAND_UV[1]]) * 0.02
-        return np.concatenate([spread, anchor])
-
-    x0 = np.concatenate([Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(), t0])
-    lo = np.concatenate([x0[:3] - 1.2, t0 - 0.06])
-    hi = np.concatenate([x0[:3] + 1.2, t0 + 0.06])
-    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
-                        max_nfev=3000, ftol=1e-10, xtol=1e-10)
-
-    def spread_cm(x):
-        pts = table_pts(unpack(x))
-        if pts is None:
-            return 999.0
-        return float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).mean() * 100)
-
-    before, after = spread_cm(x0), spread_cm(sol.x)
-    say(f"multi-view spread: {before:.1f}cm -> {after:.1f}cm "
+    # The consistency fit lives in perception/handeye.py; this owns the pan sweep.
+    fit = fit_consistency(
+        [HandEyeSample(T_ee, uv) for T_ee, uv in samples],
+        GEOM, tip_uv=HAND_UV, T_seed=T_ee_cam, z_plane=TABLE_Z0,
+        tip_offset_m=GRIP_TIP_OFFSET_M)
+    say(f"multi-view spread: {fit.before['spread_m']*100:.1f}cm -> {fit.spread_m*100:.1f}cm "
         f"(how much the same cube moves between viewpoints)")
-    if after > before or after > 4.0:
-        raise Abort(f"multi-view calibration did not converge "
-                    f"(spread {after:.1f}cm) - mount NOT changed")
-    T_new = unpack(sol.x)
-    rv = Rotation.from_matrix(T_new[:3, :3]).as_rotvec()
-    tf_str = ",".join(f"{v:.4f}" for v in list(T_new[:3, 3]) + list(rv))
-    T_ee_cam = T_new
-    with open(TF_FILE, "w") as f:
-        json.dump({"tf": tf_str, "rms_px": 0, "tip_px": 0,
-                   "spread_cm": after, "views": len(samples),
-                   "source": "multi-view consistency", "fitted": time.strftime("%Y-%m-%d %H:%M:%S")},
-                  f, indent=2)
-    say(f"mount CALIBRATED (multi-view) -> {tf_str}")
-    set_phase("IDLE", f"mount calibrated - same cube now agrees to {after:.1f}cm across views")
+    if not fit.converged:
+        raise Abort(f"multi-view calibration {fit.reason}")
+    T_ee_cam = fit.T_ee_cam
+    _sync_geometry()
+    save_hand_eye(TF_FILE, fit)
+    say(f"mount CALIBRATED (multi-view) -> {fit.tf}")
+    set_phase("IDLE",
+              f"mount calibrated - same cube now agrees to {fit.spread_m*100:.1f}cm across views")
 
 
 
@@ -1955,8 +1502,6 @@ def calibrate_handeye(finder, n_target=14):
     Residuals: 2 + 2N. Seeded from the current TF, so a good TF stays put.
     """
     global T_ee_cam
-    from scipy.optimize import least_squares
-    from scipy.spatial.transform import Rotation
 
     set_phase("CALIB", "hand-eye: sampling the cube from several poses")
     q0 = observe()[0].astype(np.float64)
@@ -1994,88 +1539,31 @@ def calibrate_handeye(finder, n_target=14):
         raise Abort(f"hand-eye: only {len(samples)} usable views (need 6) — "
                     "keep the cube in the gripper view for the whole sweep")
 
-    T_ee = [np.asarray(kin.forward_kinematics(j)) for j, _ in samples]
-    uvs = [uv for _, uv in samples]
-    # The fingertip anchor is pose-independent (the camera is rigid to the ee), so it
-    # is ONE constraint however many poses we took. Weight it like sqrt(N) samples so
-    # it is not drowned out by the noisier cube pixels.
-    w_tip = math.sqrt(len(samples))
+    # The fit itself lives in perception/handeye.py — this owns the motion that
+    # collected the views, which is the part that needs a robot.
+    T_ee0 = np.asarray(kin.forward_kinematics(samples[0][0]))
+    fit = fit_reprojection(
+        [HandEyeSample(np.asarray(kin.forward_kinematics(j)), uv) for j, uv in samples],
+        GEOM, tip_uv=HAND_UV, T_seed=T_ee_cam,
+        target_seed=_measure_point(tr0, T_ee0 @ T_ee_cam), cam_tip_m=CAM_TIP_M)
 
-    def unpack(x):
-        tf = np.eye(4)
-        tf[:3, 3] = x[:3]
-        tf[:3, :3] = Rotation.from_rotvec(x[3:6]).as_matrix()
-        return tf, np.array(x[6:9])
+    say(f"hand-eye BEFORE: cube reprojection RMS={fit.before['rms_px']:.0f}px  "
+        f"fingertip off by {fit.before['tip_gap_px']:.0f}px  ({fit.n_views} views)")
+    say(f"hand-eye AFTER:  cube reprojection RMS={fit.rms_px:.0f}px  "
+        f"fingertip off by {fit.tip_gap_px:.0f}px")
+    if not fit.converged:
+        raise Abort(f"hand-eye: {fit.reason} — TF NOT changed.")
 
-    def resid(x):
-        tf, p = unpack(x)
-        r = []
-        for T, uv in zip(T_ee, uvs):
-            pu = project_base(p, T @ tf)
-            r += [400.0, 400.0] if pu is None else [pu[0] - uv[0], pu[1] - uv[1]]
-        pt = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)      # the fingertip anchor
-        r += ([400.0, 400.0] if pt is None else
-              [w_tip * (pt[0] - HAND_UV[0]), w_tip * (pt[1] - HAND_UV[1])])
-        return r
-
-    p_seed = _measure_point(tr0, T_ee[0] @ T_ee_cam)
-    if p_seed is None:
-        p_seed = np.array([0.18, 0.0, 0.02])
-
-    # SEED THE TRANSLATION AT THE MEASURED MOUNT DISTANCE, not at the old TF's value.
-    # The old TF puts the camera 20.2 cm from the fingertip; the mount was measured at
-    # ~10 cm. Starting a nonlinear fit 2x off in translation invites a bad local minimum,
-    # so keep the old direction (the mount geometry is roughly right) and rescale it, and
-    # bound |t| to something a camera bolted to this gripper can physically be.
-    t_old = np.asarray(T_ee_cam[:3, 3], np.float64)
-    t_seed = t_old / max(1e-6, np.linalg.norm(t_old)) * CAM_TIP_M
-    x0 = np.concatenate([t_seed,
-                         Rotation.from_matrix(T_ee_cam[:3, :3]).as_rotvec(),
-                         np.asarray(p_seed, np.float64)])
-    lo = np.array([-0.16, -0.16, -0.16, -4.0, -4.0, -4.0, -0.45, -0.45, 0.005])
-    hi = np.array([0.16, 0.16, 0.16, 4.0, 4.0, 4.0, 0.45, 0.45, 0.050])
-    x0 = np.clip(x0, lo + 1e-6, hi - 1e-6)
-
-    def rms(x):
-        r = np.array(resid(x))[: 2 * len(samples)]
-        return float(np.sqrt((r ** 2).reshape(-1, 2).sum(1).mean()))
-
-    def tipgap(x):
-        tf, _ = unpack(x)
-        pu = project_base(T_ee[0][:3, 3], T_ee[0] @ tf)
-        return 999.0 if pu is None else math.hypot(pu[0] - HAND_UV[0], pu[1] - HAND_UV[1])
-
-    say(f"hand-eye BEFORE: cube reprojection RMS={rms(x0):.0f}px  "
-        f"fingertip off by {tipgap(x0):.0f}px  ({len(samples)} views)")
-
-    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
-                        max_nfev=4000, ftol=1e-10, xtol=1e-10)
-    tf, p = unpack(sol.x)
-    say(f"hand-eye AFTER:  cube reprojection RMS={rms(sol.x):.0f}px  "
-        f"fingertip off by {tipgap(sol.x):.0f}px")
-
-    # Gate on the FINGERTIP gap — a HARD geometric constraint (the camera is bolted
-    # to the gripper, so FK's fingertip must reproject to the measured HAND_UV), which
-    # locks to ~0px on a good fit. Do NOT gate tightly on the cube RMS: a colour-blob
-    # centroid has a ~50-80px noise floor that MORE poses do not lower, so a 25px bar
-    # rejected a GOOD fit (tip 0px, rms 49px) and kept the broken CAD TF. Accept when
-    # the fingertip nails it and the cube RMS is merely sane.
-    if tipgap(sol.x) > 12.0 or rms(sol.x) > 100.0:
-        raise Abort(f"hand-eye: fit did not converge (RMS {rms(sol.x):.0f}px, "
-                    f"tip {tipgap(sol.x):.0f}px) — TF NOT changed. More pose spread needed.")
-
-    rv = Rotation.from_matrix(tf[:3, :3]).as_rotvec()
-    tf_str = ",".join(f"{v:.4f}" for v in list(tf[:3, 3]) + list(rv))
-    with open(TF_FILE, "w") as f:
-        json.dump({"tf": tf_str, "rms_px": rms(sol.x), "tip_px": tipgap(sol.x),
-                   "views": len(samples), "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
-    T_ee_cam = tf
-    say(f"hand-eye CALIBRATED -> {tf_str}")
+    save_hand_eye(TF_FILE, fit)
+    T_ee_cam = fit.T_ee_cam
+    _sync_geometry()
+    p = fit.target_p
+    say(f"hand-eye CALIBRATED -> {fit.tf}")
     say(f"  (saved to {os.path.basename(TF_FILE)}; loaded automatically on every restart)")
     say(f"  cube now solves to r={np.hypot(p[0], p[1])*100:.1f}cm "
         f"ang={math.degrees(math.atan2(p[1], p[0])):+.0f}deg z={p[2]*100:.1f}cm")
-    set_phase("CALIB", f"hand-eye fixed — reprojection {rms(sol.x):.0f}px")
-    return tf
+    set_phase("CALIB", f"hand-eye fixed — reprojection {fit.rms_px:.0f}px")
+    return fit.T_ee_cam
 
 
 def bbox_range_m(tr):
@@ -2156,25 +1644,7 @@ def plan_grasp_pitch(p_obj, q_seed):
     [-10, 55] -- it aimed straight into the dead band. At 70-90 the whole 10-28cm working
     range solves to under 0.3 mm.
     """
-    p_above = np.array([p_obj[0], p_obj[1], p_obj[2] + STANDOFF_H])
-    best = None
-    for pitch in GRASP_PITCH:
-        _, e_hi = _ik_hold_pitch(q_seed, p_above, pitch, float(q_seed[4]), ret_err=True)
-        _, e_lo = _ik_hold_pitch(q_seed, p_obj, pitch, float(q_seed[4]), ret_err=True)
-        worst = max(float(e_hi), float(e_lo))
-        # At the workspace edge (shallow pitch / far reach) the IK residual can be a
-        # few mm larger and still be a valid pose. Use a sliding tolerance so we do
-        # not throw away the arm's real reach; the visual centering pass then fine-tunes.
-        tol = 0.025 if pitch <= 15.0 else 0.004
-        if worst <= tol:
-            return pitch, worst
-        if best is None or worst < best[1]:
-            best = (pitch, worst)
-    # Last resort: if nothing solved tightly but the best residual is still usable,
-    # return it rather than declaring the cube unreachable at the edge of reach.
-    if best is not None and best[1] <= 0.030:
-        return best
-    return None, best[1]
+    return ik_strategy().plan_pitch(p_obj, q_seed)
 
 
 def detect_now(finder, tries=12):
@@ -2223,11 +1693,11 @@ PICK_LIFT_M = 0.10
 PLACE_CLEAR_M = 0.008      # gap left under the carried object at release
 PLACE_HOVER_M = 0.07       # hover this far above z_release before descending
 PLACE_TRANSIT_Z = 0.16     # carry the object at this height while traversing
-PLACE_OPEN_PCT = 62.0      # gripper opening that releases without flicking
+PLACE_OPEN_PCT = ARM.gripper.place_open_pct   # releases without flicking the object
 PLACE_RETREAT_M = 0.09     # straight-up retreat after releasing
 
-# Detection resolution. 320 is what the approach trims (AIM_DU, TARGET_RIGHT_TRIM_M,
-# TARGET_BACK_M) were tuned against, and range comes straight from bbox width
+# Detection resolution. 320 is what the approach trims (CFG.aim_du_px, CFG.right_trim_m,
+# CFG.back_m) were tuned against, and range comes straight from bbox width
 #     range = fx * real_width / bbox_width
 # so changing this SHIFTS EVERY RANGE and silently invalidates that tuning. Raising
 # it to 640 found the pen but made cube picking worse; the pen is a scan-time
@@ -2280,7 +1750,6 @@ FLOOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "floor_pla
 # Default c matches the value someone measured by hand and left in ee_move_rel's
 # comment ("table contact is z=-0.022, sag included"); a=b=0 means "flat and level"
 # until a calibration says otherwise.
-FLOOR_PLANE = [0.0, 0.0, -0.022]
 FLOOR_PROBE_STEP = 0.0025      # descend in 2.5 mm bites - gentle enough not to
                                # slam the servos or trip the overload latch
 FLOOR_PROBE_DROP = 0.055       # give up after this much descent from the start
@@ -2292,27 +1761,23 @@ FLOOR_GRASP_CLEAR = 0.012      # grasp this far ABOVE the measured floor
 
 def floor_z(x, y):
     """Table height in base z at (x, y), from the calibrated plane."""
-    a, b, c = FLOOR_PLANE
-    return float(a * float(x) + b * float(y) + c)
+    return FLOOR.z(x, y)
 
 
 def load_floor_plane():
-    global FLOOR_PLANE
     try:
-        with open(FLOOR_FILE) as f:
-            d = json.load(f)
-        FLOOR_PLANE = [float(d["a"]), float(d["b"]), float(d["c"])]
-        say(f"floor: calibrated plane loaded — z = {FLOOR_PLANE[0]:+.4f}x "
-            f"{FLOOR_PLANE[1]:+.4f}y {FLOOR_PLANE[2]:+.4f}  "
-            f"(tilt {d.get('tilt_deg', 0):.2f}deg, rms {d.get('rms_mm', 0):.1f}mm, "
-            f"fitted {d.get('fitted', '?')})")
-        return d
-    except FileNotFoundError:
-        say(f"floor: no calibration yet — assuming z={FLOOR_PLANE[2]*100:.1f}cm and level. "
+        d = FLOOR.load(FLOOR_FILE)
+    except ValueError as e:
+        say(f"floor: ignoring {e}")
+        return None
+    if d is None:
+        say(f"floor: no calibration yet — assuming z={FLOOR.c*100:.1f}cm and level. "
             f"Press 'Calibrate floor' to measure it.")
-    except Exception as e:
-        say(f"floor: ignoring bad {os.path.basename(FLOOR_FILE)} ({e})")
-    return None
+        return None
+    say(f"floor: calibrated plane loaded — {FLOOR.describe()}  "
+        f"(tilt {d.get('tilt_deg', 0):.2f}deg, rms {d.get('rms_mm', 0):.1f}mm, "
+        f"fitted {d.get('fitted', '?')})")
+    return d
 
 
 def _arm_load():
@@ -2377,7 +1842,6 @@ FLOOR_PROBE_POINTS = [(0.19, -18.0), (0.19, 0.0), (0.19, 18.0),
 def calibrate_floor():
     """Touch the table at several places and fit z_floor(x, y). Self-calibration:
     no ruler, no hand-tuned constant, and it absorbs arm sag for free."""
-    global FLOOR_PLANE
     set_phase("FLOORCAL", f"probing the table at {len(FLOOR_PROBE_POINTS)} points")
     say("=" * 52)
     say("FLOOR CALIBRATION — touching the table to find its real height")
@@ -2403,23 +1867,20 @@ def calibrate_floor():
 
     if len(pts) < 3:
         raise Abort(f"floor: only {len(pts)} touch points — need 3 to fit a plane")
-    A = np.array([[p[0], p[1], 1.0] for p in pts])
-    zz = np.array([p[2] for p in pts])
-    (a, b, c), *_ = np.linalg.lstsq(A, zz, rcond=None)
-    resid = zz - A @ np.array([a, b, c])
-    rms = float(np.sqrt(np.mean(resid ** 2)))
-    tilt = math.degrees(math.atan(math.hypot(a, b)))
-    FLOOR_PLANE = [float(a), float(b), float(c)]
-    d = {"a": float(a), "b": float(b), "c": float(c),
-         "tilt_deg": round(tilt, 3), "rms_mm": round(rms * 1000, 2),
-         "points": [[round(v, 4) for v in p] for p in pts],
-         "fitted": time.strftime("%Y-%m-%d %H:%M:%S")}
     try:
-        with open(FLOOR_FILE, "w") as f:
-            json.dump(d, f, indent=1)
+        res = fit_plane(pts)
+    except ValueError as e:
+        raise Abort(f"floor: {e}")
+    a, b, c = res.plane.a, res.plane.b, res.plane.c
+    rms, tilt = res.rms_m, res.tilt_deg
+    FLOOR.set(a, b, c)          # in place: every holder of FLOOR sees the new surface
+    d = res.to_dict()
+    try:
+        # Plane.save writes a/b/c itself; pass only the fit metadata alongside.
+        FLOOR.save(FLOOR_FILE, **{k: v for k, v in d.items() if k not in ("a", "b", "c")})
     except Exception as e:
         say(f"floor: could not save ({e})")
-    say(f"floor plane: z = {a:+.4f}x {b:+.4f}y {c:+.4f}   "
+    say(f"floor plane: {FLOOR.describe()}   "
         f"tilt {tilt:.2f}deg   fit rms {rms*1000:.1f}mm over {len(pts)} points")
     say(f"  at r=18cm the floor is z={floor_z(0.18,0)*100:+.2f}cm, "
         f"at r=34cm it is z={floor_z(0.34,0)*100:+.2f}cm  "
@@ -2477,157 +1938,23 @@ def _target_finder(label=None):
 #
 # Format: label -> (shape, width_m, depth_m, height_m), width/depth being the
 # footprint on the table and height the vertical extent.
-_CLASS_TABLE = {
-    # --- the original cubes (measured on the real blocks) ---
-    "red cube":      ("cube",     0.0508, 0.0508, 0.0508),
-    "green cube":    ("cube",     0.0508, 0.0508, 0.0508),
-    "blue cube":     ("cube",     0.0508, 0.0508, 0.0508),
-    "yellow cube":   ("cube",     0.0508, 0.0508, 0.0508),
-    "toy block":     ("cube",     0.0508, 0.0508, 0.0508),
-    # --- COCO: people & animals ---
-    "person":        ("cylinder", 0.45,  0.30,  1.70),
-    "bird":          ("cuboid",   0.10,  0.22,  0.16),
-    "cat":           ("cuboid",   0.18,  0.46,  0.25),
-    "dog":           ("cuboid",   0.25,  0.70,  0.50),
-    "horse":         ("cuboid",   0.60,  2.20,  1.60),
-    "sheep":         ("cuboid",   0.40,  1.20,  0.90),
-    "cow":           ("cuboid",   0.70,  2.40,  1.50),
-    "elephant":      ("cuboid",   1.50,  4.00,  3.00),
-    "bear":          ("cuboid",   0.80,  1.80,  1.20),
-    "zebra":         ("cuboid",   0.60,  2.20,  1.50),
-    "giraffe":       ("cuboid",   0.80,  2.50,  4.50),
-    # --- COCO: vehicles & street ---
-    "bicycle":       ("cuboid",   0.60,  1.75,  1.10),
-    "car":           ("cuboid",   1.80,  4.50,  1.50),
-    "motorcycle":    ("cuboid",   0.80,  2.10,  1.20),
-    "airplane":      ("cuboid",  30.0,  35.0,  10.0),
-    "bus":           ("cuboid",   2.55, 12.0,   3.20),
-    "train":         ("cuboid",   3.00, 25.0,   4.00),
-    "truck":         ("cuboid",   2.50,  8.00,  3.00),
-    "boat":          ("cuboid",   2.00,  6.00,  2.00),
-    "traffic light": ("cuboid",   0.30,  0.30,  1.00),
-    "fire hydrant":  ("cylinder", 0.30,  0.30,  0.75),
-    "stop sign":     ("cuboid",   0.75,  0.05,  2.10),
-    "parking meter": ("cuboid",   0.15,  0.15,  1.20),
-    "bench":         ("cuboid",   0.55,  1.50,  0.85),
-    # --- COCO: accessories & sport ---
-    "backpack":      ("cuboid",   0.32,  0.20,  0.45),
-    "umbrella":      ("cylinder", 0.06,  0.06,  0.90),
-    "handbag":       ("cuboid",   0.32,  0.14,  0.26),
-    "tie":           ("cuboid",   0.08,  0.02,  0.55),
-    "suitcase":      ("cuboid",   0.45,  0.22,  0.65),
-    "frisbee":       ("cylinder", 0.27,  0.27,  0.03),
-    "skis":          ("cuboid",   0.12,  1.70,  0.05),
-    "snowboard":     ("cuboid",   0.28,  1.50,  0.03),
-    "sports ball":   ("sphere",   0.22,  0.22,  0.22),
-    "kite":          ("cuboid",   1.00,  0.60,  0.05),
-    "baseball bat":  ("cylinder", 0.07,  0.07,  0.85),
-    "baseball glove":("cuboid",   0.25,  0.15,  0.30),
-    "skateboard":    ("cuboid",   0.21,  0.80,  0.11),
-    "surfboard":     ("cuboid",   0.50,  2.10,  0.07),
-    "tennis racket": ("cuboid",   0.28,  0.68,  0.03),
-    # --- COCO: tabletop (the ones this arm can actually pick) ---
-    "bottle":        ("cylinder", 0.068, 0.068, 0.23),
-    "wine glass":    ("cylinder", 0.080, 0.080, 0.20),
-    "cup":           ("cylinder", 0.080, 0.080, 0.10),
-    "pen cup":       ("cylinder", 0.075, 0.075, 0.10),
-    "mug":           ("cylinder", 0.085, 0.085, 0.10),
-    "fork":          ("cuboid",   0.025, 0.19,  0.012),
-    "knife":         ("cuboid",   0.022, 0.22,  0.012),
-    "spoon":         ("cuboid",   0.035, 0.18,  0.012),
-    "bowl":          ("cylinder", 0.15,  0.15,  0.07),
-    "banana":        ("cuboid",   0.045, 0.19,  0.040),
-    "apple":         ("sphere",   0.078, 0.078, 0.078),
-    "sandwich":      ("cuboid",   0.12,  0.12,  0.05),
-    "orange":        ("sphere",   0.075, 0.075, 0.075),
-    "broccoli":      ("sphere",   0.12,  0.12,  0.14),
-    "carrot":        ("cuboid",   0.035, 0.17,  0.035),
-    "hot dog":       ("cuboid",   0.050, 0.16,  0.050),
-    "pizza":         ("cylinder", 0.30,  0.30,  0.03),
-    "donut":         ("cylinder", 0.095, 0.095, 0.045),
-    "cake":          ("cylinder", 0.22,  0.22,  0.10),
-    # --- COCO: furniture & appliances ---
-    "chair":         ("cuboid",   0.45,  0.45,  0.90),
-    "couch":         ("cuboid",   0.90,  2.00,  0.80),
-    "potted plant":  ("cylinder", 0.22,  0.22,  0.40),
-    "bed":           ("cuboid",   1.50,  2.00,  0.60),
-    "dining table":  ("cuboid",   0.90,  1.60,  0.75),
-    "toilet":        ("cuboid",   0.38,  0.70,  0.75),
-    "microwave":     ("cuboid",   0.50,  0.38,  0.30),
-    "oven":          ("cuboid",   0.60,  0.60,  0.85),
-    "toaster":       ("cuboid",   0.28,  0.18,  0.20),
-    "sink":          ("cuboid",   0.55,  0.45,  0.20),
-    "refrigerator":  ("cuboid",   0.70,  0.70,  1.80),
-    # --- COCO: electronics & small objects ---
-    "tv":            ("cuboid",   1.10,  0.08,  0.65),
-    "laptop":        ("cuboid",   0.33,  0.24,  0.02),
-    "mouse":         ("cuboid",   0.062, 0.11,  0.038),
-    "remote":        ("cuboid",   0.045, 0.16,  0.022),
-    "keyboard":      ("cuboid",   0.44,  0.14,  0.025),
-    "cell phone":    ("cuboid",   0.072, 0.15,  0.009),
-    "book":          ("cuboid",   0.15,  0.22,  0.030),
-    "clock":         ("cylinder", 0.25,  0.25,  0.05),
-    "vase":          ("cylinder", 0.12,  0.12,  0.25),
-    "scissors":      ("cuboid",   0.065, 0.18,  0.010),
-    "teddy bear":    ("cuboid",   0.22,  0.15,  0.32),
-    "hair drier":    ("cuboid",   0.085, 0.22,  0.22),
-    "toothbrush":    ("cuboid",   0.015, 0.19,  0.015),
-    # --- handy extras that are not COCO but come up on this table ---
-    "pen":           ("cuboid",   0.010, 0.14,  0.010),
-    "pencil":        ("cuboid",   0.008, 0.17,  0.008),
-    "marker":        ("cylinder", 0.017, 0.017, 0.14),
-    "eraser":        ("cuboid",   0.022, 0.055, 0.012),
-    "screwdriver":   ("cuboid",   0.028, 0.21,  0.028),
-    "tape":          ("cylinder", 0.075, 0.075, 0.025),
-    "battery":       ("cylinder", 0.014, 0.014, 0.050),
-    "usb stick":     ("cuboid",   0.018, 0.055, 0.009),
-    "box":           ("cuboid",   0.10,  0.10,  0.10),
-    "can":           ("cylinder", 0.066, 0.066, 0.12),
-}
-# The 80 COCO names, in order — the "all YOLO classes" preset for the query box.
-COCO_CLASSES = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-    "hair drier", "toothbrush",
-]
+# The per-class size/shape priors, the COCO name list and the tabletop subset now
+# live in perception/object_priors.py and are imported at the top of this file.
 # Objects bigger than this in any footprint dimension cannot be on this table —
 # used to reject a nonsense measurement, not to reject the detection.
-MAX_TABLE_OBJ_M = 0.45
-CUBE_EDGE_M = 0.0508       # generic fallback edge for an unlisted label
-
-CLASS_META = {k: {"shape": v[0], "w_m": v[1], "d_m": v[2], "h_m": v[3]}
-              for k, v in _CLASS_TABLE.items()}
-
-
 def class_meta(label):
     """Prior for a label: {shape, w_m, d_m, h_m}. Unlisted labels get a cube guess."""
-    return CLASS_META.get(str(label).strip().lower(),
-                          {"shape": "cube", "w_m": CUBE_EDGE_M,
-                           "d_m": CUBE_EDGE_M, "h_m": CUBE_EDGE_M})
+    return PRIORS.meta(label)
 
 
 def class_size_m(label):
-    """Characteristic width for apparent-size ranging (what the bbox width maps to).
-
-    For an object of unknown yaw the bbox width is somewhere between the footprint's
-    minor and major axis, so the geometric mean is the least-wrong single number.
-    """
-    m = class_meta(label)
-    return float(math.sqrt(max(m["w_m"], 1e-3) * max(m["d_m"], 1e-3)))
+    """Characteristic width for apparent-size ranging (what the bbox width maps to)."""
+    return PRIORS.size_m(label)
 
 
 def class_height_m(label):
     """Vertical extent above the table — used for hover/grasp height."""
-    return float(class_meta(label)["h_m"])
+    return PRIORS.height_m(label)
 
 
 # ---------------- monocular size + orientation measurement ----------------
@@ -2643,337 +1970,17 @@ def class_height_m(label):
 #   * the top of the silhouette, intersected with the vertical line through the
 #     footprint centre, gives the HEIGHT.
 # No object-size assumption enters any of this — the prior is only the fallback.
-SEG_RING = 8               # px ring around the bbox sampled as table background
-SEG_MIN_FRAC = 0.06        # mask must cover this fraction of the bbox to be usable
-# Rays that graze the table are useless for ranging: near the horizon one pixel of
-# segmentation noise slides the intersection by many centimetres. Require the ray
-# to come down onto the plane at least this steeply — sin(incidence) >= this.
-# About 13 deg off the table. Shallow, and shallow rays ARE where the range gets
-# unreliable — but raising this to 0.35 (20 deg) rejected 100% of real rays on this
-# rig (measure_stats: no_contact_line 69/69), because objects at r~40 cm sit near
-# the top of the gripper camera's view and are genuinely seen near-grazing. The
-# far-flung ghosts it was meant to stop are better caught by the two gates that say
-# what is actually wrong with them — size_vs_prior and out_of_workspace — so this
-# stays permissive and those do the rejecting.
-MIN_TABLE_INCIDENCE = 0.22
-# A TALL object's silhouette is WIDEST AT ITS TOP, not at its base — the top is
-# nearer the camera, so perspective spreads it. That means the outermost columns of
-# the silhouette are the object's near-vertical SIDE edges, and their bottom pixel
-# is somewhere up the side wall, NOT on the table. Back-projecting those onto the
-# table plane throws them far outward: measured on the synthetic bench, an 8 cm cup
-# came out 11.5 cm across from exactly this. A genuine contact pixel sits on the
-# base edge, where the silhouette's lower boundary runs roughly HORIZONTALLY; on a
-# side edge it plunges. So reject columns where the lower boundary is steeper than
-# this many pixels of drop per pixel across.
-MAX_CONTACT_SLOPE = 2.5
-
-
-def _pixels_to_table(uv, T_base_cam, z_plane, min_incidence=0.0):
-    """Back-project an (N,2) array of pixels onto the horizontal plane z=z_plane.
-
-    Returns (points (M,3), keep_mask (N,)). Rays that point up, that meet the plane
-    behind the camera or absurdly far away, or that graze it more shallowly than
-    min_incidence, are dropped.
-    """
-    uv = np.asarray(uv, np.float64).reshape(-1, 2)
-    d = np.stack([(uv[:, 0] - cx0) / fx, (uv[:, 1] - cy0) / fy,
-                  np.ones(len(uv))], axis=1)
-    d /= np.linalg.norm(d, axis=1, keepdims=True)
-    d = d @ np.asarray(T_base_cam[:3, :3], np.float64).T
-    o = np.asarray(T_base_cam[:3, 3], np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t = (z_plane - o[2]) / d[:, 2]
-    keep = ((d[:, 2] < -max(1e-4, float(min_incidence))) & np.isfinite(t)
-            & (t > 0.03) & (t < 1.50))
-    return o + d[keep] * t[keep, None], keep
-
-
-def _silhouette_mask(rgb, bbox):
-    """Separate the object from the table inside a YOLO box.
-
-    Colour-distance segmentation, not GrabCut: a ring of pixels just OUTSIDE the
-    box is the table, so any pixel inside the box far enough from that background
-    colour (in Lab, which is roughly perceptually uniform) is object. Otsu picks
-    the cut so it adapts to contrast instead of needing a tuned threshold. This
-    costs ~1 ms against GrabCut's ~60 ms, which matters because sense_2d runs
-    inside the scan sweep.
-
-    Returns a uint8 mask in FULL-FRAME coordinates, or None.
-    """
-    H, W = rgb.shape[:2]
-    x1, y1, x2, y2 = (int(round(v)) for v in bbox)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(W, x2), min(H, y2)
-    if x2 - x1 < 8 or y2 - y1 < 8:
-        return None
-    lab = cv2.cvtColor(np.asarray(rgb, np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-
-    # background colour = median of a ring just outside the box (that is table)
-    rx1, ry1 = max(0, x1 - SEG_RING), max(0, y1 - SEG_RING)
-    rx2, ry2 = min(W, x2 + SEG_RING), min(H, y2 + SEG_RING)
-    ring = np.ones((ry2 - ry1, rx2 - rx1), bool)
-    ring[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = False
-    ring_px = lab[ry1:ry2, rx1:rx2][ring]
-    if ring_px.shape[0] < 40:
-        return None
-    bg = np.median(ring_px, axis=0)
-
-    roi = lab[y1:y2, x1:x2]
-    dist = np.linalg.norm(roi - bg, axis=2)
-    dmax = float(dist.max())
-    if dmax < 8.0:                       # object is the same colour as the table
-        return None
-    d8 = np.clip(dist / dmax * 255.0, 0, 255).astype(np.uint8)
-    _thr, m = cv2.threshold(d8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = np.ones((3, 3), np.uint8)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
-
-    # keep the component that actually covers the box centre — Otsu on a
-    # background gradient can light up a corner of the ROI instead of the object
-    n, lbl, stats, _c = cv2.connectedComponentsWithStats(m, connectivity=8)
-    if n < 2:
-        return None
-    cx_r, cy_r = (x2 - x1) // 2, (y2 - y1) // 2
-    inner = lbl[max(0, cy_r - 3):cy_r + 4, max(0, cx_r - 3):cx_r + 4]
-    inner = inner[inner > 0]
-    if inner.size:
-        best = int(np.bincount(inner).argmax())
-    else:
-        best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[best, cv2.CC_STAT_AREA] < SEG_MIN_FRAC * (x2 - x1) * (y2 - y1):
-        return None
-    full = np.zeros((H, W), np.uint8)
-    full[y1:y2, x1:x2] = np.where(lbl == best, 255, 0).astype(np.uint8)
-    return full
-
-
-def _contact_points(mask, bbox, T_base_cam, z_plane):
-    """Base-frame footprint points where the object meets the table, plus the
-    matching top-of-silhouette pixel for each of those columns.
-
-    For a convex object standing on a plane, the LOWEST object pixel in each image
-    column is the point where that column's surface touches the table — so those
-    pixels, and only those, can be back-projected onto z=z_plane honestly. Columns
-    whose bottom pixel sits on the box's own bottom edge are dropped: the object is
-    cut off there and its real contact line is outside the frame.
-
-    Returns (contact_pts (M,3), top_uv (M,2)) column-for-column, so the height
-    solve can pair each roof pixel with the floor pixel DIRECTLY BELOW IT rather
-    than with the footprint centre — which is what a flat elongated object needs
-    (the highest pixel of a lying remote is its far END, not its top face).
-    """
-    H, W = mask.shape[:2]
-    x1, y1, x2, y2 = (int(round(v)) for v in bbox)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(W, x2), min(H, y2)
-    sub = mask[y1:y2, x1:x2] > 0
-    cols = np.where(sub.any(axis=0))[0]
-    if cols.size < 6:
-        return None, None
-    bottom = (sub.shape[0] - 1) - np.argmax(sub[::-1, :], axis=0)
-    top = np.argmax(sub, axis=0)
-    # Clipping means the IMAGE ran out, not the box: a bounding box touches the
-    # silhouette on all four sides by construction, so testing the bottom pixel
-    # against the box's own floor discards the entire true contact line. (It did
-    # exactly that — a cup kept 28 of 147 columns, all of them up on its far rim.)
-    if y2 >= H - 2:
-        return None, None
-    # drop the side-edge columns (see MAX_CONTACT_SLOPE) — keep only the stretch of
-    # the lower boundary that is genuinely lying along the object's base
-    b = bottom[cols].astype(np.float64)
-    slope = np.gradient(b, cols.astype(np.float64))
-    flat = np.abs(slope) <= MAX_CONTACT_SLOPE
-    if flat.sum() >= 6:
-        cols, b = cols[flat], b[flat]
-    else:
-        b = bottom[cols].astype(np.float64)
-    uv_bot = np.stack([cols + x1 + 0.5, b + y1 + 0.5], axis=1)
-    pts, ok = _pixels_to_table(uv_bot, T_base_cam, z_plane, MIN_TABLE_INCIDENCE)
-    if pts.shape[0] < 6:
-        return None, None
-    uv_top = np.stack([cols + x1 + 0.5, top[cols] + y1 + 0.5], axis=1)[ok]
-    return pts, uv_top
-
-
-def _solve_height(uv_top, xy, half_along, T_base_cam, z_plane):
-    """Height of the object above the table, from the top of its silhouette.
-
-    The highest silhouette pixel is the object's FAR TOP edge — looking down at a
-    box you see its top face, and its skyline is the far rim. That rim stands
-    vertically above the FAR edge of the footprint, so the ray is walked to the
-    vertical line there, not to the one through the centre. Anchoring on the centre
-    is what made a 2.2 cm remote measure 8.4 cm: a long object's far edge is half
-    its length away, and the ray keeps climbing over that distance.
-
-    half_along is the footprint's half-extent along the horizontal viewing
-    direction — i.e. how far the far edge sits behind the centre.
-    """
-    uv = np.asarray(uv_top, np.float64).reshape(-1, 2)
-    if uv.shape[0] == 0:
-        return None
-    o = np.asarray(T_base_cam[:3, 3], np.float64)
-    xy = np.asarray(xy, np.float64)
-    view = xy - o[:2]
-    n = float(np.linalg.norm(view))
-    if n < 1e-6:
-        return None
-    far_xy = xy + view / n * float(half_along)     # the skyline stands over here
-
-    hs = []
-    for k in np.argsort(uv[:, 1])[:max(3, uv.shape[0] // 10)]:   # the highest pixels
-        d = np.array([(uv[k, 0] - cx0) / fx, (uv[k, 1] - cy0) / fy, 1.0], np.float64)
-        d /= np.linalg.norm(d)
-        d = np.asarray(T_base_cam[:3, :3], np.float64) @ d
-        denom = float(d[0] ** 2 + d[1] ** 2)
-        if denom < 1e-9:
-            continue
-        t = float((far_xy - o[:2]) @ d[:2] / denom)
-        if not (0.03 < t < 1.50):
-            continue
-        h = float(o[2] + t * d[2] - z_plane)
-        if -0.005 < h < 0.60:
-            hs.append(h)
-    return float(np.median(hs)) if len(hs) >= 3 else None
-
-
-def _classify_shape(w_m, d_m, h_m, prior):
-    """Name the solid from its measured proportions, keeping the class prior when
-    the label is one we know (a 'cup' stays a cylinder even if the footprint arc
-    came out slightly rectangular)."""
-    if prior in ("cylinder", "sphere"):
-        return prior
-    lo, hi = min(w_m, d_m), max(w_m, d_m)
-    if hi < 1e-4:
-        return prior
-    if hi / max(lo, 1e-4) > 2.5:
-        return "cuboid"                       # clearly elongated: pen, knife, book
-    if h_m > 1.6 * hi:
-        return "cylinder"                     # tall and square-ish on the table
-    if abs(h_m - hi) / hi < 0.30:
-        return "cube"
-    return "cuboid"
-
-
-# Why measurements get rejected, so "everything says (prior)" is diagnosable
-# instead of a mystery. Surfaced in /status as measure_stats.
-MEAS_STATS = {}
-
-
-def _meas_fail(why):
-    MEAS_STATS[why] = MEAS_STATS.get(why, 0) + 1
-    return None
+# The monocular silhouette metrology now lives in perception/measure.py — what one
+# view can and cannot establish, and every gate that rejects a bad solve, is
+# documented with the code there.
+MEASURER = ObjectMeasurer(GEOM, PRIORS, reach_m=(MAP_R_MIN, MAP_R_MAX),
+                          table_z=TABLE_Z0)
+MEAS_STATS = MEASURER.stats     # surfaced in /status as measure_stats
 
 
 def measure_object(rgb, bbox, T_base_cam, label, z_plane=None):
-    """Measure an object's position, footprint, height and yaw from ONE frame.
-
-    Returns a dict {xy, w_m, d_m, h_m, yaw_deg, shape, measured, rng_m} or None if
-    the silhouette solve did not produce something believable — the caller then
-    falls back to the class prior (obj_xy_2d).
-
-    'yaw_deg' is the direction of the footprint's MAJOR axis in the base frame,
-    normalised to [-90, 90) because a rectangle has no front. By convention d_m is
-    the extent ALONG yaw (the long axis) and w_m the extent across it, matching
-    both the class priors and the way the map draws footprints.
-    """
-    if fx <= 0:
-        return None
-    z_plane = TABLE_Z0 if z_plane is None else float(z_plane)
-    mask = _silhouette_mask(rgb, bbox)
-    if mask is None:
-        return _meas_fail("no_silhouette")
-    pts, uv_top = _contact_points(mask, bbox, T_base_cam, z_plane)
-    if pts is None:
-        return _meas_fail("no_contact_line")
-
-    # WHAT ONE VIEW CAN AND CANNOT SEE. Measured on the synthetic bench:
-    #   * the extent ACROSS the sightline is recovered to about a millimetre
-    #     (5.1 cm cube -> 5.1, 15 cm book -> 15.0, 4.5 cm remote -> 4.6,
-    #     8 cm cup -> 7.9) — the silhouette's width is that extent, full stop.
-    #   * the extent ALONG the sightline is NOT observable: the object's far side
-    #     is behind the object. It over-reads on tall things (8 cm cup -> 11.5)
-    #     and under-reads when the long axis points at the camera (22 cm book ->
-    #     16.4, the rest of it hidden).
-    # So this returns the across-view width as the measurement and hands it to the
-    # map with the direction it was taken along; the map fuses the widths gathered
-    # from the different bearings of a scan sweep into the actual footprint (see
-    # _fit_rect_from_support). One view can only ever give one caliper reading.
-    xy_pts = pts[:, :2].astype(np.float32)
-    (cx_f, cy_f), (a, b), ang = cv2.minAreaRect(xy_pts)
-    if max(a, b) < 0.004 or max(a, b) > MAX_TABLE_OBJ_M * 2.2:
-        return _meas_fail("rect_size")
-
-    prior = class_meta(label)
-    cam_xy = np.asarray(T_base_cam[:3, 3], np.float64)[:2]
-    view = cam_xy - np.array([cx_f, cy_f])
-    n_view = float(np.linalg.norm(view))
-    if n_view < 1e-6:
-        return _meas_fail("degenerate_view")
-    v = view / n_view                       # unit vector back toward the camera
-    u = np.array([-v[1], v[0]])             # ACROSS the sightline: the caliper axis
-
-    proj_u = xy_pts.astype(np.float64) @ u
-    across = float(proj_u.max() - proj_u.min())
-    if not (0.004 < across < MAX_TABLE_OBJ_M):
-        return _meas_fail("across_range")
-    # SANITY-CHECK THE MEASUREMENT AGAINST WHAT THE CLASS IS. A 5.1 cm cube coming
-    # out 0.9 cm or 9.3 cm wide is a broken silhouette, not a surprising cube, and
-    # letting those through is what scattered one-off ghosts across the map. The
-    # band is deliberately wide (the prior is only a guess) — it rejects nonsense,
-    # not disagreement. Outside it, the caller falls back to the prior path.
-    p_size = float(math.sqrt(max(prior["w_m"], 1e-3) * max(prior["d_m"], 1e-3)))
-    if not (0.35 * p_size < across < 2.8 * p_size):
-        return _meas_fail("size_vs_prior")
-
-    # The contact arc is the NEAR side of the footprint, so its centroid sits about
-    # half a depth too close to the camera. We do not know the depth yet, so push
-    # back by half the across-width (a circle's worth) — the map's multi-bearing
-    # average then cancels most of what this leaves behind.
-    xy = np.array([proj_u.mean() * u[0], proj_u.mean() * u[1]], np.float64) \
-        + v * float((xy_pts.astype(np.float64) @ v).mean()) - v * (0.5 * across)
-    if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
-        return _meas_fail("out_of_workspace")
-    rng = float(np.linalg.norm(cam_xy - xy))
-
-    # HEIGHT NEEDS TO KNOW HOW FAR BACK THE OBJECT'S FAR EDGE IS, and using the
-    # across-width for that is wrong for anything elongated. A pen pointing along
-    # the sightline measures across=1.8cm (correctly - that is its width), but it
-    # extends ~7cm away from us, so anchoring the roof ray 0.9cm behind centre walks
-    # it nowhere near far enough and the height over-reads: measured, a flat pen
-    # came out 4.5cm tall and got classified as a standing cylinder.
-    #
-    # We do not know the along-view extent from one view, so use the best estimate
-    # available - the class prior's long axis - and never less than the across
-    # width. Errors here stay second-order because the roof ray is steep.
-    prior_long = max(prior["w_m"], prior["d_m"])
-    half_along = 0.5 * max(across, min(prior_long, MAX_TABLE_OBJ_M))
-    h_m = _solve_height(uv_top, xy, half_along, T_base_cam, z_plane)
-    if h_m is None or not (0.002 < h_m < 0.60):
-        h_m = float(prior["h_m"])
-    # And do not let a single view claim an object is TALL when its footprint was
-    # never determined: h > footprint reads as "standing up", which for a pen seen
-    # end-on is exactly the wrong conclusion.
-    if h_m > 1.5 * max(across, 1e-3) and prior_long > 2.2 * min(prior["w_m"], prior["d_m"]):
-        h_m = float(prior["h_m"])
-
-    # SANITY-CHECK THE SOLID AGAINST WHAT THE CLASS IS, and fall back to the prior
-    # rather than publish a shape that cannot be true. From ONE viewpoint an
-    # elongated object pointing along the sightline has no measurable length -
-    # `across` is its WIDTH, correctly measured, and the 14 cm of a pen is simply
-    # invisible. Left alone that produced "pen: 2.6 x 2.6 x 3.6 cm", i.e. a stubby
-    # thing STANDING UP, which is worse than admitting we do not know: the map drew
-    # a confident orientation for an object whose shape it had not determined.
-    # Recovering the real footprint needs several bearings (the support fusion in
-    # world2d_update), which a Scan sweep provides and idle sensing does not.
-    if h_m > 2.5 * max(prior["h_m"], 0.003):
-        return _meas_fail("height_vs_prior")
-    MEAS_STATS["ok"] = MEAS_STATS.get("ok", 0) + 1
-    yaw = math.degrees(math.atan2(u[1], u[0]))
-    return {"xy": xy, "across_m": across, "u_deg": yaw, "h_m": float(h_m),
-            "w_m": across, "d_m": max(across, min(prior["w_m"], prior["d_m"])),
-            "yaw_deg": float(((yaw + 90.0) % 180.0) - 90.0),
-            "shape": prior["shape"], "measured": True, "rng_m": rng}
+    """Measure an object's position, footprint, height and yaw from ONE frame."""
+    return MEASURER.measure(rgb, bbox, T_base_cam, label, z_plane)
 
 
 # ---- fusing per-bearing caliper readings into a footprint ----
@@ -2981,70 +1988,27 @@ def measure_object(rgb, bbox, T_base_cam, label, z_plane=None):
 # axis). That is the footprint's SUPPORT WIDTH along that direction, and a convex
 # shape is determined by its support widths — so a scan sweep, which sees each
 # object from a spread of bearings, measures the whole footprint between them.
-SUP_BINS = 12              # direction bins over 180 deg (15 deg each)
-SUP_MIN_BINS = 3           # fit a rectangle only once this many bearings are in
+# SUP_BINS / SUP_MIN_BINS now live with the fit in mobility/slam/object_map.py
 
 
-def _sup_bin(u_deg):
-    return int(((float(u_deg) % 180.0) / 180.0) * SUP_BINS) % SUP_BINS
+_sup_bin = sup_bin                              # now mobility/slam/object_map.py
+_fit_rect_from_support = fit_rect_from_support  # least-squares footprint rectangle
 
 
-def _fit_rect_from_support(sup):
-    """Least-squares rectangle through the accumulated support widths.
-
-    A rectangle with half-sides (a, b) at yaw phi has support width
-        s(theta) = 2a|cos(theta - phi)| + 2b|sin(theta - phi)|
-    Sweep phi over 1 deg steps; for each, a and b fall out of a 2x2 linear solve.
-    Keep the phi with the smallest residual. Returns (w_m, d_m, yaw_deg) with d_m
-    the long side and yaw along it, or None when too few bearings have been seen.
-    """
-    obs = [(math.radians((k + 0.5) * 180.0 / SUP_BINS), s)
-           for k, s in sorted(sup.items()) if s > 0]
-    if len(obs) < SUP_MIN_BINS:
-        return None
-    th = np.array([o[0] for o in obs])
-    s = np.array([o[1] for o in obs])
-    best = None
-    for phi_deg in range(0, 180):
-        phi = math.radians(phi_deg)
-        A = np.stack([np.abs(np.cos(th - phi)), np.abs(np.sin(th - phi))], axis=1)
-        try:
-            x, *_ = np.linalg.lstsq(A, s, rcond=None)
-        except np.linalg.LinAlgError:
-            continue
-        if x[0] <= 0 or x[1] <= 0:
-            continue
-        r = float(np.linalg.norm(A @ x - s))
-        if best is None or r < best[0]:
-            best = (r, float(x[0]), float(x[1]), phi_deg)
-    if best is None:
-        return None
-    _r, e1, e2, phi_deg = best
-    # e1 is the extent along phi, e2 across it; report the long side as d/yaw
-    if e1 >= e2:
-        d_m, w_m, yaw = e1, e2, phi_deg
-    else:
-        d_m, w_m, yaw = e2, e1, phi_deg + 90.0
-    if not (0.004 < w_m < MAX_TABLE_OBJ_M and 0.004 < d_m < MAX_TABLE_OBJ_M):
-        return None
-    return float(w_m), float(d_m), float(((yaw + 90.0) % 180.0) - 90.0)
 # Lateral aim trim, in pixels, applied to the fingertip aim point. The gripper was
 # consistently ending up LEFT of the cube. Moving the aim point LEFT (negative)
 # makes the arm travel FURTHER RIGHT before it thinks it is lined up, because
 # swinging the camera right slides the cube left in the picture. If it now
 # overshoots to the right, make this less negative; if still left, more negative.
 # The arm is still landing left, so push the aim point further left.
-AIM_DU = -45.0   # final centering bias: robot lands on the cube's RIGHT
-AIM_DV = 0.0
+# CFG.aim_du_px / CFG.aim_dv_px live on CFG now.
 # Global scale on computed range. Increase (>1.0) to push mapped objects FURTHER
 # OUT and spread them apart; decrease (<1.0) to pull them closer together. This
 # is a coarse calibration knob for when the apparent-size / stereo depth numbers
 # are consistently off in scale.
-RANGE_SCALE = [1.0]
 # Rotate all localized (x, y) positions in the base horizontal plane. Positive
 # = counter-clockwise. Use this when the camera shows objects on opposite sides
 # but the map clusters them on one side (a heading/yaw error in the hand-eye).
-MAP_BEARING_OFFSET_DEG = [0.0]
 
 
 def _cube_track(finder, tries=4):
@@ -3071,7 +2035,7 @@ def _cube_range_m(tr):
     fingertip pixel, which is why descending on pixel-alignment alone landed the
     gripper on bare board half way out)."""
     w = float(max(4.0, tr.bbox_xyxy[2] - tr.bbox_xyxy[0]))
-    return float(fx * CUBE_EDGE_M / w)
+    return float(fx * PRIORS.fallback_edge_m / w)
 
 
 def _tip(q):
@@ -3106,101 +2070,54 @@ def _move_tip(p_tgt, pitch, j5, settle=0.12, step=2.5):
     return None
 
 
-ALIGN_TOL_PX = 40.0        # cube this close to the gripper pixel = aligned
-ALIGN_ITERS = 3            # approach already gets close, so quick final centering
+# ALIGN_TOL_PX / ALIGN_ITERS are CFG.align_tol_px / CFG.align_iters now.
+
+
+class _CenteringOps:
+    """Binds this server's arm to the visual servo's interface.
+
+    The servo itself is arm-agnostic (manipulation/approach/visual_center.py); this is
+    the thin layer that knows about `finder`, the grasp pitch being held, and the wrist
+    roll that must not twist mid-approach.
+    """
+
+    def __init__(self, finder, pitch_deg, roll_deg):
+        self.finder, self.pitch, self.roll = finder, pitch_deg, roll_deg
+
+    def joints(self):
+        return observe()[0].astype(np.float64)
+
+    def tip(self, q=None):
+        return _tip(self.joints() if q is None else q)
+
+    def track(self, tries=3):
+        return _cube_track(self.finder, tries=tries)
+
+    def range_m(self, track):
+        return _cube_range_m(track)
+
+    def move_pan(self, delta_deg, *, settle, step):
+        q = self.joints()
+        lo, hi = J_LO[ARM.pan_joint], J_HI[ARM.pan_joint]
+        q[ARM.pan_joint] = float(np.clip(q[ARM.pan_joint] + float(delta_deg), lo, hi))
+        goto_smooth(q, settle=settle, step=step)
+
+    def move_tip(self, p_base, *, settle, step):
+        return _move_tip(np.asarray(p_base, np.float64), self.pitch, self.roll,
+                         settle=settle, step=step) is not None
+
+    say = staticmethod(say)
+    checkpoint = staticmethod(checkpoint)
 
 
 def _center_on_cube(finder, gp, j5):
-    """Center the cube under the jaws with DECOUPLED single-DOF servos:
+    """Center the object under the jaws — manipulation/approach/visual_center.py.
 
-      * horizontal pixel error  ->  rotate the BASE (shoulder_pan)
-      * vertical pixel error    ->  reach RADIALLY in/out
-
-    Each axis is one joint and monotonic, so the sign is trivial to measure and the
-    loop is stable. The previous 2D-Cartesian Jacobian oscillated (109->96->119px)
-    because base rotation, reach and an auto-swept wrist pitch all mixed into it.
-    Pitch is held FIXED here. Returns the final (x, y), or None."""
-    tgt_u = HAND_UV[0] + AIM_DU
-    tgt_v = HAND_UV[1] + AIM_DV
-    tr = _cube_track(finder, tries=5)
-    if tr is None:
-        say("center: cube not in view")
-        return None
-    uv0 = np.array(tr.uv, np.float64)
-    q0 = observe()[0].astype(np.float64)
-    p0 = _tip(q0)
-
-    # Small, slow probe moves so the measurement is clean and the arm does not jerk.
-    PAN_PROBE = 3.0      # deg
-    RAD_PROBE = 0.015    # m
-    # Speed is scaled by estimated cube range so the arm slows down as it gets close.
-    # The BASE is the main source of jerk, so its max step scales the most.
-    r_m = _cube_range_m(tr)
-    close = r_m < 0.12          # within ~12 cm -> slow/close mode
-    speed = 0.9 if close else 1.6
-    # The BASE carries the whole arm's inertia and is what visibly jerks, so it gets
-    # its own slower rate rather than sharing the reach rate.
-    CENTER_STEP = 1.8 * speed   # deg per goto_smooth tick
-    CENTER_SETTLE = 0.12 if close else 0.08  # s
-    MAX_PAN_STEP = (4.5 if close else 8.0)  # deg per iteration
-    MAX_RAD_STEP = (0.020 if close else 0.040)  # m per iteration
-
-    # --- probe the HORIZONTAL sign: cube_u change per +PAN_PROBE of base pan ---
-    qp = q0.copy(); qp[0] = float(np.clip(q0[0] + PAN_PROBE, -100, 100))
-    goto_smooth(qp, settle=CENTER_SETTLE, step=CENTER_STEP)
-    trp = _cube_track(finder, tries=4)
-    goto_smooth(q0, settle=CENTER_SETTLE, step=CENTER_STEP)
-    if trp is None or abs(float(qp[0] - q0[0])) < 0.5:
-        say("center: horizontal probe failed")
-        return _tip(observe()[0])[:2]
-    du_dpan = (float(trp.uv[0]) - uv0[0]) / (qp[0] - q0[0])       # px per deg
-    if abs(du_dpan) < 3.0:
-        say("center: base rotation barely moves the cube")
-        return _tip(observe()[0])[:2]
-
-    # --- probe the VERTICAL sign: cube_v change per +RAD_PROBE radial reach ---
-    r0 = float(np.hypot(p0[0], p0[1])); uo = np.array([p0[0], p0[1]]) / max(r0, 1e-6)
-    dv_dr = None
-    if _move_tip(np.array([p0[0] + uo[0]*RAD_PROBE, p0[1] + uo[1]*RAD_PROBE, p0[2]]),
-                 gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
-        trr = _cube_track(finder, tries=4)
-        _move_tip(np.array([p0[0], p0[1], p0[2]]), gp, j5,
-                  settle=CENTER_SETTLE, step=CENTER_STEP)
-        if trr is not None:
-            dv_dr = (float(trr.uv[1]) - uv0[1]) / RAD_PROBE        # px per metre
-    say(f"center: du/dpan={du_dpan:.1f}px/deg" +
-        (f", dv/dr={dv_dr:.0f}px/m" if dv_dr else ", (no vertical probe)"))
-
-    for it in range(ALIGN_ITERS):
-        checkpoint()
-        tr = _cube_track(finder, tries=3)
-        if tr is None:
-            say("center: cube gone (likely under the jaws) - stopping")
-            break
-        du = float(tr.uv[0]) - tgt_u
-        dv = float(tr.uv[1]) - tgt_v
-        say(f"center {it}: {abs(du):.0f}px {'right' if du > 0 else 'left'}, "
-            f"{abs(dv):.0f}px {'below' if dv > 0 else 'above'} the jaws")
-        if abs(du) < ALIGN_TOL_PX and abs(dv) < ALIGN_TOL_PX * 1.3:
-            say("centered on the cube")
-            break
-        moved = False
-        q = observe()[0].astype(np.float64)
-        if abs(du) >= ALIGN_TOL_PX:                # horizontal via base rotation
-            dpan = float(np.clip(-du / du_dpan, -MAX_PAN_STEP, MAX_PAN_STEP))
-            q[0] = float(np.clip(q[0] + dpan, -100, 100))
-            goto_smooth(q, settle=CENTER_SETTLE, step=CENTER_STEP); moved = True
-        if dv_dr and abs(dv) >= ALIGN_TOL_PX * 1.3:   # vertical via radial reach
-            p = _tip(observe()[0]); r = float(np.hypot(p[0], p[1]))
-            uo = np.array([p[0], p[1]]) / max(r, 1e-6)
-            dr = float(np.clip(-dv / dv_dr, -MAX_RAD_STEP, MAX_RAD_STEP))
-            if _move_tip(np.array([p[0] + uo[0]*dr, p[1] + uo[1]*dr, p[2]]),
-                         gp, j5, settle=CENTER_SETTLE, step=CENTER_STEP) is not None:
-                moved = True
-        if not moved:
-            break
-    tip = _tip(observe()[0])
-    return np.array([tip[0], tip[1]], np.float64)
+    Returns the final (x, y), or None if the object was never in view.
+    """
+    aim = (HAND_UV[0] + CFG.aim_du_px, HAND_UV[1] + CFG.aim_dv_px)
+    res = center_on_object(_CenteringOps(finder, gp, j5), aim, CFG)
+    return res.xy
 
 
 # ---------------- locate from ONE fixed pose ----------------
@@ -3234,7 +2151,7 @@ def _center_on_cube(finder, gp, j5):
 # VIEW's tilt gave "0 good reads" three times in a row while the map, built at
 # HOME's tilt, saw the same cube at r=36.8cm. VIEW's lift is +37 against HOME's
 # -99, so the camera is pointing somewhere else entirely.
-SURVEY_TILT = HOME[1:].copy()   # lift, elbow, wrist_flex, wrist_roll - always these
+SURVEY_TILT = np.array(ARM.survey_tilt_deg)   # every joint after the pan — always these
 SURVEY_READS = 9                # reads to median over (rejects detector jitter)
 SURVEY_SPREAD_MAX = 0.05        # m; if reads disagree by more than this from ONE
                                 # pose the detector is unstable - say so rather
@@ -3307,7 +2224,7 @@ def locate_from_survey(label, finder=None, bearing_deg=None):
             continue
         m = measure_object(rgb, tr.bbox_xyxy, T, label)
         if m is not None:
-            xy = _rotate_xy(m["xy"], MAP_BEARING_OFFSET_DEG[0])
+            xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
         else:
             xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=None, label=label)
             if xy is None:
@@ -3340,7 +2257,7 @@ def _mapped_xy(label):
     want = label.split()[0].lower()
     best = None
     with w2d_lock:
-        for o in W2D["objs"].values():
+        for o in WORLD.objs.values():
             if want in o["label"].lower():
                 if best is None or o["n"] > best["n"]:
                     best = o
@@ -3353,17 +2270,17 @@ def _picked_height(label, gx, gy):
     marks that entry so the place can retire it. Falls back to the class prior."""
     with w2d_lock:
         best, bd = None, 0.10
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             d = float(np.hypot(o["xy"][0] - gx, o["xy"][1] - gy))
             if d < bd and label.split()[0] in o["label"]:
                 best, bd = t, d
         if best is not None:
-            W2D["objs"][best]["picked"] = True
-            return float(max(W2D["objs"][best]["h_m"], 0.005))
+            WORLD.objs[best]["picked"] = True
+            return float(max(WORLD.objs[best]["h_m"], 0.005))
     for cand in (label, f"{label} cube"):
         if str(cand).strip().lower() in CLASS_META:
             return class_height_m(cand)
-    return CUBE_EDGE_M
+    return PRIORS.fallback_edge_m
 
 
 def _dest_geometry(tag=None, xy=None):
@@ -3375,7 +2292,7 @@ def _dest_geometry(tag=None, xy=None):
     """
     if tag is not None:
         with w2d_lock:
-            o = W2D["objs"].get(int(tag))
+            o = WORLD.objs.get(int(tag))
             if o is None:
                 raise Abort(f"destination tag {tag} is not on the 2D map")
             return (np.array(o["xy"], np.float64),
@@ -3471,7 +2388,7 @@ def place_at(tag=None, xy=None, recenter=True):
     # ---- 6. the stack got taller: record it, or the next place lands INSIDE it ----
     if tag is not None and h_carry > 0:
         with w2d_lock:
-            o = W2D["objs"].get(int(tag))
+            o = WORLD.objs.get(int(tag))
             if o is not None:
                 o["h_m"] = float(h_top + h_carry)
                 o["t"] = time.time()
@@ -3479,20 +2396,12 @@ def place_at(tag=None, xy=None, recenter=True):
     if carry_label:
         # the carried object is no longer where it was picked from
         with w2d_lock:
-            for t, o in list(W2D["objs"].items()):
+            for t, o in list(WORLD.objs.items()):
                 if o["label"] == carry_label and o.get("picked"):
-                    del W2D["objs"][t]
+                    del WORLD.objs[t]
     set_phase("DONE", f"placed {carry_label} on {where}")
 
 
-TARGET_RIGHT_TRIM_M = 0.050 # shift the APPROACH hover target this far to the
-                            # cube's RIGHT, so the cube stays on the LEFT side of the
-                            # camera view during approach.
-TARGET_BACK_M = 0.010       # stop the approach hover target this far SHORT of the
-                            # cube radially. Tunable in the UI; 1 cm default.
-APPROACH_STEPS = 3          # step 1 closes ~90% of the gap, the rest are small
-                            # corrections. Tried 2 with a full-distance first move
-                            # and it missed more, so this is back to 3.
 
 
 def run_mission(target_label=None):
@@ -3518,16 +2427,16 @@ def run_mission(target_label=None):
     def _approach_target(cube_xy):
         """Hover position for the approach: short of the cube and to its right.
 
-        TARGET_BACK_M: stop this many metres radially BEFORE the cube (keeps it in view).
-        TARGET_RIGHT_TRIM_M: shift this far to the cube's right (tunable in the UI).
+        CFG.back_m: stop this many metres radially BEFORE the cube (keeps it in view).
+        CFG.right_trim_m: shift this far to the cube's right (tunable in the UI).
         """
         cube_xy = np.asarray(cube_xy, dtype=np.float64)
         r = float(np.hypot(*cube_xy))
         if r > 1e-6:
-            backed = cube_xy * ((r - TARGET_BACK_M) / r)
+            backed = cube_xy * ((r - CFG.back_m) / r)
         else:
             backed = cube_xy.copy()
-        return _shift_right(backed, TARGET_RIGHT_TRIM_M)
+        return _shift_right(backed, CFG.right_trim_m)
 
     try:
         stop_flag.clear()
@@ -3559,8 +2468,8 @@ def run_mission(target_label=None):
         say(f"  [2/7] target    x={cube_xy[0]*100:+.1f} y={cube_xy[1]*100:+.1f} cm  "
             f"r={np.hypot(*cube_xy)*100:.1f}cm "
             f"bearing={math.degrees(math.atan2(cube_xy[1], cube_xy[0])):+.0f}deg")
-        say(f"  [3/7] approach   {APPROACH_STEPS} stages, "
-            f"trim={TARGET_RIGHT_TRIM_M*100:.1f}cm right, back={TARGET_BACK_M*100:.1f}cm, "
+        say(f"  [3/7] approach   {CFG.steps} stages, "
+            f"trim={CFG.right_trim_m*100:.1f}cm right, back={CFG.back_m*100:.1f}cm, "
             f"hover z={PICK_HOVER_Z*100:.0f}cm")
         say("        opening the gripper")
         send_joints(observe()[0], gripper=95.0)
@@ -3569,7 +2478,7 @@ def run_mission(target_label=None):
         # The hover target is always computed from the latest cube estimate, so it
         # keeps the cube on the LEFT side of the image and stops before the arm
         # passes it. Refinements update the cube position, not the approach offset.
-        for i in range(APPROACH_STEPS):
+        for i in range(CFG.steps):
             checkpoint()
             q = observe()[0].astype(np.float64)
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
@@ -3585,7 +2494,7 @@ def run_mission(target_label=None):
                 say(f"approach {i+1}: already at approach hover")
                 break
 
-            last = (i == APPROACH_STEPS - 1)
+            last = (i == CFG.steps - 1)
             frac = 1.0 if last else 0.9
             # Step 1 closes 90% of the gap, then the remaining stages make small
             # corrections. REVERTED to this after trying a single full-distance
@@ -3605,7 +2514,7 @@ def run_mission(target_label=None):
             with lock:
                 state["obj3d"] = [float(cube_xy[0]), float(cube_xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
-            set_phase("PICK", f"approach {i+1}/{APPROACH_STEPS} "
+            set_phase("PICK", f"approach {i+1}/{CFG.steps} "
                               f"-> x={wx*100:.0f} y={wy*100:.0f} cm")
             if _move_tip(np.array([wx, wy, PICK_HOVER_Z]), pitch, j5,
                          settle=0.15, step=1.4) is None:
@@ -3629,10 +2538,10 @@ def run_mission(target_label=None):
             if xy2 is not None:
                 adj = float(np.linalg.norm(xy2 - cube_xy))
                 if adj <= 0.05:
-                    say(f"check {i+1}/{APPROACH_STEPS}: refined cube by {adj*100:.1f}cm")
+                    say(f"check {i+1}/{CFG.steps}: refined cube by {adj*100:.1f}cm")
                     cube_xy = xy2
                 else:
-                    say(f"check {i+1}/{APPROACH_STEPS}: refined target jump {adj*100:.1f}cm - ignoring")
+                    say(f"check {i+1}/{CFG.steps}: refined target jump {adj*100:.1f}cm - ignoring")
 
         # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
         q = observe()[0].astype(np.float64)
@@ -3641,7 +2550,7 @@ def run_mission(target_label=None):
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
         say(f"  [4/7] centering  pitch={gp:.0f}deg wrist_roll={j5:.0f}deg "
-            f"aim=({HAND_UV[0]+AIM_DU:.0f},{HAND_UV[1]+AIM_DV:.0f})px")
+            f"aim=({HAND_UV[0]+CFG.aim_du_px:.0f},{HAND_UV[1]+CFG.aim_dv_px:.0f})px")
         aligned = _center_on_cube(finder, gp, j5)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
@@ -4343,9 +3252,9 @@ def setrelaxidle():
 
 @app.route("/floor")
 def r_floor():
-    a, b, c = FLOOR_PLANE
+    a, b, c = FLOOR.as_list()
     return jsonify(a=a, b=b, c=c,
-                   tilt_deg=round(math.degrees(math.atan(math.hypot(a, b))), 3),
+                   tilt_deg=round(FLOOR.tilt_deg, 3),
                    at_18cm=round(floor_z(0.18, 0.0), 4),
                    at_34cm=round(floor_z(0.34, 0.0), 4),
                    grasp_clear=FLOOR_GRASP_CLEAR,
@@ -4453,15 +3362,8 @@ def status():
     s["relaxed"] = ARM_RELAXED[0]
     s["idle_relax_s"] = IDLE_RELAX_S[0]
     s["idle_for"] = round(time.time() - last_activity[0])
-    s["tune"] = {
-        "aim_du": round(AIM_DU, 1),
-        "right_trim_cm": round(TARGET_RIGHT_TRIM_M * 100, 2),
-        "back_cm": round(TARGET_BACK_M * 100, 2),
-        "approach_steps": APPROACH_STEPS,
-        "cube_edge_cm": round(CUBE_EDGE_M * 100, 2),
-        "range_scale": round(float(RANGE_SCALE[0]), 2),
-        "bearing_deg": round(float(MAP_BEARING_OFFSET_DEG[0]), 1),
-    }
+    s["tune"] = CFG.as_dict()
+    s["tune"]["cube_edge_cm"] = round(PRIORS.fallback_edge_m * 100, 2)
     return jsonify(s)
 
 
@@ -4512,7 +3414,7 @@ def urdf_route():
     if _urdf_payload[0] is None:
         try:
             from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-            meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+            meshes = load_link_visual_meshes_cached(ARM.mesh_path) or {}
             out = []
             for name, (V, F) in meshes.items():
                 Vd, Fd = _decimate(np.asarray(V, np.float64), np.asarray(F, np.int64), 0.006)
@@ -4565,7 +3467,7 @@ def geom():
                "label": o["label"], "tag": o["tag"]}
               for o in world2d_snapshot()]
     return jsonify(links=links, xf=xf, ee=ee, obj=obj, obj_label=olbl,
-                   obj_size=round(float(CUBE_EDGE_M), 3), objs2d=objs2d)
+                   obj_size=round(float(PRIORS.fallback_edge_m), 3), objs2d=objs2d)
 
 
 @app.route("/stream")
@@ -4652,85 +3554,44 @@ JOG_VEC_TTL = 0.30
 # => to hold the gripper angle we algebraically slave wrist_flex:
 #        j3 = pitch_target - j1 - j2
 # This is exact — no IK convergence needed — so the angle never drifts.
-# THE REAL JOINT LIMITS, read from so101_new_calib.urdf. An IK that does not know
-# these is not an IK, it is a wish: it returns elbow_flex=+162 deg on a joint that
-# stops at +96.8, the servo silently clamps, the arm parks at the stop, and the
-# solver reports a 0.2 mm residual on a pose the robot cannot hold. That is exactly
+# Which joints those are is now declared by the profile (pan_joint / pitch_chain /
+# roll_joint), so an arm with a different layout describes itself instead of being
+# assumed here.
+#
+# THE REAL JOINT LIMITS, now READ FROM THE URDF rather than transcribed. An IK that
+# does not know these is not an IK, it is a wish: it returns elbow_flex=+162 deg on a
+# joint that stops at +96.8, the servo silently clamps, the arm parks at the stop, and
+# the solver reports a 0.2 mm residual on a pose the robot cannot hold. That is exactly
 # what froze the approach for 21 identical hops at pitch 65 while being commanded
 # to 80 (2026-07-13). CLAMP EVERY ITERATION AND SCORE THE CLAMPED POSE.
-J_LO = np.array([-110.0, -100.0, -96.8, -95.0, -157.2])
-J_HI = np.array([+110.0, +100.0, +96.8, +95.0, +162.8])
-WFLEX_MIN, WFLEX_MAX = float(J_LO[3]), float(J_HI[3])   # wrist_flex safe range (deg)
+J_LO, J_HI = ARM.limits()
+_WFLEX = ARM.slaved_joint                               # the algebraically-slaved joint
+WFLEX_MIN, WFLEX_MAX = float(J_LO[_WFLEX]), float(J_HI[_WFLEX])
 
 
 def _slave_wflex(j1, j2, pitch_tgt):
-    return float(np.clip(pitch_tgt - j1 - j2, WFLEX_MIN, WFLEX_MAX))
+    """Hold the tool pitch by slaving the last pitch joint. See PitchHoldIK.slave."""
+    q = np.zeros(ARM.n_joints, dtype=np.float64)
+    q[1], q[2] = j1, j2
+    return ik_strategy().slave(q, pitch_tgt)
 
 
 def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=80, tol=2e-3,
                    ret_err=False, _retry=True):
-    """Position IK on servos 1-3 (pan, lift, elbow) with wrist_flex (servo 4)
-    ALGEBRAICALLY SLAVED to hold the gripper pitch, and wrist_roll (servo 5) fixed.
+    """Position IK holding the tool pitch — now manipulation/arms/ik_strategy.py.
 
-    THIS SOLVER USED TO SILENTLY NOT CONVERGE, and that was the "the arm grabs at
-    air / just moves out" bug (fixed 2026-07-13). It ran a FIXED 10 iterations with
-    a +-4 deg/iter clamp -- a total travel budget of 40 deg -- while a perfectly
-    ordinary reach like tip -> (0.15, 0, 0.02) needs 80-160 deg of elbow. Measured
-    residual for that exact target with the old code: 107 mm at pitch 0, 93 mm at
-    pitch 20, 35 mm at pitch 60 -- for a point THIS code hits to 0.2 mm. It returned
-    a half-solved pose, goto_smooth faithfully drove to it, the next hop re-seeded
-    from there, and the fingertip crept outward and UPWARD forever
-    (`descend: tip_z +61mm -> +114mm` while being commanded DOWN to +15mm).
+    The solver moved out verbatim (verified bit-identical over a 120-case grid); only
+    the joint indices are read from the profile instead of being literals, which is
+    what lets a different arm use it. The comments explaining WHY it looks the way it
+    does — the fixed-10-iteration bug that made the arm grab at air, the Jacobian
+    reuse, and the two invariants about clamping to the joint limits — live with the
+    code there.
 
-    Why 10 iterations: FK here costs 790 us and a fresh numeric Jacobian is 3 more
-    FK, so 10 iters was already 32 ms -- near the 70 ms jog tick. Fix is to stop
-    rebuilding J every step: over a <=3 cm step it barely rotates, so reuse it for
-    8 iterations. That buys convergence AND is faster than before (16 ms worst case,
-    9 ms for a jog-sized step).
-
-    It now RETURNS THE RESIDUAL (ret_err=True). Callers MUST check it: a target the
-    arm cannot reach is a fact to report, not a pose to drive to.
+    Callers MUST check the residual: a target the arm cannot reach is a fact to
+    report, not a pose to drive to.
     """
-    q = np.array(q_seed, dtype=np.float64)
-    q[4] = float(np.clip(j5_fixed, J_LO[4], J_HI[4]))
-    q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    J = None
-    for it in range(iters):
-        T = np.asarray(kin.forward_kinematics(q))
-        err = p_tgt - T[:3, 3]
-        if np.linalg.norm(err) < 3e-4:
-            break
-        if J is None or it % 8 == 0:
-            J = np.empty((3, 3))
-            for c, ji in enumerate((0, 1, 2)):
-                dq = q.copy()
-                dq[ji] = float(np.clip(dq[ji] + 0.5, J_LO[ji], J_HI[ji]))
-                if ji in (1, 2):                      # keep pitch held while
-                    dq[3] = _slave_wflex(dq[1], dq[2], pitch_tgt)   # perturbing
-                J[:, c] = (np.asarray(kin.forward_kinematics(dq))[:3, 3] - T[:3, 3]) / 0.5
-        dth = np.clip(J.T @ np.linalg.solve(J @ J.T + 1e-6 * np.eye(3), err), -8.0, 8.0)
-        q[:3] = np.clip(q[:3] + dth, J_LO[:3], J_HI[:3])   # <-- STAY INSIDE THE ROBOT
-        q[3] = _slave_wflex(q[1], q[2], pitch_tgt)
-    # Score the CLAMPED pose, and only call the pitch "held" if wrist_flex did not
-    # saturate -- otherwise we are reporting success on a pose the servos will not hold.
-    e = float(np.linalg.norm(p_tgt - np.asarray(kin.forward_kinematics(q))[:3, 3]))
-    if abs((q[1] + q[2] + q[3]) - pitch_tgt) > 2.0:
-        e = max(e, 0.05)          # pitch could not be held here: treat as unreachable
-    if e > tol and _retry:
-        # Wrong IK branch. There is a genuine elbow-flip dead band (mapped 2026-07-13):
-        # at r=10-15cm the arm simply cannot hold a shallow pitch at all. Re-seed.
-        # The last two seeds extend the arm forward for far / shallow-pitch targets.
-        for alt in ([q_seed[0], -95.0, 90.0, 30.0, j5_fixed],
-                    [q_seed[0], -30.0, 50.0, 60.0, j5_fixed],
-                    [q_seed[0], -60.0, 20.0, 80.0, j5_fixed],
-                    [q_seed[0], -20.0, 75.0, 0.0, j5_fixed],
-                    [q_seed[0], -10.0, 85.0, 0.0, j5_fixed]):
-            q2, e2 = _ik_hold_pitch(np.array(alt, np.float64), p_tgt, pitch_tgt,
-                                    j5_fixed, iters, tol, ret_err=True, _retry=False)
-            if e2 < e:
-                q, e = q2, e2
-            if e <= tol:
-                break
+    q, e = ik_strategy().solve(q_seed, p_tgt, pitch_deg=pitch_tgt, roll_deg=j5_fixed,
+                               iters=iters, tol=tol, _retry=_retry)
     return (q, e) if ret_err else q
 
 
@@ -4903,14 +3764,7 @@ def setquery():
     return jsonify(ok=True, query=q)
 
 
-# Query presets. "coco" is every class YOLO knows; "table" is the subset this arm
-# can physically pick, which detects faster and keeps street furniture out of the map.
-TABLE_CLASSES = [
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana",
-    "apple", "orange", "book", "clock", "vase", "scissors", "teddy bear",
-    "cell phone", "mouse", "remote", "keyboard", "laptop", "toothbrush",
-    "pen", "pencil", "marker", "tape", "can", "box", "red cube", "green cube",
-]
+# Query presets ("coco" / "table") come from perception/object_priors.py.
 
 
 @app.route("/preset")
@@ -4948,7 +3802,7 @@ def yolo_approach():
             cmd = [
                 "lerobot-yolo-track-approach",
                 "--robot.type=so101_follower",
-                "--robot.port=COM4",
+                f"--robot.port={ARM_PORT}",
                 "--robot.cameras={\"front\": {\"type\": \"oakd\", \"fps\": 30, \"width\": 640, \"height\": 480, \"use_depth\": true}}",
                 f"--query={q}",
                 "--model-path=./yolov8s-worldv2.pt",
@@ -5023,8 +3877,7 @@ def pushout():
         cm = float((request.get_json(silent=True) or {}).get("cm", request.args.get("cm", 10)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    cm = float(np.clip(cm, -5.0, 30.0))
-    PUSH_OUT[0] = cm / 100.0
+    cm = CFG.set_knob("push_out_cm", cm)
     say(f"localization push-out set to {cm:.0f}cm — re-locate to apply")
     return jsonify(ok=True, cm=cm)
 
@@ -5037,10 +3890,9 @@ def setaimdu():
         px = float(request.args.get("px", request.form.get("px", 0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global AIM_DU
-    AIM_DU = float(np.clip(px, -300.0, 300.0))
-    say(f"AIM_DU set to {AIM_DU:.0f}px (left shift -> robot right)")
-    return jsonify(ok=True, px=AIM_DU)
+    px = CFG.set_knob("aim_du", px)
+    say(f"aim_du set to {px:.0f}px (left shift -> robot right)")
+    return jsonify(ok=True, px=px)
 
 
 @app.route("/settrim", methods=["POST"])
@@ -5051,10 +3903,9 @@ def settrim():
         cm = float(request.args.get("cm", request.form.get("cm", 0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global TARGET_RIGHT_TRIM_M
-    TARGET_RIGHT_TRIM_M = float(np.clip(cm, -10.0, 15.0)) / 100.0
-    say(f"approach right trim set to {TARGET_RIGHT_TRIM_M*100:.1f}cm")
-    return jsonify(ok=True, cm=TARGET_RIGHT_TRIM_M*100)
+    cm = CFG.set_knob("right_trim_cm", cm)
+    say(f"approach right trim set to {cm:.1f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/setback", methods=["POST"])
@@ -5064,10 +3915,9 @@ def setback():
         cm = float(request.args.get("cm", request.form.get("cm", 1.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global TARGET_BACK_M
-    TARGET_BACK_M = float(np.clip(cm, 0.0, 10.0)) / 100.0
-    say(f"approach back-off set to {TARGET_BACK_M*100:.1f}cm")
-    return jsonify(ok=True, cm=TARGET_BACK_M*100)
+    cm = CFG.set_knob("back_cm", cm)
+    say(f"approach back-off set to {cm:.1f}cm")
+    return jsonify(ok=True, cm=cm)
 
 
 @app.route("/setsteps", methods=["POST"])
@@ -5077,10 +3927,9 @@ def setsteps():
         n = int(request.args.get("n", request.form.get("n", 4)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need an integer")
-    global APPROACH_STEPS
-    APPROACH_STEPS = int(np.clip(n, 1, 12))
-    say(f"approach steps set to {APPROACH_STEPS}")
-    return jsonify(ok=True, n=APPROACH_STEPS)
+    n = CFG.set_knob("approach_steps", n)
+    say(f"approach steps set to {n}")
+    return jsonify(ok=True, n=n)
 
 
 @app.route("/setcubesize", methods=["POST"])
@@ -5092,9 +3941,8 @@ def setcubesize():
         cm = float(request.args.get("cm", request.form.get("cm", 5.08)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    global CUBE_EDGE_M
     cm = float(np.clip(cm, 1.0, 30.0))
-    CUBE_EDGE_M = cm / 100.0
+    PRIORS.fallback_edge_m = cm / 100.0
     say(f"cube edge size set to {cm:.2f}cm")
     return jsonify(ok=True, cm=cm)
 
@@ -5108,8 +3956,7 @@ def setrangescale():
         scale = float(request.args.get("scale", request.form.get("scale", 1.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    scale = float(np.clip(scale, 0.3, 3.0))
-    RANGE_SCALE[0] = scale
+    scale = CFG.set_knob("range_scale", scale)
     say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, scale=scale)
 
@@ -5123,8 +3970,7 @@ def setbearing():
         deg = float(request.args.get("deg", request.form.get("deg", 0.0)))
     except (TypeError, ValueError):
         return jsonify(ok=False, reason="need a number")
-    deg = float(np.clip(deg, -180.0, 180.0))
-    MAP_BEARING_OFFSET_DEG[0] = deg
+    deg = CFG.set_knob("bearing_deg", deg)
     say(f"map bearing offset set to {deg:.1f}deg — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, deg=deg)
 
@@ -5558,7 +4404,7 @@ def _find_map_tag(label):
     want = str(label).strip().lower()
     with w2d_lock:
         best, bn = None, -1
-        for t, o in W2D["objs"].items():
+        for t, o in WORLD.objs.items():
             if o.get("picked"):
                 continue
             if want in o["label"].lower() or o["label"].lower() in want:
@@ -5634,9 +4480,7 @@ def r_pickplace():
 
 @app.route("/clearmap2d", methods=["POST"])
 def r_clearmap2d():
-    global W2D
-    with w2d_lock:
-        W2D = {"objs": {}, "next": 1}
+    WORLD.clear()
     say("2D map cleared")
     return jsonify(ok=True)
 
@@ -5656,7 +4500,7 @@ def idle_view():
         time.sleep(0.25)
 
 
-def clear_gripper_overload(ids=(1, 2, 3, 4, 5, 6)):
+def clear_gripper_overload(ids=None):
     """Clear a latched overload on ANY motor with a raw torque cycle, before
     lerobot's handshake reads hit the error.
 
@@ -5664,21 +4508,29 @@ def clear_gripper_overload(ids=(1, 2, 3, 4, 5, 6)):
     but shoulder_lift (id 2) latches too after sustained holding, and THAT is what
     kills the server: `Failed to read 'Min_Position_Limit' on id_=2 ... Overload
     error!` at connect, before anything is running to catch it. Cycle them all.
+
+    The bus layout (ids, baud, register numbers) comes from the profile, so an arm on
+    a different servo bus declares its own instead of inheriting Feetech's.
     """
+    bus = ARM.bus
+    if bus is None:
+        return                      # this arm exposes no raw servo bus
+    if ids is None:
+        ids = bus.motor_ids
     try:
         import scservo_sdk as scs
-        ph = scs.PortHandler("COM4")
+        ph = scs.PortHandler(ARM_PORT)
         if not ph.openPort():
             return
-        ph.setBaudRate(1000000)
+        ph.setBaudRate(bus.baud)
         pk = scs.PacketHandler(0)
         cleared = []
         for mid in ids:
-            pk.write1ByteTxRx(ph, mid, 40, 0)   # torque off
+            pk.write1ByteTxRx(ph, mid, bus.torque_register, 0)   # torque off
             time.sleep(0.12)
-            pk.write1ByteTxRx(ph, mid, 40, 1)   # torque on (clears latched error)
+            pk.write1ByteTxRx(ph, mid, bus.torque_register, 1)   # on: clears the latch
             time.sleep(0.06)
-            _pos, _c, err = pk.read2ByteTxRx(ph, mid, 56)
+            _pos, _c, err = pk.read2ByteTxRx(ph, mid, bus.status_register)
             cleared.append(f"{mid}:{err:#04x}")
         ph.closePort()
         say("overload cleared — " + " ".join(cleared))
@@ -5728,15 +4580,15 @@ def rerun_thread():
     # a bare `except: pass`, so a mesh failure was invisible. Say it out loud once.
     try:
         from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-        _meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+        _meshes = load_link_visual_meshes_cached(ARM.mesh_path) or {}
         _chain = [n for n, _ in (kin.get_link_transforms_chain(np.zeros(len(ARM_MOTORS))) or [])]
         _hit = [n for n in _chain if n in _meshes]
         if _hit:
             say(f"Rerun 3D: URDF meshes OK — {len(_hit)}/{len(_chain)} links "
-                f"({kin.urdf_dir}): {', '.join(_hit)}")
+                f"({ARM.mesh_path}): {', '.join(_hit)}")
         else:
             say(f"Rerun 3D: NO URDF meshes matched — falling back to stick figure. "
-                f"urdf_dir={kin.urdf_dir} meshes={list(_meshes)} chain={_chain}")
+                f"mesh_dir={ARM.mesh_path} meshes={list(_meshes)} chain={_chain}")
     except Exception as e:
         say(f"Rerun 3D: mesh self-check failed: {type(e).__name__}: {e}")
 
@@ -5778,7 +4630,7 @@ def main():
     # leaves the bus in a half-open state that refuses reconnection).
     for attempt in range(6):
         robot = make_robot_from_config(SO101FollowerConfig(
-            port="COM4", id="so101_follower",
+            port=ARM_PORT, id="so101_follower",
             # DEPTH OFF. The pick locates the cube purely geometrically (cast its
             # pixel ray onto the table plane), so stereo depth buys us nothing — and
             # the stereo pipeline is what kept crashing the OAK-D mid-run
@@ -5786,7 +4638,8 @@ def main():
             # Dropping it also roughly halves the USB bandwidth. read_depth_m()
             # degrades gracefully to None.
             cameras={"front": OAKDCameraConfig(
-                fps=30, width=640, height=480, use_depth=False)},
+                fps=ARM.camera.fps, width=ARM.camera.width,
+                height=ARM.camera.height, use_depth=ARM.camera.use_depth)},
         ))
         try:
             robot.connect()
@@ -5816,16 +4669,22 @@ def main():
             except Exception:
                 pass
             time.sleep(2.0)
-    kin = RobotKinematics(LEROBOT + r"\SO101\so101_new_calib.urdf", "gripper_frame_link", ARM_MOTORS)
+    # The arm's own URDF, from the profile. This used to reach into the external
+    # lerobot checkout; that copy only adds two FIXED camera frames, so FK to
+    # gripper_frame_link is bit-identical (verified over 300 random poses) — and
+    # owning the file here is what lets a non-lerobot arm supply its own.
+    kin = RobotKinematics(ARM.urdf_path, ARM.ee_frame, list(ARM.joint_names))
     cam = robot.cameras["front"]
     say("colour stream only (depth OFF) — the pick works by eye, not by stereo")
-    intr = {"fx": 517.0, "fy": 517.0, "cx": 329.5, "cy": 231.4}
+    _fb = ARM.camera.intrinsics_fallback
+    intr = {"fx": _fb[0], "fy": _fb[1], "cx": _fb[2], "cy": _fb[3]}
     if hasattr(cam, "get_depth_intrinsics"):
         try:
             intr = dict(cam.get_depth_intrinsics())
         except Exception:
             pass
     fx, fy, cx0, cy0 = (float(intr[k]) for k in ("fx", "fy", "cx", "cy"))
+    _sync_geometry()          # the camera reported its real intrinsics
 
     # A hand-eye TF we FITTED (see calibrate_handeye) overrides the constant.
     load_floor_plane()

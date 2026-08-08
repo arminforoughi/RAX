@@ -1,7 +1,8 @@
-"""Golden-value parity tests for the functions being extracted out of ``stack_mission2``.
+"""Golden-value parity tests for the functions extracted out of the monolith.
 
-The modularization moves ~3,300 lines of proven logic out of the monolith and into
-packages. Most of that logic is *pure* — it maps numbers to numbers — and much of it
+The modularization moves ~1,100 lines of proven logic out of ``stack_mission2.py``
+into packages, and the result is ``mission_server.py`` — the original is kept intact
+and runnable so the two can be compared on the same hardware. Most of that logic is *pure* — it maps numbers to numbers — and much of it
 encodes specific, expensively-learned corrections (the limit-clamping in
 ``_ik_hold_pitch``, the elongated-object branch in ``obj_xy_2d``). Moving it is only
 safe if "the extracted version does exactly what the original did" is a fact we can
@@ -29,7 +30,7 @@ Deliberate behaviour changes are recorded here, with what moved and by how much.
 Anything not on this list is a bug in an extraction.
 
 * Phase 1 — joint limits now read from the URDF instead of the hand-transcribed
-  table at the old ``stack_mission2.py:4661``. The transcription was rounded to one
+  table at the old ``the original stack_mission2.py:4661``. The transcription was rounded to one
   decimal, so the true bounds differ slightly and in both directions: elbow_flex
   ``96.8 -> 96.8299`` (looser), wrist_flex ``95.0 -> 94.9998`` and shoulder_pan
   ``110.0 -> 109.9999`` (tighter). Effect, measured over this grid: joint angles move
@@ -60,7 +61,7 @@ GOLDEN = REPO / "tests" / "golden" / "extraction_parity.json"
 ATOL = 1e-9
 
 # Pinned fixture values ------------------------------------------------------------
-# The documented intrinsics fallback (stack_mission2.py:5822), so the goldens do not
+# The documented intrinsics fallback (the original stack_mission2.py:5822), so the goldens do not
 # depend on which OAK-D happens to be plugged in.
 FX = FY = 517.0
 CX = 329.5
@@ -72,7 +73,7 @@ ARM_MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wris
 
 def _load_module():
     """Import ``stack_mission2`` and pin every global the pure functions read."""
-    import stack_mission2 as S
+    import mission_server as S
     from lerobot.model.kinematics import RobotKinematics
 
     S.kin = RobotKinematics(str(URDF), EE_FRAME, ARM_MOTORS)
@@ -284,7 +285,7 @@ def test_extraction_parity():
 def test_urdf_limits_match_hardcoded():
     """The hand-transcribed J_LO/J_HI really are the URDF's limits.
 
-    ``stack_mission2.py:4661`` transcribes the joint limits by hand and the comment
+    ``the original stack_mission2.py:4661`` transcribes the joint limits by hand and the comment
     above it explains that an IK which does not know them "is not an IK, it is a
     wish". The extraction reads them from the URDF instead — so first prove the two
     agree, rather than assuming it.
