@@ -76,6 +76,9 @@ BUS = BusProfile(
 PROFILE = ArmProfile(
     name="so101",
     urdf="SO101/so101_new_calib.urdf",
+    # The same directory: it holds assets/*.stl and a robot.urdf (a copy of the calib
+    # URDF, kept because lerobot's mesh loader looks for that exact filename).
+    mesh_dir="SO101",
     ee_frame="gripper_frame_link",
     joint_names=JOINT_NAMES,
     port="COM4",

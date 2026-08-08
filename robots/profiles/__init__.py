@@ -133,6 +133,12 @@ class ArmProfile:
     ee_frame: str
     joint_names: tuple[str, ...]
     port: str = ""
+    # Directory holding the visual meshes for the 3D viewer. Empty = the URDF's own
+    # directory. It is separate from `urdf` because mesh loaders impose their own
+    # conventions on that directory (lerobot's wants a file named exactly
+    # "robot.urdf"), and an arm should be able to say where its meshes are rather than
+    # having the layout assumed for it.
+    mesh_dir: str = ""
 
     # --- topology: which joint does what -------------------------------------------
     ik: IkKind = "pose"
@@ -184,6 +190,17 @@ class ArmProfile:
         latent failure rather than a convenience.
         """
         p = pathlib.Path(self.urdf).expanduser()
+        if p.is_absolute():
+            return str(p)
+        rooted = REPO_ROOT / p
+        return str(rooted if rooted.exists() else p.resolve())
+
+    @property
+    def mesh_path(self) -> str:
+        """Absolute directory to load visual meshes from; the URDF's own if unset."""
+        if not self.mesh_dir:
+            return str(pathlib.Path(self.urdf_path).parent)
+        p = pathlib.Path(self.mesh_dir).expanduser()
         if p.is_absolute():
             return str(p)
         rooted = REPO_ROOT / p

@@ -1155,6 +1155,7 @@ def world2d_snapshot():
     # forget objects that have not been seen in a while: the map should describe the
     # table as it is, not as it once was
     WORLD.prune()
+    now = time.time()
     with w2d_lock:
         out = []
         for t, o in WORLD.objs.items():
@@ -1177,7 +1178,12 @@ def world2d_snapshot():
                         "aka": list(o.get("aka", ())),
                         "r_cm": round(float(np.hypot(*o["xy"])) * 100, 1),
                         "ang": round(math.degrees(math.atan2(o["xy"][1], o["xy"][0]))),
-                        "stereo_cm": (round(o["stereo"] * 100) if o["stereo"] == o["stereo"] else None),
+                        # "no stereo reading" arrives as either None or NaN depending on
+                        # which path created the entry; both must serialize, not crash
+                        # the viewer. (`x == x` is the NaN test.)
+                        "stereo_cm": (round(o["stereo"] * 100)
+                                      if o["stereo"] is not None and o["stereo"] == o["stereo"]
+                                      else None),
                         "n": o["n"], "age": round(now - o["t"], 1)})
         return out
 
@@ -3382,7 +3388,7 @@ def urdf_route():
     if _urdf_payload[0] is None:
         try:
             from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-            meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+            meshes = load_link_visual_meshes_cached(ARM.mesh_path) or {}
             out = []
             for name, (V, F) in meshes.items():
                 Vd, Fd = _decimate(np.asarray(V, np.float64), np.asarray(F, np.int64), 0.006)
@@ -4548,15 +4554,15 @@ def rerun_thread():
     # a bare `except: pass`, so a mesh failure was invisible. Say it out loud once.
     try:
         from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-        _meshes = load_link_visual_meshes_cached(kin.urdf_dir) or {}
+        _meshes = load_link_visual_meshes_cached(ARM.mesh_path) or {}
         _chain = [n for n, _ in (kin.get_link_transforms_chain(np.zeros(len(ARM_MOTORS))) or [])]
         _hit = [n for n in _chain if n in _meshes]
         if _hit:
             say(f"Rerun 3D: URDF meshes OK — {len(_hit)}/{len(_chain)} links "
-                f"({kin.urdf_dir}): {', '.join(_hit)}")
+                f"({ARM.mesh_path}): {', '.join(_hit)}")
         else:
             say(f"Rerun 3D: NO URDF meshes matched — falling back to stick figure. "
-                f"urdf_dir={kin.urdf_dir} meshes={list(_meshes)} chain={_chain}")
+                f"mesh_dir={ARM.mesh_path} meshes={list(_meshes)} chain={_chain}")
     except Exception as e:
         say(f"Rerun 3D: mesh self-check failed: {type(e).__name__}: {e}")
 

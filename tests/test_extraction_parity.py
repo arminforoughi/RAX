@@ -311,6 +311,39 @@ def test_urdf_limits_match_hardcoded():
     assert np.allclose(hi, S.J_HI, atol=0.05), f"upper: urdf {hi} vs J_HI {S.J_HI}"
 
 
+def test_world2d_snapshot_serializes_a_populated_map():
+    """The server's snapshot wrapper, with objects actually in the map.
+
+    This exists because a real bug shipped past the suite: replacing the inline TTL
+    prune with WORLD.prune() removed a `now = time.time()` that the rest of the
+    function still used, and /geom returned HTTP 500. Every map test exercised
+    ObjectMap directly, so nothing touched this wrapper — and the failing line only
+    runs when the map is NON-EMPTY, which no test made it.
+    """
+    S = _load_module()
+    S.WORLD.clear()
+    try:
+        S.WORLD.update("red cube", [0.25, 0.03], w_m=0.05, d_m=0.05, h_m=0.05,
+                       shape="cube", yaw=12.0, measured=True)
+        # deliberately no stereo reading on this one: entries arrive with None or NaN
+        # depending on which path made them, and both must serialize
+        S.WORLD.update("cup", [0.32, -0.10], stereo=float("nan"), w_m=0.08, d_m=0.08,
+                       h_m=0.10, shape="cylinder", yaw=0.0)
+        snap = S.world2d_snapshot()
+        assert len(snap) == 2, snap
+        for o in snap:
+            # the exact key set /geom and /map2d feed to the UI
+            for k in ("tag", "label", "x", "y", "size", "shape", "yaw", "w_m", "d_m",
+                      "h_m", "measured", "yaw_known", "aka", "r_cm", "ang", "n", "age"):
+                assert k in o, f"{k} missing from the snapshot payload"
+            assert isinstance(o["age"], float) and o["age"] >= 0.0
+            assert o["yaw_known"] is o["measured"]
+            assert o["stereo_cm"] is None, "no stereo reading -> None, not a crash"
+        assert {o["label"] for o in snap} == {"red cube", "cup"}
+    finally:
+        S.WORLD.clear()
+
+
 def test_geometry_sync_is_live():
     """A re-fitted hand-eye or a late intrinsics read must reach the shared geometry.
 
@@ -420,6 +453,7 @@ def main(argv):
     test_geometry_sync_is_live()
     test_fixed_camera_pose_is_supported()
     test_pose_ik_branch_runs()
+    test_world2d_snapshot_serializes_a_populated_map()
     print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI, "
           f"geometry sync live, fixed-camera and pose-IK branches work")
     return 0
