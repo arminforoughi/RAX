@@ -62,12 +62,17 @@ class _BaseIK:
     """Shared pitch planning: try each candidate angle and prove the arm can hold it."""
 
     def __init__(self, kin, profile, *, grasp_pitches=DEFAULT_GRASP_PITCHES,
-                 standoff_m: float = DEFAULT_STANDOFF_M):
+                 standoff_m: float = DEFAULT_STANDOFF_M, workspace=None):
         self.kin = kin
         self.profile = profile
         self.lo, self.hi = profile.limits()
         self.grasp_pitches = tuple(grasp_pitches)
         self.standoff_m = float(standoff_m)
+        # An optional WorkspaceMap, derived from this arm's own kinematics. When
+        # present it supplies the candidate angles per target instead of the hardcoded
+        # list, so the search is over what this arm can actually do rather than over
+        # what someone measured on a different one. See manipulation/arms/workspace.py.
+        self.workspace = workspace
 
     def _fk_pos(self, q) -> np.ndarray:
         return np.asarray(self.kin.forward_kinematics(q), dtype=np.float64)[:3, 3]
@@ -87,8 +92,15 @@ class _BaseIK:
         """
         p_obj = np.asarray(p_target, dtype=np.float64)
         p_above = p_obj + np.array([0.0, 0.0, self.standoff_m])
+        candidates = self.grasp_pitches
+        if self.workspace is not None:
+            # Derived candidates: already filtered to what is reachable here, and
+            # ordered steepest-first. Fall back if the target is off the probed grid.
+            derived = self.workspace.pitch_candidates(p_obj)
+            if derived:
+                candidates = derived
         best = None
-        for pitch in self.grasp_pitches:
+        for pitch in candidates:
             _, e_hi = self.solve(q_seed, p_above, pitch_deg=pitch)
             _, e_lo = self.solve(q_seed, p_obj, pitch_deg=pitch)
             worst = max(float(e_hi), float(e_lo))
