@@ -27,6 +27,7 @@ Entries are per-INSTANCE, not per-label: two cups on the table are two entries.
 
 from __future__ import annotations
 
+import collections
 import math
 import threading
 import time
@@ -36,7 +37,7 @@ import numpy as np
 from perception.object_priors import MAX_TABLE_OBJ_M
 
 __all__ = ["ObjectMap", "MapEntry", "sup_bin", "fit_rect_from_support",
-           "yaw_blend", "SUP_BINS", "SUP_MIN_BINS"]
+           "yaw_blend", "SUP_BINS", "SUP_MIN_BINS", "MAX_MERGE_M"]
 
 # Detections of the same object within this distance are the same object. Tightened
 # because objects were being merged too aggressively; increase it if one object grows
@@ -150,6 +151,10 @@ class ObjectMap:
         self.lock = threading.RLock()
         self._objs: dict[int, MapEntry] = {}
         self._next = 1
+        # Distance between each incoming observation and the entry it landed on: one
+        # sample of the localization error, since the object did not move. Bounded so a
+        # long run does not grow without limit. See observation_scatter().
+        self._residuals: collections.deque[float] = collections.deque(maxlen=500)
         # Injected because they depend on things the map does not own: the active
         # query, and how a measured footprint maps to a shape name.
         self._may_merge = may_merge_labels or (lambda a, b: True)
@@ -175,6 +180,35 @@ class ObjectMap:
         with self.lock:
             self._objs.clear()
             self._next = 1
+
+    def observation_scatter(self, min_samples: int = 20) -> float | None:
+        """Measured localization noise, in metres (RMS), or None if not enough data yet.
+
+        The map is already the right instrument for this. Every update blends a fresh
+        observation into an entry's running position, so the distance between the two
+        IS one sample of the localization error — the object did not move, the estimate
+        did. Accumulating those residuals measures the noise floor on this rig, with
+        this camera, at these ranges, without any special procedure.
+
+        This is what :meth:`merge_radius` should be derived from. The comment on that
+        method records the lesson the hard way — a radius scaled to object size produced
+        a 16-ghost map because consecutive views of ONE cube land 5-15 cm apart — and
+        the number that matters there is exactly this one.
+        """
+        with self.lock:
+            if len(self._residuals) < min_samples:
+                return None
+            r = np.asarray(self._residuals, dtype=np.float64)
+        return float(np.sqrt(np.mean(r ** 2)))
+
+    def suggested_merge_radius(self, k: float = 3.0, min_samples: int = 20) -> float | None:
+        """The merge radius the measured noise implies: ``k`` sigma of the scatter.
+
+        Returned rather than applied. Adopting it silently would change association on a
+        running robot, and the right moment for that is a decision, not a side effect.
+        """
+        s = self.observation_scatter(min_samples)
+        return None if s is None else float(np.clip(k * s, 0.02, MAX_MERGE_M))
 
     def merge_radius(self, a, b=None) -> float:
         """How close two detections must be to count as one object.
@@ -215,6 +249,10 @@ class ObjectMap:
                 dist = float(np.hypot(*(o["xy"] - xy)))
                 if dist < self.merge_radius(o, obs) and (bd is None or dist < bd):
                     best, bd = t, dist
+
+            if best is not None:
+                # the estimate moved, not the object: that gap is localization noise
+                self._residuals.append(float(bd))
 
             if best is None:
                 best = self._next

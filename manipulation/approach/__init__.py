@@ -10,11 +10,15 @@ Contents:
     geometry.py   Where to hover and how to stage the distance. Pure functions.
     visual_center.py  Final centring by eye, with gains measured by probing rather
                   than modelled — a hand-eye error can invert the raw pixel signs.
+    derive.py     Grasp height, centring tolerance and approach trim computed from
+                  the object and the camera instead of being dialled in.
 """
 
 from manipulation.approach.config import KNOBS, ApproachConfig, Knob
 from manipulation.approach.geometry import (
     approach_target, push_out_radial, shift_right, stage_step)
+from manipulation.approach.derive import (
+    align_tolerance_px, grasp_height, hover_height, right_trim_for_visibility)
 from manipulation.approach.visual_center import (
     CenteringOps, CenteringResult, center_on_object)
 
@@ -22,4 +26,6 @@ __all__ = [
     "ApproachConfig", "Knob", "KNOBS",
     "approach_target", "shift_right", "push_out_radial", "stage_step",
     "center_on_object", "CenteringOps", "CenteringResult",
+    "grasp_height", "hover_height", "align_tolerance_px",
+    "right_trim_for_visibility",
 ]
