@@ -42,7 +42,15 @@ DEFAULT_CLEARANCE_M = 0.008
 
 #: Grip this far up the object's height. Below the centre of mass so the object cannot
 #: pivot out of the jaws, but clear of the table.
-DEFAULT_GRASP_FRACTION = 0.4
+#:
+#: The value is not a guess — it is recovered from the one grasp that was empirically
+#: tuned on this rig: 1.5 cm on a 5.08 cm cube, i.e. 0.295. Anchoring here means the
+#: object the constant was tuned on grasps exactly as before, and everything else
+#: inherits the same *rule* instead of the same *number*. If a future rig re-tunes the
+#: reference grasp, recompute this from it rather than nudging it.
+REFERENCE_GRASP_M = 0.015          # PICK_GRASP_Z, tuned by hand
+REFERENCE_OBJECT_H_M = 0.0508      # ...on the 5.08 cm cube
+DEFAULT_GRASP_FRACTION = REFERENCE_GRASP_M / REFERENCE_OBJECT_H_M
 
 #: "Centred" means the error is under this fraction of the object's apparent width.
 #: A third is tight enough that the jaws straddle the object and loose enough that the

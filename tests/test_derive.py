@@ -42,9 +42,12 @@ def _geom():
 
 # --- grasp height ------------------------------------------------------------------
 def test_grasp_height_reproduces_the_hand_tuned_value_for_the_cube():
-    """The constant was tuned on a 5 cm cube; the derivation should land near it."""
+    """EXACTLY reproduces it, because the grasp fraction is recovered from that very
+    pair. This is what makes the derivation safe to switch on: the object the constant
+    was tuned on grasps identically, and every other object inherits the rule instead
+    of the number."""
     z = grasp_height(CUBE_H)
-    assert abs(z - HAND_GRASP_Z) < 0.008, f"derived {z*100:.1f}cm vs hand {HAND_GRASP_Z*100:.1f}cm"
+    assert abs(z - HAND_GRASP_Z) < 1e-9, f"derived {z*100:.3f}cm vs hand {HAND_GRASP_Z*100:.3f}cm"
 
 
 def test_grasp_height_scales_with_the_object():

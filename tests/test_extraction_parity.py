@@ -345,6 +345,44 @@ def test_world2d_snapshot_serializes_a_populated_map():
         S.WORLD.clear()
 
 
+def test_grasp_height_uses_measurements_and_never_retires_an_object_early():
+    """The derived grasp height must read the map, not mutate it.
+
+    _picked_height answers a similar question but marks the entry picked so the place
+    step can retire it. Reusing it here would retire the object BEFORE it was grasped.
+    Also checks the fallback: an unmeasured object keeps today's fixed height, so
+    switching this on cannot change behaviour where nothing measured anything.
+    """
+    S = _load_module()
+    S.WORLD.clear()
+    try:
+        # measured, and much taller than the cube the constant was tuned on
+        S.WORLD.update("bottle", [0.30, 0.0], w_m=0.07, d_m=0.07, h_m=0.23,
+                       shape="cylinder", yaw=0.0, measured=True)
+        tag = next(iter(S.WORLD.objs))
+        z = S.grasp_z_for("bottle", np.array([0.30, 0.0]))
+        assert z > S.PICK_GRASP_Z * 3, f"a 23cm bottle should not be gripped at {z*100:.1f}cm"
+        assert not S.WORLD.objs[tag].get("picked"), "the object was retired before the grasp"
+
+        # unmeasured -> fall back to the tuned constant, i.e. no behaviour change
+        S.WORLD.clear()
+        S.WORLD.update("cup", [0.30, 0.0], w_m=0.08, d_m=0.08, h_m=0.10,
+                       shape="cylinder", yaw=0.0, measured=False)
+        assert S.grasp_z_for("cup", np.array([0.30, 0.0])) == S.PICK_GRASP_Z
+        # nothing there at all -> also the constant
+        assert S.grasp_z_for("cup", np.array([-0.30, 0.0])) == S.PICK_GRASP_Z
+        assert S.grasp_z_for("cup") == S.PICK_GRASP_Z
+
+        # and the object the constant was tuned on is unchanged
+        S.WORLD.clear()
+        S.WORLD.update("red cube", [0.25, 0.0], w_m=0.0508, d_m=0.0508, h_m=0.0508,
+                       shape="cube", yaw=0.0, measured=True)
+        got = S.grasp_z_for("red cube", np.array([0.25, 0.0]))
+        assert abs(got - S.PICK_GRASP_Z) < 1e-9, f"cube grasp moved to {got*100:.2f}cm"
+    finally:
+        S.WORLD.clear()
+
+
 def test_geometry_sync_is_live():
     """A re-fitted hand-eye or a late intrinsics read must reach the shared geometry.
 
@@ -455,6 +493,7 @@ def main(argv):
     test_fixed_camera_pose_is_supported()
     test_pose_ik_branch_runs()
     test_world2d_snapshot_serializes_a_populated_map()
+    test_grasp_height_uses_measurements_and_never_retires_an_object_early()
     print(f"parity OK — {len(current)} groups match, URDF limits match J_LO/J_HI, "
           f"geometry sync live, fixed-camera and pose-IK branches work")
     return 0

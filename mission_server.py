@@ -106,6 +106,7 @@ from models.detection.tracking import (
 from mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 from manipulation.approach import ApproachConfig, approach_target, shift_right
+from manipulation.approach.derive import grasp_height, hover_height
 from manipulation.approach.visual_center import center_on_object
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
@@ -1673,7 +1674,12 @@ def detect_now(finder, tries=12):
 # no camera self-calibration in the loop. If it lands off, we SEE by how much and
 # trim — we do not guess.
 PICK_HOVER_Z = 0.06        # hover this far above the table before descending
-PICK_GRASP_Z = 0.015       # descend to here (grab the cube's lower body)
+# Fallback grasp height, used only when the object's height is unknown. When the map
+# HAS a height, grasp_z_for() derives the grip point from it instead — see
+# manipulation/approach/derive.py. The two agree exactly on the 5.08cm cube this
+# constant was tuned on; they differ where the constant was silently wrong (it closes
+# ABOVE a 0.9cm phone and grips a 23cm bottle at its base).
+PICK_GRASP_Z = 0.015
 PICK_LIFT_M = 0.10
 
 # ---------------- carry + place ----------------
@@ -2264,6 +2270,42 @@ def _mapped_xy(label):
         return None if best is None else np.array(best["xy"], float)
 
 
+def mapped_height(label, xy, max_dist_m=0.10):
+    """The map's MEASURED height for the object near xy, or None.
+
+    Read-only on purpose. _picked_height answers a similar question but marks the entry
+    as picked so the place step can retire it — calling that here would retire the
+    object before it had been grasped.
+
+    Only a genuine measurement is returned. A class prior is a guess about a category,
+    and grasping a specific object by a category guess is what the fixed constant
+    already did.
+    """
+    with w2d_lock:
+        best, bd = None, float(max_dist_m)
+        for _t, o in WORLD.objs.items():
+            d = float(np.hypot(o["xy"][0] - xy[0], o["xy"][1] - xy[1]))
+            if d < bd and str(label).split()[0] in o["label"]:
+                best, bd = o, d
+        if best is None or not best.get("measured"):
+            return None
+        h = float(best["h_m"])
+    return h if h > 0.004 else None
+
+
+def grasp_z_for(label, xy=None):
+    """Where to close the jaws: derived from the object's height when it was measured.
+
+    Falls back to the tuned constant otherwise, so an unmapped or unmeasured target
+    behaves exactly as it does today rather than being grasped from a guess. The two
+    agree on the 5.08 cm cube the constant was tuned on.
+    """
+    h = mapped_height(label, xy) if xy is not None else None
+    if h is None:
+        return PICK_GRASP_Z
+    return float(grasp_height(h, table_z_m=TABLE_Z0))
+
+
 def _picked_height(label, gx, gy):
     """Height of the object we just grasped, for growing the destination's height
     after the place. Prefers the mapped measurement nearest the grasp point, and
@@ -2546,7 +2588,11 @@ def run_mission(target_label=None):
         # ---- FINAL CENTERING BY EYE, then descend on the aligned spot ----
         q = observe()[0].astype(np.float64)
         j5 = float(q[4])             # no wrist twist
-        gp, _e = plan_grasp_pitch(np.array([cube_xy[0], cube_xy[1], PICK_GRASP_Z]), q)
+        grasp_z = grasp_z_for(label, cube_xy)
+        if abs(grasp_z - PICK_GRASP_Z) > 1e-6:
+            say(f"        grasp height {grasp_z*100:.1f}cm from the measured object "
+                f"(fixed default is {PICK_GRASP_Z*100:.1f}cm)")
+        gp, _e = plan_grasp_pitch(np.array([cube_xy[0], cube_xy[1], grasp_z]), q)
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
         say(f"  [4/7] centering  pitch={gp:.0f}deg wrist_roll={j5:.0f}deg "
@@ -2563,7 +2609,7 @@ def run_mission(target_label=None):
         z0 = float(_tip(q)[2])
         for f in (0.4, 0.75, 1.0):
             checkpoint()
-            z = float(z0 + (PICK_GRASP_Z - z0) * f)
+            z = float(z0 + (grasp_z - z0) * f)
             last = (f == 1.0)
             set_phase("PICK", f"descending to z={z*100:.1f}cm")
             # the final rung goes slower and settles longer — that is the one that
@@ -4621,6 +4667,56 @@ def rerun_thread():
         time.sleep(0.12)
 
 
+_shut = [False]
+
+
+def _shutdown(why=""):
+    """Release the camera and the servo bus before the process goes away.
+
+    THIS IS NOT HOUSEKEEPING. An OAK-D whose owner dies without disconnecting stays
+    BOOTED with no one holding it: Windows keeps enumerating it, depthai skips it with
+    "X_LINK_BOOTED ... X_LINK_ERROR", and the next start fails with "No available
+    devices" until somebody physically unplugs it. That is what left this robot blind
+    for 41 hours — the server kept serving, the camera was gone, and nothing said so.
+
+    Idempotent, and every step is independently guarded: a shutdown path that raises
+    halfway leaves exactly the wedged device it was written to prevent.
+    """
+    if _shut[0]:
+        return
+    _shut[0] = True
+    print(f"shutting down ({why}) — releasing camera and bus", flush=True)
+    try:
+        stop_flag.set()
+    except Exception:
+        pass
+    for label, fn in (("camera", lambda: cam.disconnect()),
+                      ("robot", lambda: robot.disconnect())):
+        try:
+            fn()
+            print(f"  {label} released", flush=True)
+        except Exception as e:
+            print(f"  {label} release failed: {type(e).__name__}: {e}", flush=True)
+
+
+def _install_shutdown_handlers():
+    """Run the release on normal exit and on a polite kill.
+
+    SIGTERM covers `Stop-Process`/`kill`; SIGINT covers Ctrl-C. A hard SIGKILL cannot
+    be intercepted by anything, so the camera can still wedge if the process is killed
+    outright — that case needs the USB re-plug.
+    """
+    import atexit
+    import signal
+
+    atexit.register(_shutdown, "atexit")
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, lambda s, _f: (_shutdown(f"signal {s}"), os._exit(0)))
+        except (ValueError, OSError):
+            pass            # not on the main thread, or unsupported on this platform
+
+
 def main():
     global robot, kin, fx, fy, cx0, cy0, detector, cam
     clear_gripper_overload()
@@ -4735,9 +4831,13 @@ def main():
     start_rerun()
     threading.Thread(target=rerun_thread, daemon=True).start()
     start_tunnel()
+    _install_shutdown_handlers()
     set_phase("IDLE", "ready — press Start")
     say(f"UI: http://100.110.89.78:{PORT}  (Tailscale)")
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    try:
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+    finally:
+        _shutdown("app.run returned")
 
 
 if __name__ == "__main__":
