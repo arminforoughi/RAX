@@ -106,7 +106,8 @@ from models.detection.tracking import (
 from mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 from manipulation.approach import ApproachConfig, approach_target, shift_right
-from manipulation.approach.derive import grasp_height, hover_height
+from manipulation.approach.derive import (
+    align_tolerance_px, grasp_height, hover_height, right_trim_for_visibility)
 from manipulation.approach.visual_center import center_on_object
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
@@ -2116,13 +2117,22 @@ class _CenteringOps:
     checkpoint = staticmethod(checkpoint)
 
 
-def _center_on_cube(finder, gp, j5):
+def _center_on_cube(finder, gp, j5, label=None):
     """Center the object under the jaws — manipulation/approach/visual_center.py.
 
     Returns the final (x, y), or None if the object was never in view.
     """
     aim = (HAND_UV[0] + CFG.aim_du_px, HAND_UV[1] + CFG.aim_dv_px)
-    res = center_on_object(_CenteringOps(finder, gp, j5), aim, CFG)
+    ops = _CenteringOps(finder, gp, j5)
+    # Tolerance scaled to how big the object actually looks right now. A fixed pixel
+    # count means very different physical accuracy at 10cm and at 45cm.
+    tol = None
+    tr = ops.track(tries=3)
+    if tr is not None:
+        rng = _cube_range_m(tr)
+        if rng and rng > 0.01:
+            tol = align_tolerance_px(GEOM, PRIORS.size_m(label), rng)
+    res = center_on_object(ops, aim, CFG, tolerance_px=tol)
     return res.xy
 
 
@@ -2395,7 +2405,7 @@ def place_at(tag=None, xy=None, recenter=True):
     if recenter and dest_label:
         set_phase("PLACE", f"re-centering on {where}")
         finder = (lambda rgb, T=None, _l=dest_label: find_label(rgb, _l, T))
-        aligned = _center_on_cube(finder, pitch, j5)
+        aligned = _center_on_cube(finder, pitch, j5, dest_label)
         if aligned is None:
             say(f"place: {dest_label} not visible from the hover — "
                 f"using the mapped position blind")
@@ -2478,7 +2488,13 @@ def run_mission(target_label=None):
             backed = cube_xy * ((r - CFG.back_m) / r)
         else:
             backed = cube_xy.copy()
-        return _shift_right(backed, CFG.right_trim_m)
+        # The trim's job is to keep the object in frame while the gripper closes in.
+        # How much room there is depends on the field of view and the closest range,
+        # so compute it rather than carrying one number tuned at one distance. Falls
+        # back to the configured value when the camera reports no frame width.
+        closest = max(float(np.hypot(*cube_xy)) - CFG.back_m, 0.05)
+        trim = right_trim_for_visibility(GEOM, PRIORS.size_m(label), closest)
+        return _shift_right(backed, trim or CFG.right_trim_m)
 
     try:
         stop_flag.clear()
@@ -2597,7 +2613,7 @@ def run_mission(target_label=None):
         set_phase("PICK", "centering the cube under the jaws")
         say(f"  [4/7] centering  pitch={gp:.0f}deg wrist_roll={j5:.0f}deg "
             f"aim=({HAND_UV[0]+CFG.aim_du_px:.0f},{HAND_UV[1]+CFG.aim_dv_px:.0f})px")
-        aligned = _center_on_cube(finder, gp, j5)
+        aligned = _center_on_cube(finder, gp, j5, label)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
             say(f"        centred -> grasp at x={gx*100:+.1f} y={gy*100:+.1f} cm "
@@ -4561,6 +4577,38 @@ def r_clearmap2d():
     return jsonify(ok=True)
 
 
+def merge_radius_watch():
+    """Adopt the merge radius the map's own measured noise implies.
+
+    The radius has to cover the localization scatter or one object spawns a fresh tag
+    per view — that is what produced a 16-ghost map. The scatter was never measured, so
+    the number was guessed at 14cm and left. The map can measure it: every update's
+    residual against the running estimate is one sample of that error, because the
+    object did not move, the estimate did.
+
+    Adopted only once there is enough evidence, only when it differs enough to matter,
+    and never below the configured floor — a radius that shrinks below the real noise
+    is the failure this is meant to prevent, so the measurement may widen it but not
+    tighten it past the default.
+    """
+    floor = WORLD.merge_m
+    while True:
+        time.sleep(60.0)
+        try:
+            want = WORLD.suggested_merge_radius(k=3.0, min_samples=60)
+            if want is None:
+                continue
+            want = max(float(want), floor)
+            if abs(want - WORLD.merge_m) < 0.01:
+                continue
+            scatter = WORLD.observation_scatter()
+            say(f"map: merge radius {WORLD.merge_m*100:.0f}cm -> {want*100:.0f}cm "
+                f"(measured localization scatter {scatter*1000:.0f}mm, 3 sigma)")
+            WORLD.merge_m = want
+        except Exception as e:
+            say(f"merge radius watch: {type(e).__name__}: {e}")
+
+
 def idle_view():
     while True:
         with lock:
@@ -4720,13 +4768,17 @@ def _shutdown(why=""):
         stop_flag.set()
     except Exception:
         pass
-    for label, fn in (("camera", lambda: cam.disconnect()),
-                      ("robot", lambda: robot.disconnect())):
+    # Robot first: its disconnect owns the camera it was given, so releasing the camera
+    # out from under it leaves the robot reporting "not connected" and skipping its own
+    # bus teardown. The camera call after it is belt-and-braces for the case where the
+    # robot never finished connecting.
+    for label, fn in (("robot", lambda: robot.disconnect()),
+                      ("camera", lambda: cam.disconnect())):
         try:
             fn()
             print(f"  {label} released", flush=True)
         except Exception as e:
-            print(f"  {label} release failed: {type(e).__name__}: {e}", flush=True)
+            print(f"  {label} release: {type(e).__name__}: {e}", flush=True)
 
 
 def _install_shutdown_handlers():
@@ -4865,6 +4917,7 @@ def main():
     threading.Thread(target=idle_view, daemon=True).start()
     threading.Thread(target=jog_loop, daemon=True).start()
     threading.Thread(target=idle_relax_watch, daemon=True).start()
+    threading.Thread(target=merge_radius_watch, daemon=True).start()
     start_rerun()
     threading.Thread(target=rerun_thread, daemon=True).start()
     start_tunnel()

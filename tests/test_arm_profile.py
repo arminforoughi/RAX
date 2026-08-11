@@ -54,7 +54,16 @@ def test_so101_topology_matches_the_hardcoded_ik():
     assert p.positioning_joints == (0, 1, 2)
     assert p.slaved_joint == 3
     assert p.n_joints == 5
-    assert len(p.ik_seeds) == 5, "the elbow-flip dead band needs all five re-seeds"
+    # At least one re-seed, because this arm HAS an elbow-flip dead band the natural
+    # branch cannot escape. The COUNT is deliberately not asserted: it used to be five,
+    # accumulated by hand, and manipulation.arms.workspace showed one derived seed gives
+    # identical coverage over 700 poses. What matters is that the seeds are valid and
+    # that coverage holds — see test_workspace.py — not how many there happen to be.
+    assert len(p.ik_seeds) >= 1
+    for seed in p.ik_seeds:
+        assert len(seed) == p.n_joints
+        pinned = {i for i, v in enumerate(seed) if v is not None}
+        assert pinned <= set(p.positioning_joints), f"seed pins undriven joints: {pinned}"
 
 
 def test_so101_named_poses_and_gripper():

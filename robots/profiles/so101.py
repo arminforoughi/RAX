@@ -91,16 +91,21 @@ PROFILE = ArmProfile(
     pan_joint=0,
     pitch_chain=(1, 2, 3),
     roll_joint=4,
-    # Re-seeds for the elbow-flip dead band (mapped 2026-07-13): at r=10-15 cm the arm
-    # simply cannot hold a shallow pitch from the caller's seed. None = keep the
-    # caller's value for that joint. The last two extend the arm forward for far /
-    # shallow-pitch targets.
+    # Re-seed for the elbow-flip dead band: where the solver's natural branch cannot
+    # reach a pose that IS reachable, escaping it needs a seed from the other branch.
+    # None = keep the caller's value for that joint.
+    #
+    # DERIVED, not hand-picked. manipulation.arms.workspace probes the (radius, height,
+    # pitch) space with the bare solver, records which sampled seeds rescue which cells,
+    # and takes a minimal cover. This single seed is the mirrored elbow configuration —
+    # exactly what an elbow flip needs — and it replaced five seeds that had accumulated
+    # one at a time. Measured over 700 poses spanning all five working heights: identical
+    # coverage (350/700 either way, no pose reachable by one set and not the other) and
+    # 2.6x faster, because four of the five were redundant.
+    #
+    # Re-derive rather than adding to it:  analyze_workspace(ik, profile).seeds()
     ik_seeds=(
-        (None, -95.0, 90.0, 30.0, None),
-        (None, -30.0, 50.0, 60.0, None),
-        (None, -60.0, 20.0, 80.0, None),
-        (None, -20.0, 75.0,  0.0, None),
-        (None, -10.0, 85.0,  0.0, None),
+        (None, 70.0, -67.8, None, None),
     ),
 
     home_deg=HOME_DEG,

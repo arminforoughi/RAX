@@ -116,13 +116,19 @@ def _probe_radial(ops, uv0, p0, settle, step):
     return (float(tr.uv[1]) - uv0[1]) / RAD_PROBE_M
 
 
-def center_on_object(ops: CenteringOps, target_uv, cfg) -> CenteringResult:
+def center_on_object(ops: CenteringOps, target_uv, cfg, *, tolerance_px=None
+                     ) -> CenteringResult:
     """Servo the arm until the object sits on ``target_uv`` in the image.
 
     ``target_uv`` is where the object should appear when the jaws are around it —
     normally the measured fingertip pixel plus the configured aim trims.
+
+    ``tolerance_px`` overrides the configured fixed tolerance. Prefer passing one
+    derived from the object's apparent size (see approach.derive.align_tolerance_px):
+    a fixed pixel count is a third of a near object and a whole far one, so it demands
+    quite different physical accuracy depending on where the object happens to be.
     """
-    tol = float(cfg.align_tol_px)
+    tol = float(cfg.align_tol_px if tolerance_px is None else tolerance_px)
     # The vertical axis is servoed through radial reach, which is coarser than base
     # rotation, so it gets a slightly looser tolerance rather than chasing forever.
     tol_v = tol * 1.3

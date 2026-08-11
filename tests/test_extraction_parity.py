@@ -38,6 +38,16 @@ Anything not on this list is a bug in an extraction.
   limit-dependent groups (``ik_hold_pitch``, ``slave_wflex``, ``plan_grasp_pitch``)
   changed at all — every geometry and class-prior group stayed bit-identical.
   0.03 deg is below one STS3215 servo step (0.088 deg), so no commanded pose changes.
+
+* Seed derivation — the SO-101 profile's five hand-added IK seeds replaced by the one
+  derived by ``manipulation.arms.workspace`` (the mirrored elbow branch). Different
+  seeds means the solver lands on different valid branches, so ``ik_hold_pitch`` poses
+  move. What matters is that nothing got worse: 36/60 cases solve before AND after,
+  ZERO regressions (nothing reachable became unreachable), zero newly reachable, and
+  ``plan_grasp_pitch`` chose an identical angle in all 10 cases with the same worst
+  residual (0.56 mm). The 16 cases whose residual grew were already beyond tolerance —
+  a different failed branch, which changes nothing the arm does. Independently
+  measured over 700 poses across five heights: identical coverage, 2.6x faster.
 """
 
 from __future__ import annotations
