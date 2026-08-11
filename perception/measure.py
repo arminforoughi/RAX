@@ -162,6 +162,11 @@ def contact_points(geom, mask, bbox, T_base_cam, z_plane):
     solve can pair each roof pixel with the floor pixel DIRECTLY BELOW IT rather
     than with the footprint centre — which is what a flat elongated object needs
     (the highest pixel of a lying remote is its far END, not its top face).
+
+    Failures report WHICH gate rejected, via ``reason``. They used to collapse into a
+    single "no_contact_line", which is why a 100% failure rate went undiagnosed: five
+    quite different causes — a mask too narrow, a box running off the bottom of the
+    frame, rays too shallow to trust — all looked identical from the outside.
     """
     H, W = mask.shape[:2]
     x1, y1, x2, y2 = (int(round(v)) for v in bbox)
@@ -170,7 +175,7 @@ def contact_points(geom, mask, bbox, T_base_cam, z_plane):
     sub = mask[y1:y2, x1:x2] > 0
     cols = np.where(sub.any(axis=0))[0]
     if cols.size < 6:
-        return None, None
+        return None, None, "mask_too_narrow"
     bottom = (sub.shape[0] - 1) - np.argmax(sub[::-1, :], axis=0)
     top = np.argmax(sub, axis=0)
     # Clipping means the IMAGE ran out, not the box: a bounding box touches the
@@ -178,7 +183,7 @@ def contact_points(geom, mask, bbox, T_base_cam, z_plane):
     # against the box's own floor discards the entire true contact line. (It did
     # exactly that — a cup kept 28 of 147 columns, all of them up on its far rim.)
     if y2 >= H - 2:
-        return None, None
+        return None, None, "object_runs_off_frame_bottom"
     # drop the side-edge columns (see MAX_CONTACT_SLOPE) — keep only the stretch of
     # the lower boundary that is genuinely lying along the object's base
     b = bottom[cols].astype(np.float64)
@@ -191,9 +196,13 @@ def contact_points(geom, mask, bbox, T_base_cam, z_plane):
     uv_bot = np.stack([cols + x1 + 0.5, b + y1 + 0.5], axis=1)
     pts, ok = pixels_to_table(geom, uv_bot, T_base_cam, z_plane, MIN_TABLE_INCIDENCE)
     if pts.shape[0] < 6:
-        return None, None
+        # The rays were too shallow to intersect the plane usefully. This is the gate
+        # most likely to be wrong on a given rig: it depends entirely on where the
+        # camera is pointing, and near the horizon one pixel of segmentation noise
+        # slides the intersection by centimetres.
+        return None, None, f"rays_too_shallow ({pts.shape[0]}/{len(uv_bot)} kept)"
     uv_top = np.stack([cols + x1 + 0.5, top[cols] + y1 + 0.5], axis=1)[ok]
-    return pts, uv_top
+    return pts, uv_top, ""
 
 
 def solve_height(geom, uv_top, xy, half_along, T_base_cam, z_plane):
@@ -273,6 +282,36 @@ class ObjectMeasurer:
         self.stats[why] = self.stats.get(why, 0) + 1
         return None
 
+    def viewpoint_incidence(self, T_base_cam) -> float:
+        """How steeply this viewpoint looks at the table: sin(incidence), 0 = grazing.
+
+        Measured on the ray through the image centre. Negative when the camera is
+        looking up, away from the plane entirely.
+        """
+        T = np.asarray(T_base_cam, dtype=np.float64)
+        d = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        return float(-d[2])
+
+    def can_measure(self, T_base_cam) -> bool:
+        """Whether a footprint measurement is geometrically possible from here.
+
+        THIS IS WHY THE MEASUREMENT "NEVER WORKED". The solve needs the object's
+        contact line back-projected onto the table, which needs rays that come DOWN
+        onto it. From a forward-looking pose every ray grazes the plane, and near the
+        horizon one pixel of segmentation noise slides the intersection by
+        centimetres — so the incidence gate correctly rejects all of them.
+
+        Measured on this rig: from a downward-looking pose the solve succeeds on about
+        half of attempts; from the folded home pose it succeeds on ZERO, and the idle
+        sensing loop runs from exactly that pose. The result was tens of thousands of
+        logged failures that looked like a broken measurement rather than what they
+        were — a camera pointed the wrong way to take one.
+
+        Callers should check this before attempting, and a scan should prefer poses
+        that satisfy it, rather than measuring hopefully from wherever the arm parked.
+        """
+        return self.viewpoint_incidence(T_base_cam) >= MIN_TABLE_INCIDENCE
+
     def measure(self, rgb, bbox, T_base_cam, label, z_plane=None):
         """Measure an object's position, footprint, height and yaw from ONE frame.
 
@@ -285,13 +324,17 @@ class ObjectMeasurer:
         """
         if self.geom.fx <= 0:
             return None
+        if not self.can_measure(T_base_cam):
+            # Not a failure of the solve — the camera cannot see the contact line from
+            # here. Named separately so it does not masquerade as a broken measurement.
+            return self._fail("viewpoint_too_shallow")
         z_plane = self.table_z if z_plane is None else float(z_plane)
         mask = silhouette_mask(rgb, bbox)
         if mask is None:
             return self._fail("no_silhouette")
-        pts, uv_top = contact_points(self.geom, mask, bbox, T_base_cam, z_plane)
+        pts, uv_top, why = contact_points(self.geom, mask, bbox, T_base_cam, z_plane)
         if pts is None:
-            return self._fail("no_contact_line")
+            return self._fail(f"no_contact_line: {why}")
 
         # WHAT ONE VIEW CAN AND CANNOT SEE. Measured on the synthetic bench:
         #   * the extent ACROSS the sightline is recovered to about a millimetre
