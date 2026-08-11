@@ -2300,7 +2300,17 @@ def mapped_height(label, xy, max_dist_m=0.10):
         if best is None or not best.get("measured"):
             return None
         h = float(best["h_m"])
-    return h if h > 0.004 else None
+    if h <= 0.004:
+        return None
+    # THE HEIGHT MEASUREMENT READS LOW. _dest_geometry already compensates for this
+    # when stacking ("the measurement reads low, and low here means burying the carried
+    # object in the target"), and it matters more here: measured against a 5.08cm cube
+    # this solve returned 2.7cm, which would put the grip point 8mm off the table
+    # instead of 15mm. Gripping too LOW drives the jaws into the surface; too high
+    # merely misses and can be retried. So floor by the class prior, the same rule and
+    # for the same reason as the place path.
+    prior = class_height_m(label)
+    return max(h, prior) if prior > 0 else h
 
 
 def grasp_z_for(label, xy=None):

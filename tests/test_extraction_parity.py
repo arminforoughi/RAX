@@ -374,6 +374,17 @@ def test_grasp_height_uses_measurements_and_never_retires_an_object_early():
         assert z > S.PICK_GRASP_Z * 3, f"a 23cm bottle should not be gripped at {z*100:.1f}cm"
         assert not S.WORLD.objs[tag].get("picked"), "the object was retired before the grasp"
 
+        # A measurement that reads LOW must not lower the grip point. The height solve
+        # under-reads (measured 2.7cm against a real 5.08cm cube), and gripping low
+        # drives the jaws into the table, while gripping high merely misses. So the
+        # class prior is a floor — the same rule the place path already uses.
+        S.WORLD.clear()
+        S.WORLD.update("red cube", [0.25, 0.0], w_m=0.05, d_m=0.05, h_m=0.027,
+                       shape="cube", yaw=0.0, measured=True)
+        low = S.grasp_z_for("red cube", np.array([0.25, 0.0]))
+        assert abs(low - S.PICK_GRASP_Z) < 1e-9, (
+            f"an under-reading measurement dropped the grip to {low*100:.1f}cm")
+
         # unmeasured -> fall back to the tuned constant, i.e. no behaviour change
         S.WORLD.clear()
         S.WORLD.update("cup", [0.30, 0.0], w_m=0.08, d_m=0.08, h_m=0.10,
