@@ -3562,6 +3562,36 @@ def stop():
     return jsonify(ok=True)
 
 
+@app.route("/shutdown", methods=["POST"])
+def shutdown_route():
+    """Stop the server the way that actually releases the camera.
+
+    THIS IS THE ONLY RELIABLE GRACEFUL STOP ON WINDOWS. PowerShell's Stop-Process is a
+    hard TerminateProcess — equivalent to SIGKILL — so no signal handler runs, and
+    Python on Windows does not deliver an external SIGTERM to a handler either. Killing
+    the server that way leaves the OAK-D booted with no owner, which is what makes the
+    next start fail with "No available devices" until somebody unplugs it physically.
+
+    So: POST here instead of killing the process. It releases the camera and the servo
+    bus first, then exits.
+    """
+    if is_public_request():
+        return jsonify(ok=False, reason="not available to guests"), 403
+    with lock:
+        busy = state["running"]
+    if busy and not request.args.get("force"):
+        return jsonify(ok=False, reason="a mission is running; pass ?force=1"), 409
+
+    def _bye():
+        time.sleep(0.3)          # let this response reach the client first
+        _shutdown("/shutdown requested")
+        os._exit(0)
+
+    threading.Thread(target=_bye, daemon=True).start()
+    say("shutdown requested — releasing camera and bus")
+    return jsonify(ok=True, note="camera and bus released before exit")
+
+
 # ---- smooth continuous jog (browser teleop) -----------------------------
 # Model matching the operator's mental picture:
 #  * The gripper holds a FIXED angle (pitch + roll) while you translate; its
@@ -4700,11 +4730,18 @@ def _shutdown(why=""):
 
 
 def _install_shutdown_handlers():
-    """Run the release on normal exit and on a polite kill.
+    """Run the release on normal exit and on a polite stop.
 
-    SIGTERM covers `Stop-Process`/`kill`; SIGINT covers Ctrl-C. A hard SIGKILL cannot
-    be intercepted by anything, so the camera can still wedge if the process is killed
-    outright — that case needs the USB re-plug.
+    WHAT THIS DOES AND DOES NOT COVER, on Windows specifically:
+      * normal exit / an unhandled exception  -> atexit fires. Covered.
+      * Ctrl-C in a console                   -> SIGINT fires. Covered.
+      * POST /shutdown                        -> calls _shutdown directly. Covered.
+      * PowerShell Stop-Process               -> NOT covered. It is a hard
+        TerminateProcess, the same as SIGKILL, and no handler runs. Python on Windows
+        also does not deliver an externally-sent SIGTERM to a handler.
+
+    That last case is how this server has usually been stopped, and it is exactly the
+    case that wedges the camera. Use POST /shutdown instead.
     """
     import atexit
     import signal
