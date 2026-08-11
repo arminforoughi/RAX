@@ -103,6 +103,8 @@ from perception.handeye import (
     HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye)
 from models.detection.tracking import (
     AnchorTracker, PixelTracker, Track, HSV_BANDS, HSV_BANDS_SOFT)
+from models.detection.detector_service import (
+    DetectorConfig, DetectorService, box_iou)
 from mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 from manipulation.approach import ApproachConfig, approach_target, shift_right
@@ -228,32 +230,35 @@ def _sync_geometry():
 red_tracker = AnchorTracker("red", GEOM)
 green_tracker = AnchorTracker("green", GEOM)
 
-label_trackers = {}    # label -> PixelTracker, built lazily as labels are seen
 
 
-# ---------------- parallel YOLO validation ----------------
+# ---------------- parallel detection ----------------
+# The throttled worker, query handling, NMS and the per-label trackers now live in
+# models/detection/detector_service.py. This keeps the old function names as thin
+# delegations so the ~40 call sites below are unchanged.
 detector = None
-# Latest YOLO detections keyed by class label. Each value is a LIST of instances,
-# {"xyxy": tuple, "conf": float}, confidence-sorted — a table can hold three cups
-# and the map has to carry all three, so this cannot collapse to one box per label.
-yolo_latest = {"t": 0.0, "dets": {}}
-YOLO_NMS_IOU = 0.55        # merge duplicate boxes of the same label
-pending_query = [None]      # set by /setquery, applied inside the YOLO thread
+DETECT = None              # DetectorService, built in main() once the detector loads
+DETECT_CFG = DetectorConfig(
+    period_s=2.5,
+    nms_iou=0.55,          # two prompts routinely fire on the same object
+    max_age_s=4.0,
+    colour_min_frac=0.15,
+    # the cube colours keep their dedicated HSV+anchor trackers, which are tighter
+    # during close approach than the detector's refresh rate
+    reserved_labels=("red cube", "green cube"),
+)
 
 
 def _query_labels():
     """Parse the active detection query into class labels, preserving order."""
+    if DETECT is not None:
+        return DETECT.labels()
     q = (state.get("query") or "red cube, green cube").lower()
     return [p.strip() for p in q.split(",") if p.strip()]
 
 
-# Minimum fraction of a box that must actually be the colour its LABEL names.
-# Only labels containing a colour word are gated at all, so "pen" is never asked
-# to be red while "red cube" still cannot latch onto the green one.
-COLOR_MIN_FRAC = 0.15      # matches the original blanket filter for cubes
-
-
 def _colour_ok(rgb, label, xyxy):
+    """Reject a box that is not the colour its LABEL names. Colourless labels pass."""
     try:
         from lerobot.perception.detection_filters import (
             bbox_color_match_fraction, color_names_in_query)
@@ -261,100 +266,30 @@ def _colour_ok(rgb, label, xyxy):
         return True
     cols = color_names_in_query(label)
     if not cols:
-        return True                       # colourless label: nothing to check
-    box = tuple(int(v) for v in xyxy)
+        return True
     try:
-        return bbox_color_match_fraction(rgb, box, cols) >= COLOR_MIN_FRAC
+        return bbox_color_match_fraction(
+            rgb, tuple(int(v) for v in xyxy), cols) >= DETECT_CFG.colour_min_frac
     except Exception:
         return True
 
 
-def _box_iou(a, b):
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    if inter <= 0.0:
-        return 0.0
-    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return float(inter / ua) if ua > 1e-9 else 0.0
-
-
-def _dedupe_boxes(insts):
-    """Greedy NMS within one label — two prompts often fire on the same object."""
-    kept = []
-    for e in insts:
-        if all(_box_iou(e["xyxy"], k["xyxy"]) < YOLO_NMS_IOU for k in kept):
-            kept.append(e)
-    return kept
-
-
 def yolo_worker():
-    while True:
-        time.sleep(2.5)
-        # apply a pending query change here — the model must only be mutated on
-        # the thread that runs it (set_classes from Flask crashes it).
-        if pending_query[0] is not None and detector is not None:
-            q = pending_query[0]; pending_query[0] = None
-            try:
-                detector.set_query(q)
-                with lock:
-                    state["query"] = q
-                say(f"detection query set: {q}")
-            except Exception as e:
-                say(f"query change failed: {e}")
-        with lock:
-            rgb = latest_rgb[0]
-        if rgb is None or detector is None:
-            continue
-        try:
-            dets = detector.predict_rgb(np.ascontiguousarray(rgb))
-        except Exception:
-            continue
-        with lock:
-            labels = _query_labels()
-            by_label = {}
-            for d in dets:
-                if 0 <= d.class_id < len(labels):
-                    lbl = labels[d.class_id]
-                    if not _colour_ok(rgb, lbl, d.xyxy):
-                        continue
-                    by_label.setdefault(lbl, []).append(
-                        {"xyxy": tuple(float(v) for v in d.xyxy), "conf": float(d.confidence)})
-            for lbl, inst in by_label.items():
-                inst.sort(key=lambda e: -e["conf"])
-                by_label[lbl] = _dedupe_boxes(inst)
-            yolo_latest["t"] = time.time()
-            yolo_latest["dets"] = by_label
-            # (Re)tag the per-label pixel tracker with this cycle's best box for
-            # each label, EXCEPT the two cubes — those already have their own
-            # dedicated, tighter HSV+anchor trackers (find_red / find_green).
-            for lbl, inst in by_label.items():
-                if lbl in ("red cube", "green cube") or not inst:
-                    continue
-                label_trackers.setdefault(lbl, PixelTracker(lbl)).tag(rgb, inst[0]["xyxy"])
-            # drop trackers for labels no longer being asked for, so a stale one
-            # does not keep reporting a box for something nobody is looking for
-            for lbl in [l for l in label_trackers if l not in labels]:
-                del label_trackers[lbl]
+    DETECT.run_forever()
 
 
 def find_red(rgb, T_base_cam=None):
-    """Acquire via YOLO (parallel thread) OR a big strict-HSV blob (the S>=110
-    gate already excludes wood grain, and YOLO misses edge-clipped slivers);
-    afterwards window/anchor continuity tracks."""
+    """Acquire via the detector OR a big strict-HSV blob (the saturation gate already
+    excludes wood grain, and the detector misses edge-clipped slivers); afterwards
+    window/anchor continuity tracks."""
     if red_tracker.last is not None or red_tracker.p_anchor is not None:
         tr = red_tracker.track(rgb, T_base_cam)
         if tr is not None:
             return tr
-    box = None
-    with lock:
-        inst = yolo_latest["dets"].get("red cube")
-        t = yolo_latest["t"]
-    if inst:
-        box = inst[0]["xyxy"]
-    if box is not None and time.time() - t < 4.0:
-        x1, y1, x2, y2 = box
-        red_tracker.last = Track(((x1 + x2) / 2, (y1 + y2) / 2), tuple(box),
+    inst, t = DETECT.instances("red cube")
+    if inst and time.time() - t < 4.0:
+        x1, y1, x2, y2 = inst[0]["xyxy"]
+        red_tracker.last = Track(((x1 + x2) / 2, (y1 + y2) / 2), tuple(inst[0]["xyxy"]),
                                  int((x2 - x1) * (y2 - y1)), False, time.time())
         return red_tracker.track(rgb, T_base_cam)
     tr = red_tracker.track(rgb, None)   # full-frame strict mask
@@ -368,58 +303,24 @@ def find_green(rgb, T_base_cam=None):
     return green_tracker.track(rgb, T_base_cam)
 
 
-def _track_from_box(rgb, xyxy, t):
-    x1, y1, x2, y2 = xyxy
-    clipped = x1 <= 1 or y1 <= 1 or x2 >= rgb.shape[1] - 2 or y2 >= rgb.shape[0] - 2
-    return Track(((x1 + x2) / 2.0, (y1 + y2) / 2.0), tuple(xyxy),
-                 int((x2 - x1) * (y2 - y1)), clipped, t)
-
-
 def find_labels(rgb, label, max_age=4.0):
-    """EVERY current instance of a label, as Tracks. The map needs all of them;
-    find_label() picks the single best one for the approach code."""
-    label = str(label).strip().lower()
-    with lock:
-        inst = list(yolo_latest["dets"].get(label, ()))
-        t = yolo_latest["t"]
-    if not inst or time.time() - t > max_age:
-        return []
-    return [_track_from_box(rgb, e["xyxy"], t) for e in inst]
+    """EVERY current instance of a label, as Tracks."""
+    return DETECT.find_all(rgb, label, max_age)
 
 
 def find_label(rgb, label, T_base_cam=None):
-    """Generic YOLO-driven finder for any query label.
+    """Generic finder for any query label.
 
-    Falls back to the legacy colour trackers for 'red cube' / 'green cube' because
-    those trackers are tighter during close approach than a 2.5 Hz YOLO refresh.
-
-    For everything else: track it FRAME-TO-FRAME with PixelTracker instead of
-    just handing back whatever YOLO last reported. YOLO only refreshes every
-    ~2.5 s, so returning its cached box unmoved made the FPV box look frozen,
-    then jump — this runs a real CamShift step on THIS frame every call, so the
-    box actually follows the object between YOLO confirmations.
+    The two cube colours keep their dedicated HSV+anchor trackers, which are tighter
+    during close approach than the detector's refresh rate. Everything else is tracked
+    frame-to-frame by the service.
     """
     label = str(label).strip().lower()
-    # legacy colour trackers for the original cube colours
     if label == "red cube":
         return find_red(rgb, T_base_cam)
     if label == "green cube":
         return find_green(rgb, T_base_cam)
-
-    pt = label_trackers.get(label)
-    if pt is not None:
-        tr = pt.track(rgb)
-        if tr is not None:
-            return tr
-    # no live pixel track (never tagged, or lost) — fall back to the raw cached
-    # YOLO box, and bootstrap a tracker from it so the NEXT call is already smooth
-    # instead of waiting up to 2.5 s for yolo_worker's next cycle to seed one.
-    tracks = find_labels(rgb, label)
-    if not tracks:
-        return None
-    tr = tracks[0]
-    label_trackers.setdefault(label, PixelTracker(label)).tag(rgb, tr.bbox_xyxy)
-    return tr
+    return DETECT.find(rgb, label)
 
 
 # ---------------- robot I/O ----------------
@@ -493,8 +394,8 @@ def publish(rgb, joints=None):
     # detected at high confidence and still show NO BOX - which looks exactly like
     # "the detector cannot see it". Draw whatever the detector currently reports.
     with lock:
-        dets = dict(yolo_latest["dets"])
-        d_age = time.time() - yolo_latest["t"]
+        dets = dict(DETECT.latest.dets)
+        d_age = time.time() - DETECT.latest.t
     if d_age < 4.0:
         # One physical object often matches SEVERAL words in the query - a pen fires
         # as both "pen" and "knife" - and drawing each one stacks unreadable labels
@@ -509,7 +410,7 @@ def publish(rgb, joints=None):
         flat.sort(key=lambda t: -t[0])
         kept = []
         for conf, lbl, box in flat:
-            if all(_box_iou(box, k[2]) < 0.45 for k in kept):
+            if all(box_iou(box, k[2]) < 0.45 for k in kept):
                 kept.append((conf, lbl, box))
         for conf, lbl, box in kept:
             # Prefer the LIVE PIXEL-TRACKED box over the raw YOLO cache: the cache
@@ -517,7 +418,7 @@ def publish(rgb, joints=None):
             # is what made the overlay look frozen-then-jumping as the arm moved.
             # publish() only READS pt.last here, never calls track() itself - the
             # control loop (find_label) is what steps CamShift each tick.
-            pt = label_trackers.get(lbl)
+            pt = DETECT.trackers.get(lbl)
             tracked = pt.last if (pt is not None and pt.last is not None
                                   and now - pt.last.t < 0.5) else None
             x1, y1, x2, y2 = (int(v) for v in (tracked.bbox_xyxy if tracked else box))
@@ -1219,19 +1120,13 @@ def world2d_snapshot():
 def _apply_query_now(q, timeout=6.0):
     """Switch the detector vocabulary and WAIT for it to take effect.
 
-    The model may only be mutated on the thread that runs it (set_classes from
-    Flask crashes it), so the change goes through pending_query and the YOLO
-    worker picks it up on its ~2.5 s cycle. Scanning before that lands would sweep
-    the whole table with the OLD vocabulary and find nothing.
+    The model may only be mutated on the thread that runs it (calling into it from
+    Flask crashes the process), so the change is queued and the detector thread picks
+    it up on its next cycle. Scanning before that lands would sweep the whole table
+    with the OLD vocabulary and find nothing.
     """
-    pending_query[0] = q
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        with lock:
-            if (state.get("query") or "") == q:
-                time.sleep(0.4)          # let one frame run through the new classes
-                return True
-        time.sleep(0.15)
+    if DETECT.wait_for_query(q, timeout):
+        return True
     say(f"scan: detector did not switch vocabulary within {timeout:.0f}s")
     return False
 
@@ -3086,7 +2981,7 @@ def guest_query():
         return jsonify(ok=False, reason="not one of the choices")
     if detector is None:
         return jsonify(ok=False, reason="detector not ready")
-    pending_query[0] = want            # applied by the YOLO thread within ~2.5 s
+    DETECT.request_query(want)         # applied by the detector thread
     with lock:
         state["query"] = want
     return jsonify(ok=True, query=want)
@@ -3860,7 +3755,7 @@ def setquery():
     q = (request.args.get("q") or "").strip()
     if not q or detector is None:
         return jsonify(ok=False, reason="empty query or detector not ready")
-    pending_query[0] = q        # applied by the YOLO thread within ~2.5 s
+    DETECT.request_query(q)     # applied by the detector thread
     with lock:
         state["query"] = q
     return jsonify(ok=True, query=q)
@@ -4620,7 +4515,11 @@ def merge_radius_watch():
 
 
 def idle_view():
-    while True:
+    """Keep the FPV and the map warm while nothing else is driving.
+
+    Bails out on `shutting_down` so it is not mid-read when the camera is released.
+    """
+    while not shutting_down.is_set():
         with lock:
             busy = state["running"]
         with jog_held_lock:
@@ -4756,6 +4655,10 @@ def rerun_thread():
 
 
 _shut = [False]
+# Set first thing in _shutdown so the frame-grabbing threads stop touching the camera
+# BEFORE it is disconnected. Without this they keep calling into a device that is being
+# torn down, which is what leaves it booted-with-no-owner and needing a USB re-plug.
+shutting_down = threading.Event()
 
 
 def _shutdown(why=""):
@@ -4775,9 +4678,15 @@ def _shutdown(why=""):
     _shut[0] = True
     print(f"shutting down ({why}) — releasing camera and bus", flush=True)
     try:
+        shutting_down.set()
         stop_flag.set()
+        if DETECT is not None:
+            DETECT.stop()
     except Exception:
         pass
+    # Let the frame grabbers notice and fall out of their loops. Disconnecting the
+    # camera underneath a thread still reading from it is what wedges the device.
+    time.sleep(0.6)
     # Robot first: its disconnect owns the camera it was given, so releasing the camera
     # out from under it leaves the robot reporting "not connected" and skipping its own
     # bus teardown. The camera call after it is belt-and-braces for the case where the
@@ -4817,7 +4726,7 @@ def _install_shutdown_handlers():
 
 
 def main():
-    global robot, kin, fx, fy, cx0, cy0, detector, cam
+    global robot, kin, fx, fy, cx0, cy0, detector, cam, DETECT
     clear_gripper_overload()
     say("connecting robot + camera…")
     # The gripper servo (ID 6) answers intermittently — a marginal cable. Retry
@@ -4923,7 +4832,18 @@ def main():
     detector.set_query(_q0)
     with lock:
         state["query"] = _q0
-    threading.Thread(target=yolo_worker, daemon=True).start()
+    # The detection loop, query handling, NMS and the per-label trackers all live in
+    # the service now. It reports the query back into `state` so /status is unchanged.
+    DETECT = DetectorService(
+        detector,
+        frame_source=lambda: latest_rgb[0],
+        config=DETECT_CFG,
+        colour_ok=_colour_ok,
+        log=say,
+        on_query_change=lambda q: state.update(query=q),
+    )
+    DETECT.query = _q0
+    DETECT.start()
     threading.Thread(target=idle_view, daemon=True).start()
     threading.Thread(target=jog_loop, daemon=True).start()
     threading.Thread(target=idle_relax_watch, daemon=True).start()
