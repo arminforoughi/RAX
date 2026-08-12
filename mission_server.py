@@ -110,6 +110,8 @@ from mobility.slam.object_map import (
 from manipulation.approach import ApproachConfig, approach_target, shift_right
 from manipulation.approach.derive import (
     align_tolerance_px, grasp_height, hover_height, right_trim_for_visibility)
+from perception.selfcal import (
+    LocalizationSample, apply_to_config, diagnose, fit_localization)
 from manipulation.approach.visual_center import center_on_object
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
@@ -3970,6 +3972,142 @@ def setbearing():
     deg = CFG.set_knob("bearing_deg", deg)
     say(f"map bearing offset set to {deg:.1f}deg — clear the 2D map and re-scan to see it")
     return jsonify(ok=True, deg=deg)
+
+
+# ---------------- self-calibration: measure the localization error instead of dialling it ----------------
+# push_out / range_scale / bearing were dials someone turned until grasps stopped
+# missing. They can be solved instead: the arm's OWN forward kinematics is ground
+# truth, so observing an object from a normal viewing distance and then TOUCHING it
+# gives a (camera said, arm found) pair with no ruler and no guessing. A few pairs
+# across the workspace and perception/selfcal.py fits push_out/range_scale/bearing
+# directly — and refuses to apply a fit when the residual has a known bad-geometry
+# signature (like the axial-depth bias) that a linear correction cannot actually fix.
+#
+# Two-step, operator-in-the-loop, because autonomous grasp is not yet proven on this
+# rig and this needs no grasp at all:
+#   1. POST /selfcal/observe   — from wherever the arm is now, look at the object and
+#                                 record where the CAMERA says it is.
+#   2. jog the fingertip down until it touches the object (by hand, via /jogpress /
+#      /jogvec — whatever is already on screen)
+#   3. POST /selfcal/touch     — record where the ARM says it is (FK, ground truth).
+# Repeat at a few positions across the workspace — different ranges AND bearings, or
+# the fit cannot separate the effects (see the "cannot be separated" warning). Then:
+#   POST /selfcal/fit    — see the numbers without changing anything
+#   POST /selfcal/apply  — write them to CFG, but only if the fit is trustworthy
+_selfcal = {"pending": None, "samples": []}
+
+
+def _selfcal_off_axis_deg(uv):
+    """Angle between a pixel's ray and the camera's own view direction."""
+    d = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
+    return float(math.degrees(math.acos(np.clip(1.0 / np.linalg.norm(d), -1.0, 1.0))))
+
+
+@app.route("/selfcal/reset", methods=["POST"])
+def selfcal_reset():
+    _selfcal["pending"] = None
+    _selfcal["samples"] = []
+    say("selfcal: buffer cleared")
+    return jsonify(ok=True)
+
+
+@app.route("/selfcal/observe", methods=["POST"])
+def selfcal_observe():
+    """Step 1: from here, where does the CAMERA say the object is?
+
+    Uses the same localizer the map uses, so the calibration measures the error the
+    map actually has — not a different, idealized one.
+    """
+    label = request.args.get("label") or (_query_labels() or ["red cube"])[0]
+    finder, _tracker, lbl = _target_finder(label)
+    q, rgb, _ = observe()
+    T = T_cam_of(q)
+    tr = finder(rgb, T)
+    if tr is None:
+        return jsonify(ok=False, reason=f"'{lbl}' not visible from here — move to where "
+                                        f"the camera can see it, then try again")
+    xy, rng, _size = obj_xy_2d(tr.bbox_xyxy, T, label=lbl)
+    if xy is None:
+        return jsonify(ok=False, reason="localization failed from this pose (range or "
+                                        "geometry out of bounds) — try a different pose")
+    u = (tr.bbox_xyxy[0] + tr.bbox_xyxy[2]) / 2.0
+    v = (tr.bbox_xyxy[1] + tr.bbox_xyxy[3]) / 2.0
+    off_axis = _selfcal_off_axis_deg((u, v))
+    _selfcal["pending"] = {"label": lbl, "xy_observed": [float(xy[0]), float(xy[1])],
+                           "range_m": float(rng), "off_axis_deg": off_axis, "t": time.time()}
+    say(f"selfcal: observed '{lbl}' at r={rng*100:.1f}cm, {off_axis:.0f}deg off-axis — "
+        f"now jog the tip down to TOUCH it, then press Mark True")
+    return jsonify(ok=True, observed=_selfcal["pending"])
+
+
+@app.route("/selfcal/touch", methods=["POST"])
+def selfcal_touch():
+    """Step 2: now the fingertip is ON the object. Where does the ARM say it is?"""
+    p = _selfcal["pending"]
+    if p is None:
+        return jsonify(ok=False, reason="no pending observation — POST /selfcal/observe "
+                                        "first, from a normal viewing distance")
+    tip = _tip(observe()[0])
+    sample = {"label": p["label"], "xy_true": [float(tip[0]), float(tip[1])],
+             "xy_observed": p["xy_observed"], "off_axis_deg": p["off_axis_deg"],
+             "range_m": p["range_m"]}
+    _selfcal["samples"].append(sample)
+    _selfcal["pending"] = None
+    r_true = math.hypot(*sample["xy_true"])
+    r_obs = math.hypot(*sample["xy_observed"])
+    say(f"selfcal: sample #{len(_selfcal['samples'])} — camera said r={r_obs*100:.1f}cm, "
+        f"arm found r={r_true*100:.1f}cm  (off by {(r_true-r_obs)*100:+.1f}cm)")
+    return jsonify(ok=True, n=len(_selfcal["samples"]), sample=sample)
+
+
+def _selfcal_load_samples():
+    return [LocalizationSample(np.array(s["xy_true"]), np.array(s["xy_observed"]),
+                               s["off_axis_deg"]) for s in _selfcal["samples"]]
+
+
+@app.route("/selfcal/status")
+def selfcal_status():
+    return jsonify(ok=True, n=len(_selfcal["samples"]), pending=_selfcal["pending"] is not None,
+                   samples=_selfcal["samples"])
+
+
+@app.route("/selfcal/fit", methods=["POST"])
+def selfcal_fit():
+    """Report what the samples imply, WITHOUT changing anything."""
+    samples = _selfcal_load_samples()
+    if len(samples) < 6:
+        return jsonify(ok=False, reason=f"only {len(samples)} samples (need 6+, spread "
+                                        f"across both range and bearing)")
+    fit = fit_localization(samples)
+    for line in fit.summary().split("\n"):
+        say(f"selfcal: {line}")
+    return jsonify(ok=True, trustworthy=fit.trustworthy, n=fit.n,
+                   model={"range_scale": fit.model.range_scale,
+                         "push_out_cm": round(fit.model.push_out_m * 100, 2),
+                         "bearing_deg": round(fit.model.bearing_offset_deg, 2)},
+                   rms_before_mm=round(fit.rms_before_m * 1000, 1),
+                   rms_after_mm=round(fit.rms_after_m * 1000, 1),
+                   warnings=fit.warnings, diagnosis=diagnose(samples))
+
+
+@app.route("/selfcal/apply", methods=["POST"])
+def selfcal_apply():
+    """Write the fitted model to CFG's live knobs. Refuses an untrustworthy fit
+    unless ?force=1 — installing numbers that do not describe the rig is exactly
+    how the dial-turning this replaces got started."""
+    samples = _selfcal_load_samples()
+    if len(samples) < 6:
+        return jsonify(ok=False, reason=f"only {len(samples)} samples (need 6+)")
+    fit = fit_localization(samples)
+    force = request.args.get("force") == "1"
+    applied = apply_to_config(fit, CFG, force=force)
+    if applied:
+        say(f"selfcal APPLIED: {fit.model.describe()}")
+    else:
+        say(f"selfcal: NOT applied ({'; '.join(fit.warnings) or 'fit not trustworthy'}) "
+            f"— pass ?force=1 to override")
+    return jsonify(ok=applied, applied=applied, trustworthy=fit.trustworthy,
+                   tune=CFG.as_dict(), warnings=fit.warnings)
 
 
 @app.route("/relocate", methods=["POST"])
