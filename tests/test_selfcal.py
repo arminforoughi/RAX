@@ -22,9 +22,14 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from manipulation.approach import ApproachConfig  # noqa: E402
-from perception.selfcal import (  # noqa: E402
-    LocalizationModel, LocalizationSample, apply_to_config, diagnose, fit_localization)
+from rax.manipulation.approach import ApproachConfig  # noqa: E402
+from rax.perception.selfcal import (  # noqa: E402
+    LocalizationModel,
+    LocalizationSample,
+    apply_to_config,
+    diagnose,
+    fit_localization,
+)
 
 
 def _grid(radii=(0.16, 0.22, 0.28, 0.34, 0.40), bearings=(-40, -20, 0, 20, 40)):

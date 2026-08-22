@@ -22,10 +22,13 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from manipulation.arms.ik_strategy import make_ik  # noqa: E402
-from manipulation.arms.workspace import (  # noqa: E402
-    ReachResult, WorkspaceMap, analyze_workspace, default_grid)
-from robots.profiles import load_profile  # noqa: E402
+from rax.manipulation.arms.ik_strategy import make_ik  # noqa: E402
+from rax.manipulation.arms.workspace import (  # noqa: E402
+    WorkspaceMap,
+    analyze_workspace,
+    default_grid,
+)
+from rax.robots.profiles import load_profile  # noqa: E402
 
 #: What a human measured on this arm and typed into a comment, pitch -> reach in cm.
 HAND_MEASURED = {90: 30.8, 70: 36.4, 60: 39.8, 50: 42.7,

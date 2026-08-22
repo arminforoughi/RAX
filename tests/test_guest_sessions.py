@@ -20,7 +20,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from common.guest_sessions import GuestConfig, GuestSessions  # noqa: E402
+from rax.common.guest_sessions import GuestConfig, GuestSessions  # noqa: E402
 
 
 class Clock:

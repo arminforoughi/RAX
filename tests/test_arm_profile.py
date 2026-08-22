@@ -21,9 +21,9 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from common.mission_state import DEFAULT_STATE, Abort, MissionState  # noqa: E402
-from robots.profiles import ArmProfile, load_profile  # noqa: E402
-from robots.profiles.urdf_limits import joint_limits_deg, read_urdf_limits  # noqa: E402
+from rax.common.mission_state import DEFAULT_STATE, Abort, MissionState  # noqa: E402
+from rax.robots.profiles import ArmProfile, load_profile  # noqa: E402
+from rax.robots.profiles.urdf_limits import joint_limits_deg, read_urdf_limits  # noqa: E402
 
 # The values the monolith hardcoded, repeated here so the test fails if either side
 # drifts. stack_mission2.py:4661 for the limits, :4670 for the joint roles.
@@ -68,10 +68,18 @@ def test_so101_topology_matches_the_hardcoded_ik():
 
 def test_so101_named_poses_and_gripper():
     p = load_profile("so101")
+    # The original tuned fold-home. It was briefly raised to 13.2 on 2026-08-16 to make
+    # the idle pose "look higher", but that was judged against a wrist frame still 45 deg
+    # out of calibration; once the frame was corrected, 13.2 pointed the camera at the
+    # room and left the idle 2D map empty. 33.2 (pitch 24.9) is the table-viewing pose.
     assert p.home_deg == (-14.1, -99.1, 90.8, 33.2, -4.7)
     assert p.view_deg == (5.0, 37.1, 48.1, -40.4, 90.0)
-    # SURVEY_TILT was HOME[1:] — the wrist pose held while surveying.
-    assert p.survey_tilt_deg == p.home_deg[1:]
+    # SURVEY_TILT is pinned to its own constant rather than derived from HOME[1:].
+    # It currently EQUALS home's tilt, and that is the correct value -- but the two are
+    # deliberately separate declarations, because deriving one from the other couples a
+    # cosmetic idle-pose preference to the sightline geometry every range estimate
+    # depends on. Changing home must not silently move where the survey localizes from.
+    assert p.survey_tilt_deg == (-99.1, 90.8, 33.2, -4.7)
     assert p.gripper.hand_uv == (440.0, 394.0)
     assert p.camera.eye_in_hand
     assert p.camera.use_depth is False, "the pick stack runs monocular"

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraspGPT - How It Works</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0f13; color: #e0e6ed;
+    font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+    min-height: 100vh;
+  }
+  header {
+    background: #11181f; border-bottom: 1px solid #1f2a33;
+    padding: 14px 24px; display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { font-size: 18px; color: #fff; letter-spacing: 0.8px; }
+  header a {
+    margin-left: auto; color: #64b5f6; text-decoration: none; font-size: 13px;
+    border: 1px solid #2a4a6a; padding: 6px 12px; border-radius: 6px;
+  }
+  header a:hover { background: #1a2d3d; }
+  main { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h2 {
+    font-size: 26px; margin-bottom: 10px; color: #f0f4f8;
+  }
+  .subtitle { color: #94a3b8; margin-bottom: 36px; font-size: 16px; }
+  .diagram {
+    background: #0f141a; border: 1px solid #1f2a33; border-radius: 12px;
+    padding: 24px; margin-bottom: 36px; overflow-x: auto;
+  }
+  .flow {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-family: 'Fira Code', monospace; font-size: 13px;
+  }
+  .node {
+    background: #15202b; border: 1px solid #2b3d4f; border-radius: 8px;
+    padding: 12px 16px; color: #e0e6ed; min-width: 100px; text-align: center;
+  }
+  .node.user     { border-color: #4caf50; color: #4caf50; }
+  .node.band     { border-color: #f06292; color: #f06292; }
+  .node.planner  { border-color: #64b5f6; color: #64b5f6; }
+  .node.memory   { border-color: #ba68c8; color: #ba68c8; }
+  .node.learner  { border-color: #4dd0e1; color: #4dd0e1; }
+  .node.pioneer  { border-color: #aed581; color: #aed581; }
+  .node.robot    { border-color: #4dd0e1; color: #4dd0e1; }
+  .node.critic   { border-color: #ff9800; color: #ff9800; }
+  .arrow { color: #64748b; font-size: 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .card {
+    background: #0f141a; border: 1px solid #1f2a33; border-radius: 12px;
+    padding: 22px;
+  }
+  .card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .logo {
+    width: 36px; height: 36px; border-radius: 8px; display: flex;
+    align-items: center; justify-content: center; font-weight: 800; color: #fff;
+  }
+  .band    { background: #f06292; }
+  .actian  { background: #ba68c8; }
+  .pioneer { background: #aed581; }
+  .card h3 { font-size: 18px; }
+  .card p { color: #94a3b8; font-size: 14px; line-height: 1.5; margin-top: 8px; }
+  .card ul { margin: 10px 0 0 18px; color: #cbd5e1; font-size: 14px; line-height: 1.6; }
+  .legend {
+    margin-top: 36px; padding-top: 24px; border-top: 1px solid #1f2a33;
+    color: #64748b; font-size: 13px; line-height: 1.7;
+  }
+  .legend code {
+    background: #15202b; padding: 2px 6px; border-radius: 4px; color: #4dd0e1;
+    font-family: 'Fira Code', monospace;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>GraspGPT</h1>
+  <a href="/">Back to Mission Control</a>
+</header>
+<main>
+  <h2>How the agents learn</h2>
+  <p class="subtitle">
+    Every pick is a loop: perceive, recall, predict, execute, observe, remember, improve.
+  </p>
+
+  <div class="diagram">
+    <div class="flow">
+      <div class="node user">You</div>
+      <div class="arrow">→</div>
+      <div class="node planner">Band Planner</div>
+      <div class="arrow">→</div>
+      <div class="node memory">Actian Memory</div>
+      <div class="arrow">→</div>
+      <div class="node pioneer">Pioneer Learner</div>
+      <div class="arrow">→</div>
+      <div class="node robot">Robot Arm</div>
+      <div class="arrow">→</div>
+      <div class="node critic">Band Critic</div>
+      <div class="arrow">→</div>
+      <div class="node memory">Remember</div>
+      <div class="arrow">→</div>
+      <div class="node pioneer">Fine-tune</div>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-header">
+        <div class="logo band">B</div>
+        <h3>Band AI — Agent Team</h3>
+      </div>
+      <p>Band gives the robot a persistent identity and a shared room where multiple agents collaborate:</p>
+      <ul>
+        <li><strong>Planner</strong> breaks the task into steps.</li>
+        <li><strong>Executor</strong> calls the robot.</li>
+        <li><strong>Critic</strong> judges success or failure.</li>
+        <li><strong>Memory</strong> and <strong>Learner</strong> update knowledge.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="logo actian">A</div>
+        <h3>Actian VectorAI DB — Memory</h3>
+      </div>
+      <p>Every attempt is embedded and stored as a vector:</p>
+      <ul>
+        <li>Task text → semantic embedding.</li>
+        <li>Params used → grasp configuration.</li>
+        <li>Outcome → success or failure.</li>
+      </ul>
+      <p>Before a new pick, the agent searches similar past episodes and starts from what worked.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="logo pioneer">P</div>
+        <h3>Pioneer AI — Self-Improvement</h3>
+      </div>
+      <p>Pioneer runs the specialist model that picks grasp parameters:</p>
+      <ul>
+        <li>Inference returns JSON params (aim offset, approach steps, trim, pitch).</li>
+        <li>Failed attempts become training examples.</li>
+        <li>A Pioneer fine-tune job retrains the specialist on the robot's own data.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="legend">
+    <strong>Files you can point to:</strong><br>
+    <code>agent.py</code> runs the self-learning loop.<br>
+    <code>memory.py</code> talks to Actian (or local JSONL fallback).<br>
+    <code>learner.py</code> calls Pioneer and collects training data.<br>
+    <code>self_learn_server.py</code> serves the UI and proxies the robot.<br>
+    <code>robot_view.html</code> shows only the camera + 3D model.<br>
+    <code>how_it_works.html</code> is this page.
+  </div>
+</main>
+</body>
+</html>

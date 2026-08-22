@@ -21,7 +21,7 @@ opposite ends of every choice: `so101.py` is a parallel-pitch arm with a wrist c
 `mock.py` is a generic 6-DOF arm with a fixed overhead camera and no URDF at all.
 
 ```python
-from robots.profiles import ArmProfile, CameraProfile, GripperProfile
+from rax.robots.profiles import ArmProfile, CameraProfile, GripperProfile
 
 PROFILE = ArmProfile(
     name="my_arm",
@@ -199,7 +199,7 @@ both behaviours.
 | Approach tunables, staging, centring | `manipulation/approach/` |
 | HTTP server, UI, guest sessions | `stack_mission2.py` |
 
-Each package's `__init__.py` lists its public surface, so `from perception import
+Each package's `__init__.py` lists its public surface, so `from rax.perception import
 CameraGeometry, ObjectMeasurer` and similar work directly.
 
 ### What deliberately stays in the server

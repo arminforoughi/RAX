@@ -1,0 +1,7 @@
+{
+  "_comment": "Hand-eye transform, refitted by rax.perception.handeye from the arm's own motion. This file is a MEASUREMENT OF ONE ROBOT: copying another rig's values is how an arm confidently misses by centimetres. Delete it and re-run the calibration on your own hardware.",
+  "T_ee_cam": "0.0400,0.0000,0.0700,0.0000,-0.5000,0.0000",
+  "fitted_by": "fit_reprojection",
+  "rms_px": 1.8,
+  "samples": 14
+}

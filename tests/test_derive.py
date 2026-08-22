@@ -21,12 +21,21 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from manipulation.approach.derive import (  # noqa: E402
-    align_tolerance_px, apparent_width_px, grasp_height, horizontal_fov_deg,
-    hover_height, right_trim_for_visibility)
-from mobility.slam.object_map import ObjectMap  # noqa: E402
-from perception.camera_geometry import (  # noqa: E402
-    CameraGeometry, FixedCamera, intrinsics_from_dict, parse_tf)
+from rax.manipulation.approach.derive import (  # noqa: E402
+    align_tolerance_px,
+    apparent_width_px,
+    grasp_height,
+    horizontal_fov_deg,
+    hover_height,
+    right_trim_for_visibility,
+)
+from rax.mobility.slam.object_map import ObjectMap  # noqa: E402
+from rax.perception.camera_geometry import (  # noqa: E402
+    CameraGeometry,
+    FixedCamera,
+    intrinsics_from_dict,
+    parse_tf,
+)
 
 CUBE_H = 0.0508          # the 5 cm cube every constant was tuned on
 HAND_GRASP_Z = 0.015     # PICK_GRASP_Z

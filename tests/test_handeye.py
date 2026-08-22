@@ -26,11 +26,20 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from perception.camera_geometry import (  # noqa: E402
-    CameraGeometry, EyeInHand, intrinsics_from_dict, parse_tf)
-from perception.handeye import (  # noqa: E402
-    HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye,
-    tf_string)
+from rax.perception.camera_geometry import (  # noqa: E402
+    CameraGeometry,
+    EyeInHand,
+    intrinsics_from_dict,
+    parse_tf,
+)
+from rax.perception.handeye import (  # noqa: E402
+    HandEyeSample,
+    fit_consistency,
+    fit_reprojection,
+    load_hand_eye,
+    save_hand_eye,
+    tf_string,
+)
 
 #: The transform the tests must recover. Realistic for a camera bolted behind the jaws.
 T_TRUE = parse_tf("-0.0503,0.0906,-0.1730,-0.2921,1.0770,-2.1688")
@@ -41,7 +50,7 @@ HOME = np.array([-14.1, -99.1, 90.8, 33.2, -4.7])
 def _kin():
     from lerobot.model.kinematics import RobotKinematics
 
-    from robots.profiles import load_profile
+    from rax.robots.profiles import load_profile
 
     p = load_profile("so101")
     return RobotKinematics(p.urdf_path, p.ee_frame, list(p.joint_names))

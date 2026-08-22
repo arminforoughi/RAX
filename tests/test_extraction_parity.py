@@ -54,11 +54,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -81,10 +81,25 @@ EE_FRAME = "gripper_frame_link"
 ARM_MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 
 
+#: The monolith these goldens were extracted from now lives with the other demos.
+MISSION_SERVER_DIR = REPO / "examples" / "mission_server"
+
+
 def _load_module():
-    """Import ``stack_mission2`` and pin every global the pure functions read."""
-    import mission_server as S
-    from lerobot.model.kinematics import RobotKinematics
+    """Import ``mission_server`` and pin every global the pure functions read.
+
+    Skips rather than fails when the demo server will not import. It depends on a
+    lerobot checkout that only the original hardware machine has, and a contributor
+    with no SO-101 should still be able to run the suite — the packages this pins
+    against are covered by the other tests, which need nothing but numpy.
+    """
+    if str(MISSION_SERVER_DIR) not in sys.path:
+        sys.path.insert(0, str(MISSION_SERVER_DIR))
+    try:
+        import mission_server as S
+        from lerobot.model.kinematics import RobotKinematics
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"the reference monolith needs a lerobot checkout: {exc}")
 
     S.kin = RobotKinematics(str(URDF), EE_FRAME, ARM_MOTORS)
     S.fx, S.fy, S.cx0, S.cy0 = FX, FY, CX, CY
@@ -444,8 +459,8 @@ def test_pose_ik_branch_runs():
 
     from lerobot.model.kinematics import RobotKinematics
 
-    from manipulation.arms.ik_strategy import PoseIK, make_ik
-    from robots.profiles import load_profile
+    from rax.manipulation.arms.ik_strategy import PoseIK, make_ik
+    from rax.robots.profiles import load_profile
 
     p = load_profile("so101")
     kin = RobotKinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
@@ -468,7 +483,7 @@ def test_pose_ik_branch_runs():
 def test_fixed_camera_pose_is_supported():
     """The geometry must serve a world-mounted camera too, not just eye-in-hand —
     with tip_pixel correctly reporting that it has no answer for that rig."""
-    from perception.camera_geometry import CameraGeometry, FixedCamera, intrinsics_from_dict
+    from rax.perception.camera_geometry import CameraGeometry, FixedCamera, intrinsics_from_dict
 
     T = np.eye(4)
     T[:3, 3] = [0.0, 0.0, 0.60]           # 60 cm above the base, looking down

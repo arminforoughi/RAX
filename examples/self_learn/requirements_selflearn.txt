@@ -1,0 +1,12 @@
+# Core deps already present in the RAX environment:
+# flask, requests, numpy, opencv-python
+
+# Sponsor SDKs
+actian-vectorai-client
+band-sdk[langgraph]
+
+# Embeddings (fallback to deterministic hash if unavailable)
+sentence-transformers
+
+# Pioneer is used via REST/OpenAI-compatible endpoint, so no extra SDK needed.
+# Band SDK is optional; the agent falls back to local event logging if not installed.

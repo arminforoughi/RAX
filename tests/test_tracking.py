@@ -21,11 +21,15 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from models.detection.tracking import AnchorTracker, PixelTracker  # noqa: E402
-from perception.camera_geometry import (  # noqa: E402
-    CameraGeometry, FixedCamera, intrinsics_from_dict, parse_tf)
-from perception.measure import ObjectMeasurer, classify_shape, silhouette_mask  # noqa: E402
-from perception.object_priors import PRIORS  # noqa: E402
+from rax.models.detection.tracking import AnchorTracker, PixelTracker  # noqa: E402
+from rax.perception.camera_geometry import (  # noqa: E402
+    CameraGeometry,
+    FixedCamera,
+    intrinsics_from_dict,
+    parse_tf,
+)
+from rax.perception.measure import ObjectMeasurer, classify_shape, silhouette_mask  # noqa: E402
+from rax.perception.object_priors import PRIORS  # noqa: E402
 
 TABLE_BGR = (160, 140, 110)     # a wood-ish table, in RGB order as the code sees it
 

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAX Robot View</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: #000; color: #e0e6ed;
+    font-family: ui-monospace, monospace;
+    height: 100vh; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  #cam-panel {
+    flex: 1; position: relative; background: #05080a;
+    display: flex; align-items: center; justify-content: center;
+    border-bottom: 1px solid #1f2a33;
+    min-height: 0;
+  }
+  #cam-feed {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain; display: block;
+  }
+  #cam-label {
+    position: absolute; top: 8px; left: 10px;
+    background: rgba(0,0,0,0.6); color: #888;
+    padding: 3px 8px; border-radius: 4px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  #viz-panel {
+    flex: 1; position: relative; background: #0b0f14;
+    min-height: 0;
+  }
+  #v3d {
+    width: 100%; height: 100%; display: block;
+  }
+  #viz-label {
+    position: absolute; top: 8px; left: 10px;
+    background: rgba(0,0,0,0.6); color: #888;
+    padding: 3px 8px; border-radius: 4px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+</style>
+</head>
+<body>
+  <div id="cam-panel">
+    <span id="cam-label">robot eye</span>
+    <img id="cam-feed" src="/stream" alt="robot camera">
+  </div>
+  <div id="viz-panel">
+    <span id="viz-label">robot + object 3d</span>
+    <canvas id="v3d"></canvas>
+  </div>
+
+<script>
+// 3D viewer adapted from stack_mission2.py UI
+(function(){
+  const cv = document.getElementById('v3d');
+  const ctx = cv.getContext('2d');
+  let az = 0.0, el = 0.62, geom = {links:[], ee:null, obj:null};
+  const YAW = 0.246, YC = Math.cos(YAW), YS = Math.sin(YAW);
+  function yz(p){ return [p[0]*YC - p[1]*YS, p[0]*YS + p[1]*YC, p[2]]; }
+  function resize(){
+    const r = cv.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(r.width * dpr);
+    cv.height = Math.round(r.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  let mesh = null;
+  fetch('/urdf').then(r => r.json()).then(d => {
+    mesh = (d.links || []).map(L => ({name: L.name, v: Float32Array.from(L.v), f: Int32Array.from(L.f)}));
+    if (!mesh.length) mesh = null;
+    draw();
+  }).catch(() => { mesh = null; });
+
+  const LINKCOL = {
+    base_link: [122,134,152], shoulder_link: [100,140,200],
+    upper_arm_link: [120,160,215], lower_arm_link: [100,140,200],
+    wrist_link: [130,170,220], gripper_link: [190,200,214],
+    moving_jaw_so101_v1_link: [225,232,241]
+  };
+
+  function proj(p){
+    const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+    const rx = -p[0]*sa + p[1]*ca;
+    const dep = p[0]*ca + p[1]*sa;
+    const uy = p[2]*ce - dep*se;
+    const W = cv.clientWidth, H = cv.clientHeight, s = Math.min(W, H) / 0.60;
+    return [W*0.5 + s*rx, H*0.62 - s*uy, dep*ce + p[2]*se];
+  }
+  function line(a, b, col, w){
+    const p = proj(a), q = proj(b);
+    ctx.strokeStyle = col; ctx.lineWidth = w || 1;
+    ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+  }
+  function drawMeshes(){
+    const xf = geom.xf || {};
+    const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+    const vd0x = ca*ce, vd0y = sa*ce;
+    const vdx = vd0x*YC - vd0y*YS, vdy = vd0x*YS + vd0y*YC, vdz = se;
+    const tris = [];
+    for (const L of mesh){
+      const T = xf[L.name]; if (!T) continue;
+      const nv = L.v.length / 3;
+      const sx = new Float64Array(nv), sy = new Float64Array(nv), sd = new Float64Array(nv);
+      const bx = new Float64Array(nv), by = new Float64Array(nv), bz = new Float64Array(nv);
+      for (let i = 0; i < nv; i++){
+        const x = L.v[3*i], y = L.v[3*i+1], z = L.v[3*i+2];
+        const X0 = T[0]*x + T[1]*y + T[2]*z + T[3];
+        const Y0 = T[4]*x + T[5]*y + T[6]*z + T[7];
+        const Z = T[8]*x + T[9]*y + T[10]*z + T[11];
+        const X = X0*YC - Y0*YS, Y = X0*YS + Y0*YC;
+        bx[i] = X; by[i] = Y; bz[i] = Z;
+        const s = proj([X, Y, Z]); sx[i] = s[0]; sy[i] = s[1]; sd[i] = s[2];
+      }
+      const c = LINKCOL[L.name] || [140,160,190];
+      for (let t = 0; t < L.f.length; t += 3){
+        const a = L.f[t], b = L.f[t+1], q = L.f[t+2];
+        const ux = bx[b]-bx[a], uy2 = by[b]-by[a], uz = bz[b]-bz[a];
+        const vx = bx[q]-bx[a], vy = by[q]-by[a], vz = bz[q]-bz[a];
+        let nx = uy2*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy2*vx;
+        const nl = Math.hypot(nx, ny, nz) || 1;
+        nx /= nl; ny /= nl; nz /= nl;
+        if (nx*vdx + ny*vdy + nz*vdz >= 0) continue;
+        const lam = Math.max(0.34, Math.min(1, 0.42 + 0.58*(0.35*nx - 0.45*ny + 0.82*nz)));
+        tris.push([(sd[a]+sd[b]+sd[q])/3, sx[a], sy[a], sx[b], sy[b], sx[q], sy[q],
+                   `rgb(${Math.round(c[0]*lam)},${Math.round(c[1]*lam)},${Math.round(c[2]*lam)})`]);
+      }
+    }
+    tris.sort((p, q) => q[0] - p[0]);
+    ctx.lineJoin = 'round';
+    for (const t of tris){
+      ctx.fillStyle = t[7]; ctx.strokeStyle = t[7]; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(t[1], t[2]); ctx.lineTo(t[3], t[4]); ctx.lineTo(t[5], t[6]); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+    }
+  }
+  function draw(){
+    const W = cv.clientWidth, H = cv.clientHeight;
+    ctx.clearRect(0, 0, W, H);
+    const g = 0.30, n = 6; ctx.globalAlpha = 0.5;
+    for (let i = 0; i <= n; i++){
+      const t = -g + 2*g*i/n;
+      line([t,-g,0], [t,g,0], '#243040', 1);
+      line([-g,t,0], [g,t,0], '#243040', 1);
+    }
+    ctx.globalAlpha = 1;
+    line(yz([0,0,0]), yz([0.08,0,0]), '#c9524a', 2);
+    line(yz([0,0,0]), yz([0,0.08,0]), '#4a93c9', 2);
+    line(yz([0,0,0]), yz([0,0,0.08]), '#4ac275', 2);
+    if (mesh && geom.xf){
+      drawMeshes();
+    } else {
+      const L = geom.links || [];
+      for (let i = 0; i + 1 < L.length; i++) line(yz(L[i]), yz(L[i+1]), '#7f9fd8', 4);
+      for (const p of L){ const s = proj(yz(p)); ctx.fillStyle = '#b9c9ea'; ctx.beginPath(); ctx.arc(s[0], s[1], 3.5, 0, 7); ctx.fill(); }
+    }
+    if (geom.ee){ const s = proj(yz(geom.ee)); ctx.fillStyle = '#e6ecf1'; ctx.beginPath(); ctx.arc(s[0], s[1], 4.5, 0, 7); ctx.fill(); }
+    if (geom.obj){
+      const o = geom.obj, h = (geom.obj_size || 0.03) / 2;
+      const c = []; for (const dx of [-h,h]) for (const dy of [-h,h]) for (const dz of [-h,h]) c.push(yz([o[0]+dx, o[1]+dy, o[2]+dz]));
+      const E = [[0,1],[0,2],[1,3],[2,3],[4,5],[4,6],[5,7],[6,7],[0,4],[1,5],[2,6],[3,7]];
+      const col = (geom.obj_label === 'green') ? '#3fc46b' : '#e2574c';
+      for (const e of E) line(c[e[0]], c[e[1]], col, 2);
+      const s = proj(yz(o));
+      ctx.fillStyle = col; ctx.font = '11px ui-monospace, Consolas';
+      ctx.fillText(`${geom.obj_label || 'obj'} r=${Math.hypot(o[0], o[1]).toFixed(2)}m`, s[0]+8, s[1]-8);
+    }
+    for (const o of (geom.objs2d || [])){
+      const sz = o.s || 0.03, hh = sz/2;
+      const cl = /green/.test(o.label) ? '#3fc46b' : /blue/.test(o.label) ? '#4a93c9' : /red/.test(o.label) ? '#e2574c' : '#e0b040';
+      const c = []; for (const dx of [-hh,hh]) for (const dy of [-hh,hh]) for (const dz of [0,sz]) c.push(yz([o.x+dx, o.y+dy, dz]));
+      const E2 = [[0,1],[0,2],[1,3],[2,3],[4,5],[4,6],[5,7],[6,7],[0,4],[1,5],[2,6],[3,7]];
+      for (const e of E2) line(c[e[0]], c[e[1]], cl, 1.5);
+      const s = proj(yz([o.x, o.y, sz]));
+      ctx.fillStyle = cl; ctx.font = '10px ui-monospace, Consolas';
+      ctx.fillText(`${o.label.split(' ')[0]}#${o.tag}`, s[0]+7, s[1]-6);
+    }
+  }
+  let drag = null;
+  cv.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointermove', e => {
+    if (!drag) return;
+    az -= (e.clientX - drag[0]) * 0.01;
+    el += (e.clientY - drag[1]) * 0.01;
+    el = Math.max(-0.2, Math.min(1.5, el));
+    drag = [e.clientX, e.clientY];
+    draw();
+  });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  async function poll(){ try { geom = await (await fetch('/geom')).json(); } catch(e){} draw(); }
+  poll(); setInterval(poll, 180);
+})();
+</script>
+</body>
+</html>

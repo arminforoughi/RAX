@@ -17,14 +17,16 @@ import random
 import sys
 import time
 
-import numpy as np
-
 REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from mobility.slam.object_map import (  # noqa: E402
-    ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
+from rax.mobility.slam.object_map import (  # noqa: E402
+    ObjectMap,
+    fit_rect_from_support,
+    sup_bin,
+    yaw_blend,
+)
 
 CUBE = dict(w_m=0.05, d_m=0.05, h_m=0.05, shape="cube", yaw=0.0)
 
@@ -121,7 +123,7 @@ def test_support_ring_recovers_a_rectangle():
     generated them — that is the whole premise of measuring shape by sweeping."""
     import math
 
-    from mobility.slam.object_map import SUP_BINS
+    from rax.mobility.slam.object_map import SUP_BINS
 
     w_true, d_true, yaw_true = 0.06, 0.16, 30.0
     sup = {}

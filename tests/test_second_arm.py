@@ -27,16 +27,20 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from manipulation.approach import ApproachConfig, approach_target, stage_step  # noqa: E402
-from manipulation.arms.ik_strategy import PoseIK, make_ik  # noqa: E402
-from manipulation.arms.kinematics import CartesianKinematics  # noqa: E402
-from manipulation.arms.motion import MotionLimits, quintic_waypoints  # noqa: E402
-from mobility.slam.object_map import ObjectMap  # noqa: E402
-from perception.camera_geometry import (  # noqa: E402
-    CameraGeometry, FixedCamera, intrinsics_from_dict, parse_tf)
-from perception.locate import ApparentSizeLocalizer  # noqa: E402
-from perception.object_priors import PRIORS  # noqa: E402
-from robots.profiles import load_profile  # noqa: E402
+from rax.manipulation.approach import ApproachConfig, approach_target, stage_step  # noqa: E402
+from rax.manipulation.arms.ik_strategy import PoseIK, make_ik  # noqa: E402
+from rax.manipulation.arms.kinematics import CartesianKinematics  # noqa: E402
+from rax.manipulation.arms.motion import MotionLimits, quintic_waypoints  # noqa: E402
+from rax.mobility.slam.object_map import ObjectMap  # noqa: E402
+from rax.perception.camera_geometry import (  # noqa: E402
+    CameraGeometry,
+    FixedCamera,
+    intrinsics_from_dict,
+    parse_tf,
+)
+from rax.perception.locate import ApparentSizeLocalizer  # noqa: E402
+from rax.perception.object_priors import PRIORS  # noqa: E402
+from rax.robots.profiles import load_profile  # noqa: E402
 
 # Where the object really is. Nothing downstream is told this; it exists only to
 # render the synthetic view and to score the result at the end.

@@ -22,9 +22,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from manipulation.approach import ApproachConfig  # noqa: E402
-from manipulation.approach.visual_center import (  # noqa: E402
-    CenteringOps, center_on_object)
+from rax.manipulation.approach import ApproachConfig  # noqa: E402
+from rax.manipulation.approach.visual_center import CenteringOps, center_on_object  # noqa: E402
 
 AIM = (440.0, 394.0)
 
