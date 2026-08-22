@@ -86,3 +86,8 @@ mission_server_stderr*.log
 .calib_enter.txt
 
 mission_server_stdout.prev.log
+
+# The pre-modularization monolith. Kept on disk as a local hardware reference and
+# preserved in git history, but out of the published tree — nothing imports it, and
+# mission_server.py replaces it.
+examples/legacy/

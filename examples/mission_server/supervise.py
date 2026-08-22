@@ -1,7 +1,7 @@
 """Keep the robot server and the room-camera server alive.
 
 WHY A SUPERVISOR. The two die for different reasons and neither can fix itself:
-  * stack_mission2.py exits at CONNECT when a servo has latched its overload flag
+  * mission_server.py exits at CONNECT when a servo has latched its overload flag
     (`Failed to read 'Min_Position_Limit' on id_=2 ... Overload error!`). A process
     that has exited cannot retry.
   * camserver.py has been killed externally with nothing in its own log.
@@ -37,15 +37,16 @@ BACKOFF_S = 300.0
 
 SERVICES = {
     "robot": {
-        "cmd": [sys.executable, "stack_mission2.py"],
+        "cmd": [sys.executable, "mission_server.py"],
         "cwd": RAX,
         "url": "http://127.0.0.1:8484/status",
         # the robot loads motors, the camera and YOLO before it answers
         "warmup": 150.0,
         # clearing the latched overload FIRST is the whole point: without it a
         # fresh process hits the same unreadable servo and exits again at once
-        "pre": [sys.executable, os.path.join(RAX, "clear_motor_overload.py")],
-        "log": os.path.join(RAX, "stack_mission2_stdout.log"),
+        "pre": [sys.executable,
+                os.path.join(RAX, os.pardir, "teleop", "clear_motor_overload.py")],
+        "log": os.path.join(RAX, "mission_server_stdout.log"),
     },
     "camserver": {
         "cmd": [sys.executable, "camserver.py"],
