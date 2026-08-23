@@ -16,11 +16,15 @@ from __future__ import annotations
 import pathlib
 import sys
 
+# Guest queueing is a property of the *demo server*, not of the pick stack, so it lives
+# beside the server rather than in the published package. The test stays here because it
+# is pure logic and the suite runs everything in one place.
 REPO = pathlib.Path(__file__).resolve().parents[1]
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
+MISSION_SERVER_DIR = REPO / "examples" / "mission_server"
+if str(MISSION_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(MISSION_SERVER_DIR))
 
-from rax.common.guest_sessions import GuestConfig, GuestSessions  # noqa: E402
+from guest_sessions import GuestConfig, GuestSessions  # noqa: E402
 
 
 class Clock:

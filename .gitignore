@@ -91,3 +91,12 @@ mission_server_stdout.prev.log
 # preserved in git history, but out of the published tree — nothing imports it, and
 # mission_server.py replaces it.
 examples/legacy/
+
+# Snapshots the demo server writes beside itself while running: the current map,
+# the last camera view, the status blob. Regenerated every run, meaningless in a clone.
+/m.json
+/p.json
+/q.json
+/st.json
+/view.jpg
+/placed.jpg

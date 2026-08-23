@@ -1,6 +1,6 @@
 # Launch the RAX robot server DETACHED from whatever shell started it.
 #
-# Why this exists: running `python stack_mission2.py` inside an agent/CI background
+# Why this exists: running `python mission_server.py` inside an agent/CI background
 # task ties the server's lifetime to that task. When the task is cleaned up the
 # server dies with it - twice this happened MID-PICK, and killing the process while
 # the arm is moving is what leaves COM4 in a state that then fails the next connect
@@ -19,11 +19,11 @@
 param([switch]$Stop, [switch]$Status, [switch]$Force)
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$log  = Join-Path $root 'stack_mission2_stdout.log'
+$log  = Join-Path $root 'mission_server_stdout.log'
 
 function Get-Server {
   Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*stack_mission2*' }
+    Where-Object { $_.CommandLine -like '*mission_server*' }
 }
 
 if ($Status) {
@@ -51,7 +51,7 @@ if ($existing) {
 }
 
 $env:PYTHONUNBUFFERED = '1'
-$p = Start-Process -FilePath 'python' -ArgumentList 'stack_mission2.py' `
+$p = Start-Process -FilePath 'python' -ArgumentList 'mission_server.py' `
        -WorkingDirectory $root -WindowStyle Hidden -PassThru `
        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 "started pid=$($p.Id) - detached, survives this shell"

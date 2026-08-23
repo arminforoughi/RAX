@@ -102,7 +102,7 @@ same flags. Run directly as a module:
 ```bash
 python -m rax.robots.arms.lerobot_so101 \
   --robot.port /dev/ttyACM0 \
-  --urdf SO101/so101_new_calib.urdf \
+  --urdf robots/arms/lerobot_so101/SO101/so101_new_calib.urdf \
   --query "red cube" \
   --gripper-camera-tf "0.04,0,0.09,-0.2690,0.2824,-1.6014" \
   --display-data
@@ -114,7 +114,7 @@ Key flags:
 |------|---------|-------------|
 | `--robot.port` | *(required)* | SO-101 serial port |
 | `--query` | `red box` | Object to grasp |
-| `--urdf` | `SO101/so101_new_calib.urdf` | URDF path |
+| `--urdf` | `robots/arms/lerobot_so101/SO101/so101_new_calib.urdf` | URDF path |
 | `--gripper-camera-tf` | see above | Eye-in-hand extrinsic |
 | `--approach-style` | `angled` | `angled` / `topdown` / `horizontal` |
 | `--model-path` | *(none)* | YOLO-World weights path |
@@ -156,7 +156,7 @@ ROBOT_MOCK=1 ./run_livekit_gaze.sh dev   # mock
 ./run_livekit_gaze.sh dev                 # real arm
 ```
 
-See [livekit_gaze_agent.md](livekit_gaze_agent.md) for the full agent docs.
+See [examples/livekit_gaze/livekit_gaze_agent.md](../examples/livekit_gaze/livekit_gaze_agent.md) for the full agent docs.
 
 ---
 

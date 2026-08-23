@@ -17,7 +17,8 @@
 #   GOOGLE_API_KEY     your Gemini / Google AI key
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$HERE/../.." && pwd)"
 cd "$REPO_DIR"
 
 # Use the RAX arm venv if present; else fall back to whatever python3 is active.
@@ -52,7 +53,7 @@ PYEOF
   fi
 fi
 
-export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$REPO_DIR/src:$HERE:${PYTHONPATH:-}"
 
 DEMO_PORT="${DEMO_PORT:-8888}"
 
@@ -67,7 +68,7 @@ echo "    Demo UI : http://localhost:$DEMO_PORT"
 echo ""
 
 # Start the demo web server in the background (serves demo.html + mints tokens)
-"$PY" "$REPO_DIR/demo_server.py" --port "$DEMO_PORT" &
+"$PY" "$REPO_DIR/examples/mission_server/demo_server.py" --port "$DEMO_PORT" &
 DEMO_PID=$!
 trap "kill $DEMO_PID 2>/dev/null" EXIT
 

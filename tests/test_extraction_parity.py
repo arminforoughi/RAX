@@ -76,7 +76,7 @@ ATOL = 1e-9
 FX = FY = 517.0
 CX = 329.5
 CY = 231.4
-URDF = REPO / "SO101" / "so101_new_calib.urdf"
+URDF = REPO / "src" / "rax" / "robots" / "arms" / "lerobot_so101" / "SO101" / "so101_new_calib.urdf"
 EE_FRAME = "gripper_frame_link"
 ARM_MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 

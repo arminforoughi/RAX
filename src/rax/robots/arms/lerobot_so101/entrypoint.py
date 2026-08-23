@@ -7,7 +7,7 @@ Usage (matches lerobot/run_gaze_engine.sh)::
 
     python -m rax.robots.arms.lerobot_so101 \\
       --robot.port /dev/ttyACM0 \\
-      --urdf ./SO101/so101_new_calib.urdf \\
+      --urdf ./robots/arms/lerobot_so101/SO101/so101_new_calib.urdf \\
       --query "red cube" \\
       --model-path ./yolov8s-worldv2.pt \\
       --gripper-camera-tf "0.04,0,0.09,-0.2690,0.2824,-1.6014"
@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Robot type (only so101_follower is supported here).")
     p.add_argument("--robot.cameras", dest="robot_cameras", default="",
                    help="Ignored — OAK-D is auto-detected from the arm.")
-    p.add_argument("--urdf", default="SO101/so101_new_calib.urdf",
+    p.add_argument("--urdf", default="robots/arms/lerobot_so101/SO101/so101_new_calib.urdf",
                    help="Path to the SO-101 URDF (absolute or relative to CWD).")
     p.add_argument("--ee-frame", default="gripper_frame_link",
                    help="End-effector frame name in the URDF.")

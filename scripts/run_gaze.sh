@@ -10,20 +10,21 @@
 #   ./run_gaze_engine.sh --pan-sign 1            # flip if arm pans the wrong way
 #   QUERY="red cube" ./run_gaze_engine.sh        # override via env var (unless --query passed)
 #
-# Any extra flags are passed straight through to manipulation.arms.run_gaze.
+# Any extra flags are passed straight through to rax.manipulation.arms.run_gaze.
 # Override defaults with env vars: PORT, QUERY, DETECTOR, STEREO, MAX_DISP, MAX_TICKS, RERUN=0.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-# --- Python: prefer the isolated arm venv (depthai + placo + feetech, no glog clash) ---
-PY="$REPO_DIR/.venv-arm/bin/python"
+# --- Python: prefer an isolated venv (depthai + placo together clash with system glog) ---
+PY="${PY:-$REPO_DIR/.venv-arm/bin/python}"
 if [[ ! -x "$PY" ]]; then
   echo "!! venv not found at $PY"
   echo "   Create it once with:"
   echo "     python3 -m venv .venv-arm && .venv-arm/bin/pip install -U pip"
-  echo "     .venv-arm/bin/pip install -e \"/Users/armin/Documents/lerobot[feetech,kinematics,oakd,yolo-world]\" feetech-servo-sdk"
+  echo "     .venv-arm/bin/pip install -e \".[all]\" feetech-servo-sdk"
+  echo "   Or point this script at any interpreter:  PY=/usr/bin/python3 $0"
   exit 1
 fi
 
@@ -55,7 +56,7 @@ done
 echo ">>> gaze engine: port=$PORT detector=$DETECTOR stereo=$STEREO max_disp=$MAX_DISP"
 echo ">>> The arm WILL move (unless you passed --no-move). Keep the workspace clear; Ctrl-C to stop."
 
-CMD=( "$PY" -m manipulation.arms.run_gaze
+CMD=( "$PY" -m rax.manipulation.arms.run_gaze
   --backend so101
   --port "$PORT"
   --detector "$DETECTOR"

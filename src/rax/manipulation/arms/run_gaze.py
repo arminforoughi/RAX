@@ -108,7 +108,7 @@ def main() -> None:
     # so101 hardware knobs
     p.add_argument("--port", default="/dev/ttyACM0",
                    help="SO-101 serial port (Linux: /dev/ttyACM0, macOS: /dev/tty.usbmodem*)")
-    p.add_argument("--urdf", default="SO101/so101_new_calib.urdf")
+    p.add_argument("--urdf", default="robots/arms/lerobot_so101/SO101/so101_new_calib.urdf")
     p.add_argument("--ee-frame", default="gripper_frame_link")
     p.add_argument("--gripper-camera-tf", default="0.04,0,0.07,0,-0.5,0",
                    help="eye-in-hand extrinsic 'x,y,z,rx,ry,rz' (m, rotvec rad): camera pose in "
