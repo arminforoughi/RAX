@@ -12,7 +12,7 @@
 #  What moved, and where:
 #    robots/profiles/          the arm as data — URDF, joint topology, camera mount,
 #                              gripper thresholds. Swapping arms is writing one of
-#                              these; see docs/adding_an_arm.md.
+#                              these; see docs/porting.md.
 #    manipulation/arms/        ik_strategy.py (pitch-hold and pose IK), motion.py
 #    manipulation/approach/    the tunables, approach staging, the centring servo
 #    perception/               camera geometry, table plane, class priors,
@@ -2077,14 +2077,17 @@ def _center_on_cube(finder, gp, j5, label=None):
             say(f"center: saved the frame it could not find '{label}' in -> {path}")
         except Exception as e:
             say(f"center: could not save the debug frame ({type(e).__name__})")
-    if not res.ok:
-        # A failed centring returns the arm's CURRENT TIP, not the object — see
-        # CenteringResult in manipulation/approach/visual_center.py. Handing that back
-        # made the caller grasp at the standoff pose, which the right-trim deliberately
-        # offsets from the object by ~5cm, so the jaws closed on air while every stage
-        # reported success. None is the honest answer: the caller already falls back to
-        # the mapped position, which is the measurement we actually trust.
-        say(f"center: {res.reason} — not trusting the servo's position")
+    if not res.centered:
+        # A centring that did not converge returns the arm's CURRENT TIP, not the
+        # object — see CenteringResult in manipulation/approach/visual_center.py.
+        # Handing that back made the caller grasp at the standoff pose, which the
+        # right-trim deliberately offsets from the object by ~5cm, so the jaws closed
+        # on air while every stage reported success. None is the honest answer: the
+        # caller already falls back to the mapped position, which is the measurement
+        # we actually trust.
+        if res.xy is not None:
+            say(f"center: {res.reason or 'did not converge'} — "
+                f"not trusting the servo's position")
         return None
     return res.xy
 

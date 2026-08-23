@@ -188,3 +188,21 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_the_result_field_is_named_centered():
+    """Pin the attribute name the callers branch on.
+
+    mission_server's _center_on_cube decides whether to trust the servo's position or
+    fall back to the mapped one. It was written against a guessed `res.ok`, which does
+    not exist — so on the first real failure it raised AttributeError inside the pick
+    and aborted a run that would otherwise have recovered. The library's own tests all
+    passed, because the bug was in a caller with no coverage.
+
+    A rename here is a silent break there, so the name is the contract.
+    """
+    res = center_on_object(FakeArm(du_dpan=0.2), AIM, ApproachConfig())
+    assert hasattr(res, "centered"), "callers branch on .centered"
+    assert not hasattr(res, "ok"), "there is no .ok — do not reintroduce the ambiguity"
+    # The other two fields callers read.
+    assert hasattr(res, "xy") and hasattr(res, "reason")
