@@ -53,7 +53,6 @@
 # out too shallow — so absolute ranges are compressed and the map's positions are
 # approximate. Most of the localization care in here works around that.
 import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
-from collections import deque
 
 import cv2
 import numpy as np
@@ -65,7 +64,6 @@ sys.path.insert(0, r"C:\Users\labot\Documents\lerobot\src")
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.perception.yolo_world import YoloWorldDetector
 from lerobot.manipulation.visual_servo.gaze_engine import parse_tf_string
-from lerobot.manipulation.yolo_track.motion_primitives import send_joint_target_smoothly
 from lerobot.robots.utils import make_robot_from_config
 from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.cameras.oakd.configuration_oakd import OAKDCameraConfig
@@ -93,16 +91,16 @@ from rax.robots.profiles import load_profile
 from rax.perception.camera_geometry import (
     CameraGeometry, EyeInHand, FixedCamera, intrinsics_from_dict, parse_tf)
 from rax.perception.object_priors import (
-    PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES, MAX_TABLE_OBJ_M)
+    PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES)
 from rax.perception.table_plane import Plane, fit_plane
 from rax.manipulation.arms.ik_strategy import make_ik
 from rax.manipulation.arms.motion import MotionLimits, quintic_waypoints
 from rax.perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
-from rax.perception.measure import ObjectMeasurer, classify_shape, silhouette_mask
+from rax.perception.measure import ObjectMeasurer, classify_shape
 from rax.perception.handeye import (
     HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye)
 from rax.models.detection.tracking import (
-    AnchorTracker, PixelTracker, Track, HSV_BANDS, HSV_BANDS_SOFT)
+    AnchorTracker, Track)
 from rax.models.detection.detector_service import (
     DetectorConfig, DetectorService, box_iou)
 from rax.mobility.slam.object_map import (
@@ -110,10 +108,15 @@ from rax.mobility.slam.object_map import (
 from rax.manipulation.approach import (
     ApproachConfig, approach_target, cap_reach, stage_step)
 from rax.manipulation.approach.derive import (
-    align_tolerance_px, grasp_height, hover_height, right_trim_for_visibility)
+    align_tolerance_px, grasp_height, right_trim_for_visibility)
 from rax.perception.selfcal import (
     LocalizationSample, apply_to_config, diagnose, fit_localization)
 from rax.manipulation.approach.visual_center import center_on_object
+from rax.common.mission_state import Abort, MissionState
+
+# Sibling module, not part of the published package: queueing strangers onto one
+# shared robot is this demo's problem, not the pick stack's.
+from guest_sessions import GuestConfig, GuestSessions
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -140,41 +143,23 @@ Z_TABLE = ARM.table_z_m   # base-frame height of the object CENTRE; the sightlin
                           # intersected with THIS plane to localize. See the profile.
 TARGET_SIZE_M = 0.03      # cube edge — pinhole range from bbox size (survives close range)
 
-state = {
-    "phase": "IDLE", "detail": "", "joints": [], "gripper": None,
-    "p_red": None, "p_green": None, "t0": None, "running": False, "loop_hz": 0.0,
-    "dist_mm": None,  # live camera→target range during approach/place
-}
-log = deque(maxlen=140)
+# Phase, rolling log and stop flag now come from rax.common.mission_state, which was
+# written as a drop-in for the dict that used to live here: it subscripts, gets and
+# updates like one, so the ~290 call sites below did not have to change. The aliases
+# keep `say(...)`, `set_phase(...)` and `with lock:` reading the way they always have.
+MS = MissionState()
+state = MS
+log = MS.log
+lock = MS.lock
+stop_flag = MS.stop_flag
+say = MS.say
+set_phase = MS.set_phase
+checkpoint = MS.checkpoint
+
 frame_jpeg = [None]
-lock = threading.Lock()
 bus_lock = threading.RLock()   # Feetech bus is not thread-safe
-stop_flag = threading.Event()
 mission_thread = [None]
 latest_rgb = [None]            # for the YOLO thread
-
-
-def say(msg):
-    log.appendleft(f"{time.strftime('%H:%M:%S')}  {msg}")
-    print(msg, flush=True)
-
-
-def set_phase(phase, detail=""):
-    with lock:
-        state["phase"], state["detail"] = phase, detail
-        state["dist_mm"] = None
-    say(f"[{phase}] {detail}" if detail else f"[{phase}]")
-
-
-class Abort(Exception):
-    pass
-
-
-def checkpoint():
-    with lock:
-        running = state["running"]
-    if stop_flag.is_set() and running:
-        raise Abort("stopped by user")
 
 
 robot = None
@@ -2735,10 +2720,8 @@ PUBLIC_HOST = [None]          # set once the public tunnel reports its URL
 # The cooldown is deliberately CONDITIONAL: it only applies when somebody else is
 # actually waiting. Alone with the robot you can keep playing; the moment a queue
 # forms, a repeat visitor goes behind the people who have not had a turn yet.
-guest = {"token": None, "expires": 0.0, "started": 0.0}
-visitors = {}                 # vid -> {"ip", "last_end", "turns", "seen"}
-queue = []                    # vids waiting, front of list = next up
-guest_lock = threading.Lock()
+# The queue itself lives in guest_sessions.GuestSessions — see GUESTS below, built
+# once the robot-side callbacks it needs are defined.
 
 
 # PERSISTENT VISITOR LOG. This writes IP addresses to disk, which earlier versions
@@ -2804,30 +2787,13 @@ def _visitor(resp_cookies=None):
     new = False
     if not vid or len(vid) < 8:
         vid, new = secrets.token_urlsafe(12), True
-    fresh = vid not in visitors
-    v = visitors.setdefault(vid, {"ip": _client_ip(), "last_end": 0.0,
-                                  "turns": 0, "seen": 0.0,
-                                  "first": time.time()})
-    v["seen"] = time.time()
-    v["ip"] = _client_ip()
+    fresh = GUESTS.see(vid, _client_ip(),
+                       ua=(request.headers.get("User-Agent") or "")[:90])
     if fresh:
-        _log_guest("scanned", vid, ua=(request.headers.get("User-Agent") or "")[:90])
+        # First-seen time is only for the admin roster's "waiting" column, so it is
+        # the server's bookkeeping rather than the queue policy's.
+        visitors[vid]["first"] = time.time()
     return vid, new
-
-
-def _prune(now):
-    """Drop waiters who stopped polling. Caller holds guest_lock."""
-    global queue
-    queue = [v for v in queue
-             if v in visitors and now - visitors[v]["seen"] < QUEUE_TTL]
-
-
-def _cooling(vid, now):
-    """Seconds of cooldown left for this visitor, 0 if none."""
-    v = visitors.get(vid)
-    if not v or not v["turns"]:
-        return 0.0
-    return max(0.0, v["last_end"] + GUEST_COOLDOWN_MIN * 60.0 - now)
 
 
 def _guest_cleanup():
@@ -2871,39 +2837,27 @@ def _guest_cleanup():
     threading.Thread(target=_t, daemon=True).start()
 
 
-def _end_turn(now):
-    """Finish the active session and record the cooldown. Caller holds the lock."""
-    tok = guest["token"]
-    if tok:
-        for vid, v in visitors.items():
-            if v.get("token") == tok:
-                v["last_end"], v["turns"] = now, v["turns"] + 1
-                _log_guest("turn_end", vid, turns=v["turns"],
-                           held_s=round(now - guest["started"], 1))
-                break
-        _guest_cleanup()
-    guest.update(token=None, expires=0.0, started=0.0)
+# THE QUEUE OBJECT. Everything above this line is robot- and Flask-specific; the
+# turn-taking policy itself is not, so it lives in guest_sessions.py where it can be
+# tested without a robot (tests/test_guest_sessions.py runs an evening of visitor
+# behaviour in a millisecond). The three things it cannot know are injected: how to
+# park the arm when a turn ends, how to announce a turn starting, and where to log.
+GUESTS = GuestSessions(
+    GuestConfig(minutes=GUEST_MINUTES, cooldown_min=GUEST_COOLDOWN_MIN,
+                queue_ttl_s=QUEUE_TTL),
+    on_turn_end=_guest_cleanup,
+    on_turn_start=lambda vid, waiting: say(
+        f"guest turn started ({GUEST_MINUTES:.0f} min) — "
+        f"{GUESTS.visitors[vid]['ip']} — {waiting} waiting"),
+    log=_log_guest,
+)
 
-
-def _promote(now):
-    """Hand the arm to the front of the queue. Caller holds the lock."""
-    _prune(now)
-    while queue:
-        vid = queue[0]
-        # someone still cooling down yields to anyone who has not played yet
-        if _cooling(vid, now) > 0 and any(_cooling(o, now) <= 0 for o in queue[1:]):
-            queue.append(queue.pop(0))
-            continue
-        queue.pop(0)
-        tok = secrets.token_urlsafe(16)
-        guest.update(token=tok, expires=now + GUEST_MINUTES * 60.0, started=now)
-        visitors[vid]["token"] = tok
-        _log_guest("turn_start", vid, waiting=len(queue),
-                   turns=visitors[vid].get("turns", 0))
-        say(f"guest turn started ({GUEST_MINUTES:.0f} min) — "
-            f"{visitors[vid]['ip']} — {len(queue)} waiting")
-        return vid
-    return None
+# Read-only aliases so the routes below still read the way they did. `queue` is NOT
+# aliased: _prune rebinds it, so a module-level name would go stale after the first
+# sweep — the routes ask GUESTS.queue instead.
+guest = GUESTS.holder
+visitors = GUESTS.visitors
+guest_lock = GUESTS.lock
 
 
 def lobby_tick(vid):
@@ -2913,39 +2867,8 @@ def lobby_tick(vid):
     the arm to whoever is next, and keeps the queue swept — so the whole system is
     driven by visitors polling, with no background thread to get out of sync.
     """
-    now = time.time()
-    with guest_lock:
-        if guest["token"] and now >= guest["expires"]:
-            _end_turn(now)
-        _prune(now)
-        mine = visitors.get(vid, {}).get("token")
-        playing = bool(guest["token"]) and mine == guest["token"]
+    return GUESTS.tick(vid).to_dict()
 
-        if not playing:
-            if vid not in queue:
-                # a repeat visitor joins behind everyone still on their first turn
-                if _cooling(vid, now) > 0:
-                    queue.append(vid)
-                else:
-                    at = len(queue)
-                    for i, o in enumerate(queue):
-                        if _cooling(o, now) > 0:
-                            at = i
-                            break
-                    queue.insert(at, vid)
-            if not guest["token"]:
-                got = _promote(now)
-                playing = (got == vid)
-
-        pos = 0 if playing else (queue.index(vid) + 1 if vid in queue else 0)
-        left = max(0.0, guest["expires"] - now) if guest["token"] else 0.0
-        ahead = max(0, pos - 1)
-        eta = left + ahead * GUEST_MINUTES * 60.0 if pos else 0.0
-        return {"playing": playing, "position": pos, "waiting": len(queue),
-                "left": round(left), "eta": round(eta),
-                "cooldown": round(_cooling(vid, now)),
-                "minutes": GUEST_MINUTES,
-                "token": guest["token"] if playing else None}
 
 # View-function names a public visitor may reach. Deliberately tiny: look, drive,
 # pick, stop. No parameters, no calibration, no map, no placing.
@@ -2968,12 +2891,7 @@ def is_public_request():
 
 def guest_state():
     """(active, seconds_left, token). Expiry is lazy — checked on read."""
-    with guest_lock:
-        now = time.time()
-        if guest["token"] and now >= guest["expires"]:
-            _end_turn(now)
-        left = max(0.0, guest["expires"] - now) if guest["token"] else 0.0
-        return bool(guest["token"]), left, guest["token"]
+    return GUESTS.state()
 
 
 def guest_is_caller():
@@ -3223,7 +3141,7 @@ def guestlink():
                                         svgclass=None, lineclass=None)
         svg = buf.getvalue().decode("utf-8")
     with guest_lock:
-        waiting = len(queue)
+        waiting = len(GUESTS.queue)
     return jsonify(ok=bool(url), url=url, qr_svg=svg, error=tunnel["error"],
                    kind=tunnel["kind"], permanent=(tunnel["kind"] == "funnel"),
                    busy=active, left=round(left), minutes=GUEST_MINUTES,
@@ -3375,7 +3293,6 @@ def guests():
     """
     now = time.time()
     with guest_lock:
-        _prune(now)
         tok = guest["token"]
         playing = None
         for vid, v in visitors.items():
@@ -3389,8 +3306,8 @@ def guests():
               "vid": v[:6],
               "waiting": round(now - visitors.get(v, {}).get("first", now)),
               "turns": visitors.get(v, {}).get("turns", 0),
-              "cooldown": round(_cooling(v, now))}
-             for i, v in enumerate(queue)]
+              "cooldown": round(GUESTS.cooldown_left(v, now))}
+             for i, v in enumerate(GUESTS.queue)]
         seen = len(visitors)
     rows, by_ip = _guest_history()
     return jsonify(playing=playing, queue=q, seen_now=seen,
@@ -3401,10 +3318,9 @@ def guests():
 @app.route("/guestkick", methods=["POST"])
 def guestkick():
     """Admin-only: end the current guest's turn immediately."""
-    with guest_lock:
-        now = time.time()
-        _end_turn(now)
-        _promote(now)
+    # end_current only ends. The next lobby poll promotes whoever is next, which is
+    # within a second and gives _guest_cleanup time to park the arm first.
+    GUESTS.end_current()
     stop_flag.set()
     say("guest turn ended by admin")
     return jsonify(ok=True)
@@ -3436,9 +3352,8 @@ def index():
 
 @app.route("/status")
 def status():
-    with lock:
-        s = {k: v for k, v in state.items()}
-    s["log"] = list(log)
+    s = state.snapshot()
+    s["log"] = state.log_lines()
     s["measure_stats"] = dict(MEAS_STATS)
     s["relaxed"] = ARM_RELAXED[0]
     s["idle_relax_s"] = IDLE_RELAX_S[0]
