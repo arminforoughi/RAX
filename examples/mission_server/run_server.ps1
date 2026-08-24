@@ -16,7 +16,15 @@
 #
 # NOTE: ASCII only. Windows PowerShell 5.1 reads .ps1 as ANSI, so a UTF-8 em dash
 # in a string becomes mojibake and throws a ParserError.
-param([switch]$Stop, [switch]$Status, [switch]$Force)
+param([switch]$Stop, [switch]$Status, [switch]$Force, [string]$Port)
+
+# The arm's serial port. The profile reads RAX_ARM_PORT and has no default, so a
+# server started without it connects to '' and dies in robot.connect() - which is
+# exactly what happened when this script was first used to relaunch a server that
+# had been started by hand in a shell that happened to have the variable set.
+# COM4 is the CH343 adapter; -Port overrides, and an already-set env var wins.
+if ($Port) { $env:RAX_ARM_PORT = $Port }
+elseif (-not $env:RAX_ARM_PORT) { $env:RAX_ARM_PORT = 'COM4' }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $log  = Join-Path $root 'mission_server_stdout.log'
@@ -51,8 +59,20 @@ if ($existing) {
 }
 
 $env:PYTHONUNBUFFERED = '1'
+"arm port: $env:RAX_ARM_PORT"
+
+# lerobot's bus.connect() asks on STDIN whether to reuse the stored calibration.
+# Detached there is no console, so input() raises EOFError and the server dies before
+# it ever binds the port. Feed it a file of blank lines: every prompt takes its
+# default, which is the stored calibration - the answer we want anyway.
+$stdin = Join-Path $root '.server_stdin.txt'
+if (-not (Test-Path $stdin)) {
+  Set-Content -Path $stdin -Value ([string]::Join("`r`n", (1..12 | ForEach-Object { '' }))) -NoNewline -Encoding ascii
+}
+
 $p = Start-Process -FilePath 'python' -ArgumentList 'mission_server.py' `
        -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+       -RedirectStandardInput $stdin `
        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 "started pid=$($p.Id) - detached, survives this shell"
 "log: $log"
