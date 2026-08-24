@@ -70,8 +70,14 @@ if (-not (Test-Path $stdin)) {
   Set-Content -Path $stdin -Value ([string]::Join("`r`n", (1..12 | ForEach-Object { '' }))) -NoNewline -Encoding ascii
 }
 
-$p = Start-Process -FilePath 'python' -ArgumentList 'mission_server.py' `
-       -WorkingDirectory $root -WindowStyle Hidden -PassThru `
+# Run from the REPO ROOT, not from this directory. The server resolves its own
+# assets off __file__ so it does not care, but ultralytics caches the YOLO-World CLIP
+# encoder in a cwd-relative weights/ - start it anywhere else and it re-downloads
+# 338 MB into a second cache that nothing will ever use again.
+$repo = Split-Path -Parent (Split-Path -Parent $root)
+$p = Start-Process -FilePath 'python' `
+       -ArgumentList 'examples\mission_server\mission_server.py' `
+       -WorkingDirectory $repo -WindowStyle Hidden -PassThru `
        -RedirectStandardInput $stdin `
        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 "started pid=$($p.Id) - detached, survives this shell"

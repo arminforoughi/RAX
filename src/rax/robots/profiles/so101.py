@@ -118,6 +118,11 @@ PROFILE = ArmProfile(
     urdf="robots/arms/lerobot_so101/SO101/so101_new_calib.urdf",
     # The same directory: it holds assets/*.stl and a robot.urdf (a copy of the calib
     # URDF, kept because lerobot's mesh loader looks for that exact filename).
+    # NOTE the directory holds the same URDF twice, under two names, and both are
+    # load-bearing: `urdf` names the file the kinematics read, while the Rerun mesh
+    # viewer calls robot_urdf_file_in_dir(), which looks for a file literally called
+    # robot.urdf. Deleting it as a duplicate costs you the 3D view, and the error
+    # ("No robot.urdf in directory") arrives far from here.
     mesh_dir="robots/arms/lerobot_so101/SO101",
     ee_frame="gripper_frame_link",
     joint_names=JOINT_NAMES,
