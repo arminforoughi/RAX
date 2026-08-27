@@ -2109,6 +2109,11 @@ def _center_on_cube(finder, gp, j5, label=None):
 # HOME's tilt, saw the same cube at r=36.8cm. VIEW's lift is +37 against HOME's
 # -99, so the camera is pointing somewhere else entirely.
 SURVEY_TILT = np.array(ARM.survey_tilt_deg)   # every joint after the pan — always these
+# ...except the wrist pitch, which is live-tunable. It is the only joint that aims the
+# camera without changing the arm's shape, and every range the survey produces depends
+# on how steeply the sightline meets the table — so it belongs on a dial, not in a
+# constant. The profile still owns the default; CFG owns what the operator dialled.
+CFG.survey_pitch_deg = float(SURVEY_TILT[2])
 SURVEY_READS = 9                # reads to median over (rejects detector jitter)
 SURVEY_SPREAD_MAX = 0.05        # m; if reads disagree by more than this from ONE
                                 # pose the detector is unstable - say so rather
@@ -2137,8 +2142,9 @@ def survey_pose_for(bearing_deg=None):
     was staring at bare wood and even the idle map went empty.
     """
     pan = float(HOME[0]) if bearing_deg is None else float(bearing_deg)
-    return np.concatenate(([np.clip(pan, -SURVEY_PAN_LIMIT, SURVEY_PAN_LIMIT)],
-                           SURVEY_TILT))
+    tilt = SURVEY_TILT.copy()
+    tilt[2] = float(CFG.survey_pitch_deg)      # live-tunable; see ApproachConfig
+    return np.concatenate(([np.clip(pan, -SURVEY_PAN_LIMIT, SURVEY_PAN_LIMIT)], tilt))
 
 
 def locate_from_survey(label, finder=None, bearing_deg=None):
@@ -3919,6 +3925,32 @@ def setaimdu():
     px = CFG.set_knob("aim_du", px)
     say(f"aim_du set to {px:.0f}px (left shift -> robot right)")
     return jsonify(ok=True, px=px)
+
+
+@app.route("/setknob", methods=["POST"])
+def setknob():
+    """Live-tune ANY knob by name: /setknob?name=survey_pitch_deg&value=68.2
+
+    The seven routes below this one are per-knob shims that predate ApproachConfig
+    owning its own bounds. This is the generic form they were meant to collapse into,
+    so a knob added to KNOBS is tunable the moment it exists rather than when someone
+    remembers to write it an eighth route. GET /setknob lists what there is to tune.
+    """
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify(ok=False, reason="need name=",
+                       knobs={n: CFG.get_knob(n) for n in CFG.knob_names()})
+    if name not in CFG.knob_names():
+        return jsonify(ok=False, reason=f"unknown knob {name!r}",
+                       knobs=CFG.knob_names()), 400
+    try:
+        value = float(request.args.get("value", request.form.get("value")))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, reason="need a numeric value="), 400
+    was = CFG.get_knob(name)
+    now = CFG.set_knob(name, value)      # clamps to the knob's own bounds
+    say(f"{name}: {was:g} -> {now:g}" + ("  (clamped)" if abs(now - value) > 1e-9 else ""))
+    return jsonify(ok=True, name=name, was=was, value=now)
 
 
 @app.route("/settrim", methods=["POST"])

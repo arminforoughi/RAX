@@ -54,6 +54,8 @@ KNOBS: tuple[Knob, ...] = (
          doc="multiplier on every estimated range"),
     Knob("bearing_deg", "bearing_offset_deg", 1.0, -180.0, 180.0,
          doc="rotate the mapped bearing, correcting hand-eye heading error"),
+    Knob("survey_pitch_deg", "survey_pitch_deg", 1.0, 0.0, 94.0,
+         doc="wrist pitch the survey looks from; higher points the camera further down"),
 )
 
 
@@ -64,6 +66,28 @@ class ApproachConfig:
     Mutable and shared: the UI retunes it live, so holders keep the object rather than
     copying values out of it.
     """
+
+    # --- where the survey looks from ----------------------------------------------
+    # The wrist pitch (SO-101 id4) the survey pose holds. It is the ONE joint that
+    # aims the camera without changing the arm's shape, which is why it is the knob:
+    # everything the survey measures rides on how steeply the sightline meets the
+    # table, so this is the highest-leverage number on the rig and it wants to be
+    # dialled against a live map rather than edited and restarted.
+    #
+    # Measured on the SO-101 with the wrist camera, coverage of the reachable table
+    # (r 18-42cm) across a full pan sweep, counting only views that clear
+    # MIN_TABLE_INCIDENCE:
+    #
+    #     33.2 deg -> camera 3.0 deg ABOVE horizontal, 40% covered, blind inside 30cm
+    #     53.2     -> +14.4 deg down, 91%
+    #     63.2     -> +22.9 deg down, 100%
+    #     68.2     -> +27.1 deg down, 100%   <- centre of the plateau
+    #     78.2     -> +35.3 deg down, 100%
+    #     88.2     -> +43.0 deg down, 96%, and the far edge starts dropping out
+    #
+    # The server overwrites this from the arm profile at startup; the value here is
+    # the fallback for a rig that does not carry one.
+    survey_pitch_deg: float = 68.2
 
     # --- approach staging ---------------------------------------------------------
     # Shift the hover target to the object's RIGHT so it stays on the LEFT of the

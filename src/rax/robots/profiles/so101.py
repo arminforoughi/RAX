@@ -57,7 +57,15 @@ HOME_DEG = (-14.1, -99.1, 90.8, 33.2, -4.7)
 # viewing; these stay at HOME's ORIGINAL 2026-07-20 tilt, the one the 0.4 cm
 # survey repeatability was measured against. Keep the leading value equal to
 # HOME's shoulder_lift or `survey_pose_for` starts from a different arm shape.
-SURVEY_TILT_DEG = (-99.1, 90.8, 33.2, -4.7)
+# 2026-08-26: wrist pitch 33.2 -> 68.2. At 33.2 the camera sat 3 deg ABOVE horizontal
+# and a full pan sweep covered 40% of the reachable table -- nothing inside 30cm was
+# ever in frame, so near objects were localized from whatever grazing view clipped the
+# frame edge, and the range error that comes back is amplified ~8x at that incidence.
+# 68.2 puts the camera 27 deg down and covers 100% at every radius from 18 to 42cm.
+# Only id4 moves: it is the one joint that re-aims the camera without changing the
+# arm's shape, so reach, IK seeds and the approach trims are all untouched.
+# Live-tunable at runtime as the `survey_pitch_deg` knob.
+SURVEY_TILT_DEG = (-99.1, 90.8, 68.2, -4.7)
 # Wrist twisted 90 deg so the jaws are square to a table cube.
 GRASP_ROLL_DEG = 90.0
 VIEW_DEG = (5.0, 37.1, 48.1, -40.4, GRASP_ROLL_DEG)
