@@ -82,7 +82,7 @@ Synthetic scene: red, green, and blue spheres ~0.4 m in front of a virtual
 eye-in-hand camera. No hardware, no display — state logs are the output.
 
 ```python
-from manipulation.arms.mock_arm import MockArm, WORLD_UP
+from rax.manipulation.arms.mock_arm import MockArm, WORLD_UP
 arm = MockArm()
 obs = arm.get_observation()   # left/right frames with coloured blobs
 ```
@@ -94,13 +94,13 @@ obs = arm.get_observation()   # left/right frames with coloured blobs
 | `PlacoKinematics` | lerobot's placo FK/IK | Real SO-101 |
 | `CartesianKinematics` | pure maths | MockArm / dev |
 
-### `manipulation/arms/lerobot_so101/` — RAX-native CLI
+### `robots/arms/lerobot_so101/` — RAX-native CLI
 
 Drop-in replacement for the `lerobot-gaze-engine` console script, with all the
 same flags. Run directly as a module:
 
 ```bash
-python -m manipulation.arms.lerobot_so101 \
+python -m rax.robots.arms.lerobot_so101 \
   --robot.port /dev/ttyACM0 \
   --urdf SO101/so101_new_calib.urdf \
   --query "red cube" \
@@ -138,13 +138,13 @@ Real-hardware `ArmInterface` wrapping lerobot's `make_robot_from_config`:
 ### No hardware (mock)
 
 ```bash
-python -m manipulation.arms.run_gaze --backend mock --query "red cube"
+python -m rax.manipulation.arms.run_gaze --backend mock --query "red cube"
 ```
 
 ### With SO-101 + OAK-D
 
 ```bash
-python -m manipulation.arms.lerobot_so101 \
+python -m rax.robots.arms.lerobot_so101 \
   --robot.port /dev/ttyACM0 \
   --query "red cube"
 ```

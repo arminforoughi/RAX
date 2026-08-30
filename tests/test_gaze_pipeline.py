@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from manipulation.arms.se3 import look_at_R, make_pose, vantage_dir
-from models.depth.stereo import StereoIntrinsics
-from perception.depth_cloud.backproject import backproject_masked, box_iou
-from perception.depth_cloud.object_cloud import ObjectTrack
-
+from rax.manipulation.arms.se3 import look_at_R, vantage_dir
+from rax.models.depth.stereo import StereoIntrinsics
+from rax.perception.depth_cloud.backproject import backproject_masked, box_iou
+from rax.perception.depth_cloud.object_cloud import ObjectTrack
 
 INTR = StereoIntrinsics(fx=500.0, fy=500.0, cx=320.0, cy=240.0, baseline_m=0.06, width=640, height=480)
 
@@ -91,7 +90,7 @@ def test_box_iou():
 
 
 def test_ray_point_base_on_center_ray():
-    from manipulation.arms.gaze_engine import _ray_point_base
+    from rax.manipulation.arms.gaze_engine import _ray_point_base
 
     T = np.eye(4)
     p = _ray_point_base(320.0, 240.0, 0.5, T, INTR)
@@ -100,8 +99,8 @@ def test_ray_point_base_on_center_ray():
 
 
 def _engine(cfg=None):
-    from manipulation.arms.gaze_engine import GazeConfig, GazeEngine
-    from manipulation.arms.kinematics import CartesianKinematics
+    from rax.manipulation.arms.gaze_engine import GazeConfig, GazeEngine
+    from rax.manipulation.arms.kinematics import CartesianKinematics
 
     class _Arm:
         joint_names = []
@@ -110,8 +109,8 @@ def _engine(cfg=None):
 
 
 def test_gaze_deltas_and_depth_filter():
-    from manipulation.arms.gaze_engine import GazeConfig
-    from manipulation.arms.arm_interface import Observation
+    from rax.manipulation.arms.arm_interface import Observation
+    from rax.manipulation.arms.gaze_engine import GazeConfig
 
     eng = _engine(GazeConfig(pan_sign=1.0, tilt_sign=1.0, aim_v_offset_px=90.0))
     eng._aim_v_now = 90.0  # aim fully ramped to the gripper line (bottom-centre)
@@ -138,12 +137,12 @@ def test_gaze_deltas_and_depth_filter():
 
 
 def test_mock_reaches_grasp():
-    from manipulation.arms.gaze_engine import GazeConfig, GazeEngine
-    from manipulation.arms.mock_arm import WORLD_UP, MockArm
-    from manipulation.arms.kinematics import CartesianKinematics
-    from models.depth import make_stereo
-    from models.detection import make_detector, make_mask_tracker
-    from perception.depth_cloud import CloudTracker
+    from rax.manipulation.arms.gaze_engine import GazeConfig, GazeEngine
+    from rax.manipulation.arms.kinematics import CartesianKinematics
+    from rax.manipulation.arms.mock_arm import WORLD_UP, MockArm
+    from rax.models.depth import make_stereo
+    from rax.models.detection import make_detector, make_mask_tracker
+    from rax.perception.depth_cloud import CloudTracker
 
     arm = MockArm()
     cloud = CloudTracker(
@@ -165,7 +164,7 @@ def test_mock_reaches_grasp():
 
 
 def test_cloud_tracker_schedule_focus_every_tick_others_round_robin():
-    from perception.depth_cloud.cloud_tracker import CloudTracker
+    from rax.perception.depth_cloud.cloud_tracker import CloudTracker
 
     ct = CloudTracker.__new__(CloudTracker)  # bypass heavy __init__
     ct.focus_tag = 1

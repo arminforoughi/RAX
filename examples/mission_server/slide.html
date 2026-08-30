@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraspGPT - Hackathon Slide</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #070a0f;
+    color: #f0f4f8;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .slide {
+    width: 1280px; height: 720px;
+    background: radial-gradient(circle at 80% 20%, rgba(76,175,80,0.12) 0%, transparent 45%),
+                radial-gradient(circle at 10% 90%, rgba(100,181,246,0.10) 0%, transparent 40%),
+                linear-gradient(145deg, #0c1118 0%, #0a0e14 100%);
+    border: 1px solid #1c2733;
+    border-radius: 16px;
+    padding: 60px 70px;
+    display: grid;
+    grid-template-columns: 1.05fr 0.95fr;
+    gap: 60px;
+    position: relative;
+    overflow: hidden;
+  }
+  .slide::before {
+    content: "";
+    position: absolute; top: 0; left: 0; right: 0; height: 4px;
+    background: linear-gradient(90deg, #4caf50, #64b5f6, #ba68c8);
+  }
+  .left { display: flex; flex-direction: column; justify-content: center; }
+  .eyebrow {
+    font-size: 13px; font-weight: 700; letter-spacing: 1.5px;
+    color: #4caf50; text-transform: uppercase; margin-bottom: 14px;
+  }
+  h1 {
+    font-size: 64px; font-weight: 900; letter-spacing: -2px;
+    line-height: 1.05; margin-bottom: 18px;
+  }
+  h1 span { color: #4caf50; }
+  .tagline {
+    font-size: 23px; color: #94a3b8; line-height: 1.4; margin-bottom: 42px;
+  }
+  .point {
+    display: flex; align-items: flex-start; gap: 14px; margin-bottom: 18px;
+    font-size: 17px; color: #cbd5e1; line-height: 1.45;
+  }
+  .bullet {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: #15202b; border: 1px solid #2b3d4f;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 800; color: #4caf50; flex-shrink: 0;
+  }
+  .right { display: flex; flex-direction: column; justify-content: center; }
+  .ui-mock {
+    background: #080c11; border: 1px solid #1f2d3a; border-radius: 14px;
+    overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,0.55);
+    margin-bottom: 32px;
+  }
+  .ui-top {
+    height: 210px; background: #05080a;
+    display: flex; align-items: center; justify-content: center;
+    color: #2a3a4a; font-size: 14px; border-bottom: 1px solid #1f2d3a;
+  }
+  .ui-bottom {
+    padding: 18px 22px; font-family: 'Fira Code', monospace; font-size: 12px;
+    color: #64748b;
+  }
+  .ui-bottom .line { margin: 5px 0; }
+  .sponsors {
+    display: flex; gap: 12px;
+  }
+  .sponsor {
+    flex: 1; background: rgba(21, 32, 43, 0.7); border: 1px solid #243040;
+    border-radius: 10px; padding: 16px; text-align: center;
+  }
+  .sponsor .logo {
+    width: 42px; height: 42px; border-radius: 10px; margin: 0 auto 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 16px; color: #fff;
+  }
+  .band { background: #f06292; }
+  .actian { background: #4a90e2; }
+  .pioneer { background: #7e57c2; }
+  .sponsor h3 { font-size: 15px; margin-bottom: 4px; }
+  .sponsor p { font-size: 12px; color: #94a3b8; line-height: 1.35; }
+  .metrics {
+    position: absolute; bottom: 34px; left: 70px;
+    display: flex; gap: 30px;
+  }
+  .metric { text-align: center; }
+  .metric .num { font-size: 34px; font-weight: 800; color: #4caf50; }
+  .metric .label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 2px; }
+  .footer {
+    position: absolute; bottom: 34px; right: 70px;
+    font-size: 12px; color: #475569;
+  }
+</style>
+</head>
+<body>
+<div class="slide">
+  <div class="left">
+    <div class="eyebrow">Self-Evolving Agents Hackathon</div>
+    <h1>Grasp<span>GPT</span></h1>
+    <div class="tagline">A robot arm that learns to pick better from every failed grasp.</div>
+
+    <div class="point">
+      <div class="bullet">1</div>
+      <div><strong>Perceive & recall</strong> — reads the scene and searches Actian vector memory for similar past tasks.</div>
+    </div>
+    <div class="point">
+      <div class="bullet">2</div>
+      <div><strong>Predict & execute</strong> — a Pioneer AI specialist model chooses grasp parameters, then the arm acts.</div>
+    </div>
+    <div class="point">
+      <div class="bullet">3</div>
+      <div><strong>Observe & improve</strong> — Band AI agents review the outcome, store the lesson, and fine-tune the model.</div>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="ui-mock">
+      <div class="ui-top">live camera + 3d robot model</div>
+      <div class="ui-bottom">
+        <div class="line"><span style="color:#64b5f6">Planner</span> Attempt 2 / 3</div>
+        <div class="line"><span style="color:#ba68c8">Memory</span> Recalled 2 similar episodes</div>
+        <div class="line"><span style="color:#4dd0e1">Learner</span> aim_du=-53, approach_steps=5</div>
+        <div class="line"><span style="color:#ff9800">Critic</span> Outcome: success = true</div>
+      </div>
+    </div>
+
+    <div class="sponsors">
+      <div class="sponsor">
+        <div class="logo band">B</div>
+        <h3>Band</h3>
+        <p>Multi-agent coordination room</p>
+      </div>
+      <div class="sponsor">
+        <div class="logo actian">A</div>
+        <h3>Actian</h3>
+        <p>Vector episodic memory</p>
+      </div>
+      <div class="sponsor">
+        <div class="logo pioneer">P</div>
+        <h3>Pioneer</h3>
+        <p>Adaptive inference & fine-tuning</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="num">3</div><div class="label">Sponsors</div></div>
+    <div class="metric"><div class="num">5</div><div class="label">Modules</div></div>
+    <div class="metric"><div class="num">∞</div><div class="label">Learning loops</div></div>
+  </div>
+
+  <div class="footer">Built on RAX — Robot Agent eXchange</div>
+</div>
+</body>
+</html>

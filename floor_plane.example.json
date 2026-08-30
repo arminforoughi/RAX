@@ -1,0 +1,6 @@
+{
+  "_comment": "The measured table/floor plane in base frame, written by the calibrate_floor routine. Machine-specific: your table is not at the same height as anyone else's.",
+  "normal": [0.0, 0.0, 1.0],
+  "offset_m": -0.022,
+  "points": 5312
+}

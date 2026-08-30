@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAX Evolve - Self-Learning Robot</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0f13; color: #e0e6ed;
+    font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+    height: 100vh; overflow: hidden; display: flex; flex-direction: column;
+  }
+  header {
+    background: #11181f; border-bottom: 1px solid #1f2a33;
+    padding: 10px 18px; display: flex; align-items: center; gap: 14px;
+  }
+  header h1 { font-size: 15px; letter-spacing: 0.8px; }
+  header .badge {
+    font-size: 10px; padding: 3px 8px; border-radius: 4px;
+    background: #1b4d2e; color: #4caf50; text-transform: uppercase;
+  }
+  header .status { margin-left: auto; font-size: 11px; color: #789; }
+  header a {
+    color: #64b5f6; text-decoration: none; font-size: 12px;
+    border: 1px solid #2a4a6a; padding: 5px 10px; border-radius: 5px;
+  }
+  header a:hover { background: #1a2d3d; }
+  main {
+    flex: 1; display: grid; grid-template-columns: 1fr 420px;
+    overflow: hidden;
+  }
+  #robot-frame {
+    width: 100%; height: 100%; border: none; background: #000;
+  }
+  #side {
+    border-left: 1px solid #1f2a33;
+    display: flex; flex-direction: column; overflow: hidden;
+    background: #0f141a;
+  }
+  .panel { border-bottom: 1px solid #1f2a33; padding: 14px; }
+  .panel h2 {
+    font-size: 11px; color: #789; text-transform: uppercase; letter-spacing: 0.6px;
+    margin-bottom: 10px;
+  }
+  .metrics {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px;
+  }
+  .metric {
+    background: #141b23; border: 1px solid #243040; border-radius: 6px;
+    padding: 10px; text-align: center;
+  }
+  .metric .num { font-size: 20px; font-weight: 800; color: #4caf50; }
+  .metric .label { font-size: 10px; color: #64748b; margin-top: 4px; text-transform: uppercase; }
+  .metric.fail .num { color: #ff7043; }
+  .metric.mem .num { color: #ba68c8; }
+  .params {
+    background: #141b23; border: 1px solid #243040; border-radius: 6px;
+    padding: 10px; font-size: 11px; color: #94a3b8; font-family: inherit;
+    min-height: 64px; white-space: pre-wrap;
+  }
+  .task-row { display: flex; gap: 8px; }
+  #task-input {
+    flex: 1; background: #141b23; border: 1px solid #2b3844; color: #e0e6ed;
+    padding: 10px 12px; border-radius: 6px; font-family: inherit; font-size: 13px;
+  }
+  #task-input:focus { outline: none; border-color: #4caf50; }
+  button {
+    background: #1b4d2e; border: 1px solid #2a6b3e; color: #4caf50;
+    padding: 10px 14px; border-radius: 6px; cursor: pointer; font-family: inherit;
+    font-size: 12px; font-weight: 700;
+  }
+  button:hover { background: #235c36; }
+  button.secondary {
+    background: #1a2d3d; border-color: #2a4a6a; color: #64b5f6;
+  }
+  .quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .quick button { padding: 6px 10px; font-size: 11px; font-weight: 500; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 14px; font-size: 11.5px; line-height: 1.6;
+  }
+  .msg { margin-bottom: 8px; }
+  .role {
+    display: inline-block; min-width: 62px; font-weight: 700;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .role-Planner { color: #64b5f6; }
+  .role-Executor { color: #4caf50; }
+  .role-Critic { color: #ff9800; }
+  .role-Memory { color: #ba68c8; }
+  .role-Learner { color: #4dd0e1; }
+  .role-Band { color: #f06292; }
+  .role-Pioneer { color: #aed581; }
+  .role-System { color: #90a4ae; }
+  .history { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #4caf50;
+  }
+  .dot.fail { background: #ff7043; }
+  .agent-tag {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    padding: 4px 8px; border-radius: 4px; border: 1px solid;
+  }
+  .agent-tag.planner { color: #64b5f6; border-color: #2a4a6a; }
+  .agent-tag.memory { color: #ba68c8; border-color: #5a2a5a; }
+  .agent-tag.learner { color: #4dd0e1; border-color: #2a5a5a; }
+  .agent-tag.executor { color: #4caf50; border-color: #2a5a35; }
+  .agent-tag.critic { color: #ff9800; border-color: #5a3a1a; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>GraspGPT</h1>
+  <span class="badge">Self-Learning</span>
+  <a href="/how_it_works.html" target="_blank">How it works</a>
+  <span class="status" id="conn-status">connecting...</span>
+</header>
+<main>
+  <iframe id="robot-frame" src="/robot_view"></iframe>
+  <div id="side">
+    <div class="panel">
+      <h2>Learning Live</h2>
+      <div class="metrics">
+        <div class="metric"><div class="num" id="m-attempts">0</div><div class="label">Attempts</div></div>
+        <div class="metric"><div class="num" id="m-success">0</div><div class="label">Success</div></div>
+        <div class="metric fail"><div class="num" id="m-fail">0</div><div class="label">Failures</div></div>
+        <div class="metric mem"><div class="num" id="m-mem">0</div><div class="label">Memories</div></div>
+        <div class="metric"><div class="num" id="m-rate">0%</div><div class="label">Success Rate</div></div>
+        <div class="metric"><div class="num" id="m-model">-</div><div class="label">Pioneer Model</div></div>
+      </div>
+      <div class="history" id="history"></div>
+      <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:6px;">
+        <span style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:0.5px; width:100%; margin-bottom:2px;">Agents</span>
+        <span class="agent-tag planner">Planner</span>
+        <span class="agent-tag memory">Memory</span>
+        <span class="agent-tag learner">Learner</span>
+        <span class="agent-tag executor">Executor</span>
+        <span class="agent-tag critic">Critic</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Current Parameters</h2>
+      <div class="params" id="params">waiting for first prediction...</div>
+    </div>
+
+    <div class="panel">
+      <h2>Task</h2>
+      <div class="task-row">
+        <input id="task-input" type="text" placeholder="pick the red cube and place it on the green cube"
+               onkeydown="if(event.key==='Enter') runTask()">
+        <button onclick="runTask()">Run</button>
+      </div>
+      <div class="quick">
+        <button class="secondary" onclick="setTask('pick the red cube')">pick red</button>
+        <button class="secondary" onclick="setTask('pick the green cube')">pick green</button>
+        <button class="secondary" onclick="setTask('place it on the green cube')">place on green</button>
+        <button class="secondary" onclick="scanMap()">SCAN MAP</button>
+        <button class="secondary" onclick="homeRobot()">FOLD HOME</button>
+        <button class="secondary" onclick="stopRobot()">STOP</button>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </div>
+</main>
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('conn-status');
+let lastEventTime = 0;
+let attempts = 0, successes = 0, failures = 0, memories = 0;
+
+function setTask(t) { document.getElementById('task-input').value = t; }
+
+function addLog(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML = `<span class="role role-${role}">${role}</span> ${escapeHtml(text)}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function escapeHtml(t) {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function updateMetrics() {
+  document.getElementById('m-attempts').textContent = attempts;
+  document.getElementById('m-success').textContent = successes;
+  document.getElementById('m-fail').textContent = failures;
+  document.getElementById('m-mem').textContent = memories;
+  const rate = attempts ? Math.round((successes / attempts) * 100) : 0;
+  document.getElementById('m-rate').textContent = rate + '%';
+}
+
+function addHistory(success) {
+  const d = document.createElement('div');
+  d.className = 'dot' + (success ? '' : ' fail');
+  d.title = success ? 'success' : 'failure';
+  document.getElementById('history').appendChild(d);
+}
+
+async function runTask() {
+  const input = document.getElementById('task-input');
+  const task = input.value.trim();
+  if (!task) return;
+  input.value = '';
+  addLog('System', 'Starting: ' + task);
+  try {
+    const r = await fetch('/agent/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({task, max_attempts: 3})
+    });
+    const d = await r.json();
+    if (!d.ok) addLog('System', 'Run failed: ' + JSON.stringify(d));
+  } catch(e) {
+    addLog('System', 'Network error: ' + e.message);
+  }
+}
+
+async function stopRobot() {
+  try { await fetch('/stop', {method:'POST'}); addLog('System', 'Stop sent'); }
+  catch(e) { addLog('System', 'Stop error: ' + e.message); }
+}
+
+async function homeRobot() {
+  try { await fetch('/home', {method:'POST'}); addLog('System', 'Fold home sent'); }
+  catch(e) { addLog('System', 'Home error: ' + e.message); }
+}
+
+async function scanMap() {
+  try { await fetch('/scan2d', {method:'POST'}); addLog('System', 'Scan 2D map started'); }
+  catch(e) { addLog('System', 'Scan error: ' + e.message); }
+}
+
+async function pollEvents() {
+  try {
+    const r = await fetch('/agent/events?since=' + lastEventTime);
+    const events = await r.json();
+    events.forEach(ev => {
+      addLog(ev.role, ev.text);
+      if (ev.t > lastEventTime) lastEventTime = ev.t;
+
+      if (ev.role === 'Planner' && ev.text.includes('Attempt')) {
+        attempts++; updateMetrics();
+      }
+      if (ev.role === 'Critic') {
+        const ok = ev.outcome && ev.outcome.success;
+        if (ok) { successes++; addHistory(true); }
+        else { failures++; addHistory(false); }
+        updateMetrics();
+      }
+      if (ev.role === 'Memory' && ev.text.includes('Remembered')) {
+        memories++; updateMetrics();
+      }
+      if (ev.role === 'Learner' && ev.text.includes('Predicted params')) {
+        const m = ev.text.match(/\{.*\}/);
+        if (m) document.getElementById('params').textContent = JSON.stringify(JSON.parse(m[0]), null, 2);
+      }
+      if (ev.role === 'Pioneer' && ev.text.includes('Predicted')) {
+        const m = ev.text.match(/via (.+?):/);
+        if (m) document.getElementById('m-model').textContent = m[1];
+      }
+    });
+  } catch(e) { statusEl.textContent = 'events offline'; }
+}
+
+async function pollStatus() {
+  try {
+    const r = await fetch('/agent/status');
+    const d = await r.json();
+    statusEl.textContent = d.robot_connected
+      ? `robot connected · events ${d.event_count}`
+      : 'robot disconnected';
+  } catch(e) { statusEl.textContent = 'server offline'; }
+}
+
+setInterval(pollEvents, 600);
+setInterval(pollStatus, 2000);
+pollStatus();
+</script>
+</body>
+</html>
