@@ -13,10 +13,15 @@
 #   .\run_server.ps1 -Force   replace a running one
 #   .\run_server.ps1 -Stop    stop it
 #   .\run_server.ps1 -Status  is it alive?
+#   .\run_server.ps1 -SkipPreflight   start even if a preflight check trips
+#
+# Before launching, it preflights the host-side faults written up in
+# TROUBLESHOOTING.md and refuses to start rather than dying ~40s later inside
+# cam.connect() with an error that reads like dead hardware.
 #
 # NOTE: ASCII only. Windows PowerShell 5.1 reads .ps1 as ANSI, so a UTF-8 em dash
 # in a string becomes mojibake and throws a ParserError.
-param([switch]$Stop, [switch]$Status, [switch]$Force, [string]$Port)
+param([switch]$Stop, [switch]$Status, [switch]$Force, [string]$Port, [switch]$SkipPreflight)
 
 # The arm's serial port. The profile reads RAX_ARM_PORT and has no default, so a
 # server started without it connects to '' and dies in robot.connect() - which is
@@ -46,6 +51,87 @@ if ($Stop) {
   $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; "stopped pid=$($_.ProcessId)" }
   Start-Sleep -Seconds 3
   return
+}
+
+# ---------------------------------------------------------------------------
+# PREFLIGHT: the two host-side faults that cost days in Sep 2026.
+#
+# Neither is a hardware fault and neither travels with the device - both live in
+# THIS machine's config, which is why the same OAK-D worked fine on a Mac while
+# every connect here failed. Without these checks the only symptom is a ~17s
+# stall inside dai.Device() and then
+#     RuntimeError: Failed to find device after booting, X_LINK_DEVICE_NOT_FOUND
+# which reads like a dead camera and sends you hunting cables for a week.
+# See TROUBLESHOOTING.md for the full write-up.
+#
+#   1. The OAK-D enumerates under TWO ids: 03E7:2485 (Movidius bootloader, what
+#      you see while it sits idle) and 03E7:F63B (Luxonis Device, what it becomes
+#      AFTER depthai uploads firmware). A disable flag on F63B is INVISIBLE while
+#      the camera is idle - Device Manager shows a healthy 2485 - and only bites
+#      during the ~6s boot window. ConfigFlags=1 is CONFIGFLAG_DISABLED.
+#   2. usbipd bind (STATE=Shared) hands the device toward WSL and swaps its
+#      driver. A PERSISTED binding re-applies itself on every replug, so the
+#      fault comes back every single time the camera is plugged in.
+# ---------------------------------------------------------------------------
+$OAK_F63B = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB\VID_03E7&PID_F63B\19443010F15FF81200'
+
+function Test-RigHealth {
+  $problems = @()
+
+  $cf = (Get-ItemProperty $OAK_F63B -Name ConfigFlags -ErrorAction SilentlyContinue).ConfigFlags
+  if ($cf -eq 1) {
+    $problems += @"
+OAK-D booted identity (PID_F63B) is DISABLED (ConfigFlags=1).
+    depthai boots the camera, Windows disables it the instant it enumerates, and
+    the server dies in cam.connect() with X_LINK_DEVICE_NOT_FOUND.
+    Fix from an ADMIN PowerShell, then unplug and replug the camera:
+      Set-ItemProperty '$OAK_F63B' -Name ConfigFlags -Value 0 -Type DWord
+"@
+  }
+
+  $shared = @()
+  try {
+    foreach ($line in (usbipd list)) {   # try/catch below covers usbipd being absent
+      if ($line -match '03e7:(2485|f63b)|1a86:55d3') {
+        # -match is CASE-INSENSITIVE and 'Not shared' contains 'shared', so matching
+        # on 'Shared' alone flags every healthy device. Exclude the negative first.
+        if ($line -notmatch 'Not\s+shared' -and $line -match 'Shared') { $shared += $line.Trim() }
+      }
+    }
+  } catch { }
+  if ($shared.Count) {
+    $problems += ("usbipd has the rig BOUND (Shared) - handed toward WSL:" + "`n      " +
+      ($shared -join "`n      ") + "`n" +
+      "    Fix from an ADMIN PowerShell. The busid moves on every replug, so read it" + "`n" +
+      "    fresh from 'usbipd list' rather than reusing an old one:" + "`n" +
+      "      usbipd unbind --busid <busid>" + "`n" +
+      "    If it comes back after a replug, a PERSISTED binding is re-applying it -" + "`n" +
+      "    those show under 'Persisted' in usbipd list, and unbind clears them too.")
+  }
+
+  $ports = [System.IO.Ports.SerialPort]::getportnames()
+  if ($ports -notcontains $env:RAX_ARM_PORT) {
+    $seen = 'none'
+    if ($ports.Count) { $seen = ($ports -join ', ') }
+    $problems += ("arm port $env:RAX_ARM_PORT not present. COM ports seen: $seen" + "`n" +
+      "    If the list is EMPTY the CH343 has not enumerated at all - that is a cable" + "`n" +
+      "    or port fault, not a config one, and no amount of retrying fixes it." + "`n" +
+      "    If it enumerated somewhere else, pass -Port COMn.")
+  }
+  return $problems
+}
+
+if (-not $SkipPreflight) {
+  $issues = @(Test-RigHealth)
+  if ($issues.Count) {
+    ''
+    'PREFLIGHT FAILED - the server cannot connect until these are fixed:'
+    ''
+    foreach ($p in $issues) { "  * $p"; '' }
+    'Not starting. See TROUBLESHOOTING.md. Use -SkipPreflight to start anyway.'
+    return
+  }
+  'preflight: OK'
 }
 
 $existing = Get-Server

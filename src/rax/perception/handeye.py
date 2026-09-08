@@ -61,7 +61,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 __all__ = [
-    "HandEyeSample", "HandEyeFit", "fit_reprojection", "fit_consistency",
+    "HandEyeSample", "GraspSample", "HandEyeFit", "fit_reprojection", "fit_consistency",
+    "fit_to_known_points",
     "load_hand_eye", "save_hand_eye", "tf_string",
 ]
 
@@ -76,6 +77,10 @@ MAX_SPREAD_M = 0.04
 
 MIN_VIEWS_REPROJECTION = 6
 MIN_VIEWS_CONSISTENCY = 5
+
+#: Six unknowns, two residuals per grasp, so three is the algebraic minimum -
+#: demand a couple more so one mis-recorded grasp cannot carry the fit.
+MIN_VIEWS_KNOWN_POINTS = 5
 
 
 @dataclass(frozen=True)
@@ -264,6 +269,98 @@ def fit_reprojection(samples, geometry, *, tip_uv, T_seed, target_seed=None,
 
 
 # --- objective 2: the same object lands in the same place ----------------------------
+@dataclass
+class GraspSample:
+    """One object seen, then grasped: the pixel it appeared at, and where it WAS.
+
+    ``p_base`` is not an estimate. It is forward kinematics at the moment the jaws
+    closed on the object — the arm's own joint encoders, owing nothing to the camera,
+    the hand-eye transform, or the table plane. That independence is the whole point.
+    """
+
+    T_base_ee: np.ndarray      # 4x4 FK pose when the pixel was observed
+    uv: np.ndarray             # (u, v) the object appeared at, in that frame
+    p_base: np.ndarray         # (x, y, z) where the grasp proved it actually was
+
+
+def fit_to_known_points(samples, geometry, *, T_seed, max_rms_px: float = 12.0
+                        ) -> HandEyeFit:
+    """Fit the transform against objects whose true position is KNOWN.
+
+    WHY THIS EXISTS, when there are already two fitters.
+
+    ``fit_reprojection`` solves for the transform AND the target's position together:
+    nine unknowns, and translation can trade against rotation with the target absorbing
+    the difference. Seeded with the exact true transform on noise-free data it still
+    drifts ~14mm / ~3 degrees while reporting a perfect 0.5px residual. The objective
+    cannot tell it moved.
+
+    ``fit_consistency`` demands only that every viewpoint AGREE on where the object is.
+    Agreement is not correctness. Run on this rig it converged to 0.3cm agreement across
+    ten views — and picking got worse, because the ten views now agreed on the wrong
+    place. Map spread improved 30x while grasp accuracy regressed.
+
+    Both fail for the same reason: nothing in either objective knows where the object
+    ACTUALLY is. A grasp does. When the jaws close, the object is between the
+    fingertips, and forward kinematics says where those are — measured by the arm, with
+    no camera in the loop. Fixing ``p_base`` collapses the unknowns from nine to six and
+    the flat direction with them; the residual is then honest pixels of reprojection
+    error, which is a quantity you can refuse a fit on.
+    """
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+
+    samples = list(samples)
+    n = len(samples)
+    if n < MIN_VIEWS_KNOWN_POINTS:
+        return HandEyeFit(np.asarray(T_seed), n, "known-point reprojection", False,
+                          f"only {n} grasp samples (need {MIN_VIEWS_KNOWN_POINTS}) — "
+                          f"each successful pick records one")
+
+    T_seed = np.asarray(T_seed, dtype=np.float64)
+    g = geometry
+    pairs = [(np.asarray(s.T_base_ee, np.float64), np.asarray(s.uv, np.float64),
+              np.asarray(s.p_base, np.float64)) for s in samples]
+
+    def resid(x):
+        T_ee_cam = _unpack_r_first(x)
+        out = np.zeros(2 * n)
+        for i, (T_ee, uv, p) in enumerate(pairs):
+            T = T_ee @ T_ee_cam
+            # base -> camera, then pinhole. A point behind the camera cannot be seen;
+            # push it hard rather than letting it produce a plausible pixel.
+            R, t = T[:3, :3], T[:3, 3]
+            pc = R.T @ (p[:3] - t)
+            if pc[2] <= 1e-4:
+                out[2 * i:2 * i + 2] = 1e3
+                continue
+            u = g.cx + g.fx * pc[0] / pc[2]
+            v = g.cy + g.fy * pc[1] / pc[2]
+            out[2 * i:2 * i + 2] = (u - uv[0], v - uv[1])
+        return out
+
+    x0 = np.concatenate([Rotation.from_matrix(T_seed[:3, :3]).as_rotvec(), T_seed[:3, 3]])
+    # Translation bounds have to admit the ANSWER, not just a tweak of the seed. A
+    # shipped transform can be wrong by more than the mount is large — the one on this
+    # rig was out by 12cm — and a +/-10cm box around a wrong seed simply excludes the
+    # truth, leaving the solver to stop on the wall and report a residual that looks
+    # like a hard problem rather than a boxed-in one.
+    lo = np.concatenate([x0[:3] - 1.5, x0[3:] - 0.25])
+    hi = np.concatenate([x0[:3] + 1.5, x0[3:] + 0.25])
+    before = float(np.sqrt(np.mean(resid(x0) ** 2)))
+    sol = least_squares(resid, x0, bounds=(lo, hi), x_scale="jac",
+                        max_nfev=4000, ftol=1e-12, xtol=1e-12)
+    after = float(np.sqrt(np.mean(sol.fun ** 2)))
+    T_new = _unpack_r_first(sol.x)
+    ok = after <= before and after <= max_rms_px
+    return HandEyeFit(
+        T_new, n, "known-point reprojection", ok,
+        "" if ok else (f"reprojection {after:.1f}px over {n} grasps "
+                       f"(was {before:.1f}px, need <={max_rms_px:.0f}px) — "
+                       f"mount NOT changed"),
+        rms_px=after, before={"rms_px": before})
+
+
 def fit_consistency(samples, geometry, *, tip_uv, T_seed, z_plane: float = 0.0,
                     tip_offset_m: float = 0.0, max_spread_m: float = MAX_SPREAD_M
                     ) -> HandEyeFit:
@@ -290,39 +387,92 @@ def fit_consistency(samples, geometry, *, tip_uv, T_seed, z_plane: float = 0.0,
     t0 = T_seed[:3, 3].copy()
     g = geometry
 
-    def table_pts(T_ee_cam):
-        """Where each view says the object is, on the table plane. None if any ray
-        points the wrong way — a fit built on one is meaningless."""
-        pts = []
+    #: A ray must point at least this far downward to be worth intersecting.
+    DOWN_EPS = 1e-3
+    #: Weight on a view that produced no table point. Large enough to dominate the
+    #: spread term, so the fit prefers transforms where every view resolves.
+    INVALID_W = 50.0
+
+    def view_points(T_ee_cam):
+        """Per-view table intersection, plus how far each FAILING view is from having
+        one.
+
+        The failing views are the whole point. This objective used to be all-or-
+        nothing: one view whose ray came out pointing upward returned None for the
+        entire set, ``resid`` answered with a CONSTANT vector, and least_squares saw
+        zero gradient everywhere and could not move a single step. The fit then
+        reported "did not converge" and left the mount untouched — from a mildly wrong
+        seed it worked, and from a badly wrong one it did nothing at all, which is
+        exactly the seed you are calibrating away from. Reproduced synthetically at
+        rot_err=(0.6, 0.6, -0.5): before and after both 999, transform unchanged.
+
+        So a view that fails now contributes a SMOOTH measure of its failure instead of
+        poisoning the batch: how far its ray is from pointing usefully downward, or how
+        far its intersection lies outside the plausible range. Those vary continuously
+        with the transform, so the optimizer can climb out of the bad region.
+        """
+        pts, pen, valid = [], [], []
         for T_ee, uv in pairs:
             T = T_ee @ T_ee_cam
             o = T[:3, 3]
             d = T[:3, :3] @ np.array([(uv[0] - g.cx) / g.fx, (uv[1] - g.cy) / g.fy, 1.0])
-            if d[2] >= -1e-3:
-                return None
-            t = (z_plane - o[2]) / d[2]
-            if not (0.02 < t < 2.0):
-                return None
-            pts.append((o + t * d)[:2])
-        return np.array(pts) if pts else None
+            # Unit ray, so d[2] is a direction cosine in [-1, 1] and t is a distance in
+            # metres. The intersection point is unchanged by this (t rescales with d);
+            # what it buys is penalties that are comparable between views instead of
+            # scaled by an arbitrary pixel-ray length.
+            nd = float(np.linalg.norm(d))
+            if nd > 1e-9:
+                d = d / nd
+            if d[2] < -DOWN_EPS:
+                t = (z_plane - o[2]) / d[2]
+                if 0.02 < t < 2.0:
+                    pts.append((o + t * d)[:2]); pen.append(0.0); valid.append(True)
+                    continue
+                # It does meet the plane, just absurdly near or far. A ray a hair off
+                # parallel gives t in the thousands, so this is CLIPPED: an unbounded
+                # penalty swamps the spread term and makes the landscape worse, not
+                # better. What matters is the direction to move, not the magnitude.
+                over = (0.02 - t) if t <= 0.02 else (t - 2.0)
+                pts.append(None); valid.append(False)
+                pen.append(float(min(abs(over), 2.0)))
+                continue
+            # Ray points up or along the plane: no intersection ahead of the camera.
+            # d[2] in [-DOWN_EPS, 1], so this is already bounded.
+            pts.append(None); valid.append(False)
+            pen.append(float(d[2] + DOWN_EPS) + 1.0)
+        return pts, pen, valid
+
+    def _good(pts, valid):
+        return np.array([p for p, v in zip(pts, valid) if v])
 
     def resid(x):
         T = _unpack_r_first(x)
-        pts = table_pts(T)
-        if pts is None:
-            return np.full(2 * n + 2, 10.0)
-        spread = (pts - pts.mean(axis=0)).ravel() * 40.0        # metres -> weighted
+        pts, pen, valid = view_points(T)
+        good = _good(pts, valid)
+        out = np.zeros(2 * n + 2)
+        m = good.mean(axis=0) if len(good) >= MIN_VIEWS_CONSISTENCY else None
+        for i, (p, v) in enumerate(zip(pts, valid)):
+            if v and m is not None:
+                out[2 * i:2 * i + 2] = (p - m) * 40.0
+            else:
+                out[2 * i:2 * i + 2] = INVALID_W * (1.0 + abs(pen[i]))
         # The anchor keeps the solution from sliding into a mirrored or degenerate
         # pose; it is weighted low so it guides rather than dominates.
         d = _tip_error_uv(g, pairs[0][0], T, tip_uv, tip_offset_m)
-        anchor = np.array([10.0, 10.0]) if d is None else np.array(d) * 0.02
-        return np.concatenate([spread, anchor])
+        out[2 * n:2 * n + 2] = ([10.0, 10.0] if d is None
+                                else np.asarray(d, dtype=np.float64) * 0.02)
+        return out
 
     def spread_of(x):
-        pts = table_pts(_unpack_r_first(x))
-        if pts is None:
+        pts, _pen, valid = view_points(_unpack_r_first(x))
+        good = _good(pts, valid)
+        if len(good) < MIN_VIEWS_CONSISTENCY:
             return 999.0
-        return float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).mean())
+        return float(np.linalg.norm(good - good.mean(axis=0), axis=1).mean())
+
+    def n_valid(x):
+        pts, _pen, valid = view_points(_unpack_r_first(x))
+        return int(sum(valid))
 
     x0 = np.concatenate([Rotation.from_matrix(T_seed[:3, :3]).as_rotvec(), t0])
     lo = np.concatenate([x0[:3] - 1.2, t0 - 0.06])
@@ -333,9 +483,18 @@ def fit_consistency(samples, geometry, *, tip_uv, T_seed, z_plane: float = 0.0,
     after = spread_of(sol.x)
     T_new = _unpack_r_first(sol.x)
     ok = after <= before and after <= max_spread_m
+    nv_before, nv_after = n_valid(x0), n_valid(sol.x)
+    why = f"did not converge (spread {after * 100:.1f}cm) — mount NOT changed"
+    if after >= 999.0:
+        # Say WHICH gate rejected and how many views survived it, rather than leaving
+        # a 999 sentinel for someone to reverse-engineer.
+        why = (f"only {nv_after}/{n} views produced a table intersection "
+               f"(need {MIN_VIEWS_CONSISTENCY}) — the seed transform points those "
+               f"sightlines away from the table; re-run from a steeper view of the "
+               f"object, or fix the seed first — mount NOT changed")
     return HandEyeFit(
         T_new, n, "multi-view consistency", ok,
-        "" if ok else f"did not converge (spread {after * 100:.1f}cm) — mount NOT changed",
+        "" if ok else why,
         spread_m=after,
         tip_gap_px=_tip_gap(g, pairs[0][0], T_new, tip_uv, tip_offset_m),
         before={"spread_m": before})

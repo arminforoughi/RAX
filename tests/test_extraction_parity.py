@@ -97,15 +97,15 @@ def _load_module():
         sys.path.insert(0, str(MISSION_SERVER_DIR))
     try:
         import mission_server as S
-        from lerobot.model.kinematics import RobotKinematics
+        from rax.manipulation.arms.kinematics import make_kinematics
     except Exception as exc:  # pragma: no cover - environment dependent
         pytest.skip(f"the reference monolith needs a lerobot checkout: {exc}")
 
-    S.kin = RobotKinematics(str(URDF), EE_FRAME, ARM_MOTORS)
+    S.kin = make_kinematics(str(URDF), EE_FRAME, ARM_MOTORS)
     S.fx, S.fy, S.cx0, S.cy0 = FX, FY, CX, CY
     # Pin the hand-eye to the in-source constant, NOT to handeye_tf.json — that file
     # is re-fitted by /calib and would silently move every golden.
-    S.T_ee_cam = S.parse_tf_string(S.TF)
+    S.T_ee_cam = S.parse_tf(S.TF)
     # Push both into the shared CameraGeometry the way the running server does. Doing
     # this explicitly matters: the pinned intrinsics happen to equal the profile's
     # fallback, so without it the geometry goldens would pass even if the sync were
@@ -118,6 +118,14 @@ def _load_module():
     S.CFG.range_scale = 1.0
     S.CFG.bearing_offset_deg = 0.0
     S.PRIORS.fallback_edge_m = 0.0508
+    # These goldens freeze the ORIGINAL monolith's answers, and it walked the
+    # size-derived distance along the sightline rather than treating it as axial depth.
+    # The running server no longer does — the sightline placement puts an off-axis
+    # object too close by cos(angle), measured at 11cm on a real cube, enough to report
+    # two objects in the wrong order. Pinning it off here keeps this test measuring what
+    # it is for (did the EXTRACTION change behaviour) rather than re-litigating a
+    # deliberate fix. tests/test_axial_depth.py covers the new behaviour.
+    S.localizers().apparent.axial_depth = False
     return S
 
 
@@ -443,7 +451,7 @@ def test_geometry_sync_is_live():
     assert S.project_base(np.array([0.25, 0.0, 0.02]), T) == before
 
     # A different hand-eye must move the camera pose itself.
-    S.T_ee_cam = S.parse_tf_string("0.01,0.02,0.03,0,0,0")
+    S.T_ee_cam = S.parse_tf("0.01,0.02,0.03,0,0,0")
     S._sync_geometry()
     assert not np.allclose(np.asarray(S.T_cam_of(q)), T), "hand-eye change did not reach GEOM"
 
@@ -457,13 +465,13 @@ def test_pose_ik_branch_runs():
     """
     import dataclasses
 
-    from lerobot.model.kinematics import RobotKinematics
+    from rax.manipulation.arms.kinematics import make_kinematics
 
     from rax.manipulation.arms.ik_strategy import PoseIK, make_ik
     from rax.robots.profiles import load_profile
 
     p = load_profile("so101")
-    kin = RobotKinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
+    kin = make_kinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
     generic = dataclasses.replace(p, name="generic", ik="pose", pan_joint=None,
                                   pitch_chain=(), roll_joint=None, ik_seeds=())
     generic.validate()

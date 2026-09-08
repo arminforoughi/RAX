@@ -45,7 +45,7 @@ KNOBS: tuple[Knob, ...] = (
     Knob("approach_steps", "steps", 1.0, 1.0, 12.0, integer=True,
          doc="how many staged hops close the distance"),
     Knob("aim_du", "aim_du_px", 1.0, -300.0, 300.0,
-         doc="lateral pixel trim on the fingertip aim point"),
+         doc="EXTRA lateral pixel trim, added to the derived grasp bias"),
     Knob("aim_dv", "aim_dv_px", 1.0, -300.0, 300.0,
          doc="vertical pixel trim on the fingertip aim point"),
     Knob("push_out_cm", "push_out_m", 0.01, -5.0, 30.0,
@@ -93,8 +93,18 @@ class ApproachConfig:
     # Shift the hover target to the object's RIGHT so it stays on the LEFT of the
     # camera view during the approach and does not disappear under the gripper.
     right_trim_m: float = 0.050
-    # Stop short of the object radially, so the arm does not drive past it.
-    back_m: float = 0.010
+    # Stop short of the object radially, so the arm does not drive past it -- and, more
+    # importantly, so the object is still IN FRAME at the hover.
+    #
+    # Was 0.010. At 1 cm short the object left the camera's view at every single
+    # approach on this rig: the centring servo reported "object not in view", fell back
+    # to the staged estimate, and the final visual correction never ran once. The saved
+    # miss frames show the table and a gripper finger with no object anywhere in them.
+    # That is what made the grasp land on the object's centre and shove it, and it is
+    # also why a badly wrong aim_du sat unnoticed for so long -- the servo it feeds was
+    # never reached. At 4 cm the object stays visible and the servo converges in about
+    # two iterations. Measured 2026-09-06 over repeated picks, both values.
+    back_m: float = 0.040
     # Step 1 closes ~90% of the gap, the rest are small corrections. Tried 2 with a
     # full-distance first move and it missed more: arriving with no margin left means
     # any residual localization error lands as a miss.
@@ -146,13 +156,55 @@ class ApproachConfig:
     max_refine_out_m: float = 0.03
 
     # --- visual centering ---------------------------------------------------------
-    aim_du_px: float = -45.0
+    # Lateral pixel trim on the aim point. NEGATIVE shifts the aim LEFT in the image,
+    # which drives the arm RIGHT relative to the object.
+    #
+    # -45 -> -140 after the centring servo started converging. The trim is really
+    # compensating for what HAND_UV is: it was measured with /caltip against ONE black
+    # fingertip, not the midpoint between the jaws, so centring the object on it parks
+    # that finger on the object instead of straddling it — observed on hardware as the
+    # right finger sitting in the middle of the cube.
+    #
+    # 95 px is 2 cm at the grasp pose: fx=517, camera ~11 cm off the object, so
+    # fx * 0.02 / 0.11 = 94 px. Cross-checks against the same run's numbers — the
+    # servo accepted du=45px, so its tolerance was the 60px cap, which means the cube's
+    # apparent width was >180px, i.e. >35px/cm for a 5.08cm cube.
+    #
+    # THE PRINCIPLED FIX is to re-measure HAND_UV at the midpoint between the jaws
+    # rather than on one fingertip; this knob would then sit near zero. Until then it
+    # is a per-rig constant and it belongs on the dial.
+    # An ADDITIVE trim on top of the derived grasp bias (derive.grasp_aim_offset_px),
+    # not the bias itself. It was -140.0, a hand-dialled pixel count that is 9.5 cm at
+    # 35 cm range and 4.8 cm at 18 cm — enough to put a 5 cm cube wholly outside the
+    # jaws. It went unnoticed because the centring servo it feeds never converged (the
+    # object left frame at the hover), so the value was never applied. With the servo
+    # running it closed on air every time. 0.0 = take the derived bias as-is.
+    aim_du_px: float = 0.0
     aim_dv_px: float = 0.0
     # Object this close to the aim pixel counts as centred. Deliberately loose: the
     # staged approach already gets close, and chasing a tight pixel tolerance with
     # coarse radial reach moves costs iterations without improving the grasp.
     align_tol_px: float = 40.0
-    align_iters: int = 3
+    # Was 3, and 3 could not finish the job it was given. The servo inherits whatever
+    # lateral offset the approach parked at — right_trim_m, ~250 px at grasp range —
+    # and each iteration is capped at 4.5 deg of pan when close. Measured on a real
+    # pick: 268 px of error at 12.8 px/deg needs 21 deg of pan, against a budget of
+    # 3 x 4.5 = 13.5 deg. The loop was structurally unable to converge and reported
+    # max_iters on every pick in the log, so the grasp always fell back to the
+    # uncorrected mapped position. Raised to give the loop more actuation than the
+    # error it is handed; the tolerance, not the counter, should be what ends it.
+    # (The trim now also decays across the approach — see trim_final_frac — so this
+    # budget is sized against a much smaller starting error than the one measured.)
+    align_iters: int = 8
+
+    # How much of right_trim_m is left at the LAST approach stage. The trim exists to
+    # keep the object off to one side so it stays in frame during transit, and that
+    # need is strongest early — far away, swinging — and weakest at the final hop,
+    # where it converts directly into pixel error the centring servo must undo. Decay
+    # it and the servo inherits an error it can actually close, without giving up the
+    # visibility the trim was there to buy. Full trim at stage 1, this fraction at the
+    # last stage. 1.0 restores the old fixed-trim behaviour.
+    trim_final_frac: float = 0.3
 
     # --- localization corrections -------------------------------------------------
     push_out_m: float = 0.0

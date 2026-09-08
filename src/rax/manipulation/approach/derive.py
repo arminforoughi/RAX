@@ -30,6 +30,7 @@ import math
 
 __all__ = [
     "grasp_height", "hover_height", "align_tolerance_px", "apparent_width_px",
+    "grasp_aim_offset_px", "grasp_bias_m",
     "right_trim_for_visibility", "horizontal_fov_deg",
 ]
 
@@ -106,6 +107,56 @@ def align_tolerance_px(geometry, object_size_m: float, range_m: float, *,
     """
     tol = fraction * apparent_width_px(geometry, object_size_m, range_m)
     return float(min(max(tol, bounds[0]), bounds[1]))
+
+
+#: Hold the fingertip this fraction of the object's WIDTH to its right, all the way in.
+#:
+#: Why any bias at all. The jaws straddle the object, but they do not arrive from
+#: directly above: the approach still carries lateral motion, so the near finger
+#: sweeps in slightly ahead of the far one. Aimed dead-centre, that finger arrives on
+#: the object's face and shoves it before the jaws can close — the "it pushes the cube
+#: away" failure.
+#:
+#: Why it must be held from the FIRST hop. The offset used to decay to ~30% across the
+#: approach and then be re-applied by the centring servo at the hover. Observed on the
+#: rig: "it goes from middle, then goes to right, which makes it push the object away
+#: most of the time" — the late lateral move happens with the jaws already beside the
+#: object, which is the worst possible moment for it. One offset, established on the
+#: first approach and held to the grasp, means the gripper never crosses the object.
+#:
+#: Half a width puts a 5.08 cm cube at 2.5 cm, which is where the offset was asked for
+#: by eye on this rig. It stays inside the jaw span for every entry in the class table.
+DEFAULT_GRASP_AIM_FRACTION = 0.5
+
+#: Clamp on the derived bias, in METRES. Bounding the physical distance rather than a
+#: pixel count is the whole point — a pixel clamp is a different offset at every range,
+#: and at close approach it silently cut the bias to a third of what was asked for.
+GRASP_BIAS_BOUNDS_M = (0.0, 0.04)
+
+
+def grasp_bias_m(object_size_m: float, *,
+                 fraction: float = DEFAULT_GRASP_AIM_FRACTION,
+                 bounds=GRASP_BIAS_BOUNDS_M) -> float:
+    """How far right of the object the fingertip should sit at the grasp, in metres.
+
+    This is the one lateral offset: the staged approach decays TO it, and the centring
+    servo aims AT it, so neither introduces a sideways move the other has to undo.
+    """
+    return float(min(max(fraction * float(object_size_m), bounds[0]), bounds[1]))
+
+
+def grasp_aim_offset_px(geometry, object_size_m: float, range_m: float, *,
+                        fraction: float = DEFAULT_GRASP_AIM_FRACTION,
+                        bounds=GRASP_BIAS_BOUNDS_M) -> float:
+    """The same offset, in pixels at this range, in ``aim_du``'s sign convention.
+
+    NEGATIVE: the aim point sits left of the measured fingertip pixel, so the servo
+    drives until the object is left of the fingertip — putting the fingertip to the
+    object's right. Because it is the metres value converted at the live range, it is
+    the same physical distance near or far, which a dialled pixel count never is.
+    """
+    bias = grasp_bias_m(object_size_m, fraction=fraction, bounds=bounds)
+    return -float(apparent_width_px(geometry, bias, range_m))
 
 
 def horizontal_fov_deg(geometry) -> float:

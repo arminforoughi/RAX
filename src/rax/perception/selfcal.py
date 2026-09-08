@@ -104,6 +104,31 @@ class LocalizationModel:
         r2 = self.range_scale * r + self.push_out_m
         return np.array([r2 * math.cos(th), r2 * math.sin(th)])
 
+    def unapply(self, xy) -> np.ndarray:
+        """The exact inverse of :meth:`apply` — recover the raw observation.
+
+        Needed to fit from samples gathered DURING NORMAL OPERATION rather than during a
+        dedicated calibration. Ordinary picks are localized through whatever corrections
+        are dialled in at the time, so a sample recorded from one is already partly
+        corrected. Fitting on that measures the error that is LEFT, and applying the
+        result on top of the corrections already in place double-counts them: the fit
+        must be absolute — "this rig's range reads 6% long" — not a delta on the current
+        dial positions.
+
+        Record the correction state alongside each observation, undo it with this, and
+        every fit is against the raw rig no matter what was set when the sample was
+        taken. That is what lets the calibration converge over many runs instead of
+        oscillating as it chases its own last answer.
+        """
+        xy = np.asarray(xy, dtype=np.float64)
+        r = float(np.hypot(xy[0], xy[1]))
+        if r < 1e-9:
+            return xy.copy()
+        th = math.atan2(xy[1], xy[0]) - math.radians(self.bearing_offset_deg)
+        scale = self.range_scale if abs(self.range_scale) > 1e-9 else 1.0
+        r2 = max((r - self.push_out_m) / scale, 0.0)
+        return np.array([r2 * math.cos(th), r2 * math.sin(th)])
+
     def describe(self) -> str:
         return (f"range x{self.range_scale:.4f} {self.push_out_m * 100:+.2f}cm, "
                 f"bearing {self.bearing_offset_deg:+.2f}deg")

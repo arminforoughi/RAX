@@ -179,10 +179,26 @@ PROFILE = ArmProfile(
     # this plane to localize. If the grasp stops short/high, raise it a few mm; if it
     # drives into the table, lower it.
     table_z_m=0.02,
-    # Nothing that matters is outside the arm's own workspace (~42 cm reach), so a
-    # "cube" localized at 92 cm is a broken solve, not a distant object.
+    # Nothing that matters is outside the arm's own workspace, so a "cube" localized
+    # at 92 cm is a broken solve, not a distant object. This is a PLAUSIBILITY bound,
+    # deliberately looser than what the arm can grasp.
     reach_min_m=0.08,
     reach_max_m=0.55,
+    # MEASURED 2026-09-06, IK-verified, not guessed. Two independent probes agree:
+    # workspace.analyze_workspace on a 2 cm grid, and a 5 mm scan against the bare
+    # solver at 3 mm tolerance. Max fingertip radius at table height (z=2 cm):
+    #
+    #     pitch   0-15 deg  ->  47-48 cm     <- a flat wrist reaches furthest
+    #     pitch  30    deg  ->  44 cm
+    #     pitch  45    deg  ->  42 cm
+    #     pitch  60    deg  ->  38 cm
+    #     pitch  75    deg  ->  34 cm        <- the first grasp pitch tried
+    #     pitch  90    deg  ->  30 cm
+    #
+    # So "how far can it reach" has no single answer: it costs ~17 cm to go from a
+    # flat wrist to a vertical one. 0.47 is the best case, used as the hard ceiling;
+    # plan_pitch discovers the pitch-specific limit per target by solving for it.
+    reach_grasp_max_m=0.47,
 
     gripper=GRIPPER,
     camera=CAMERA,

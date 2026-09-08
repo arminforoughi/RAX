@@ -1,83 +1,117 @@
-# RAX robot-arm server, MODULARIZED: pick / place, an open-vocabulary object map,
-# an admin UI and a public guest UI, all on one Flask port (:8484).
+# RAX first-person-view manipulation server: see an object, locate it, drive at it,
+# grasp it, put it somewhere. Admin UI, guest UI and MJPEG stream on one Flask port
+# (:8484). This is the demo rig; the reusable stack it sits on is `rax.*` in src/.
 #
-# RELATIONSHIP TO stack_mission2.py
-#  This is the same server with its reusable half moved into packages. The original
-#  is kept, unchanged and runnable, so the two can be compared on the same hardware
-#  rather than the old one being replaced on trust. Behaviour is intended to be
-#  identical: the extracted pieces were verified bit-identical against the original
-#  over a 447-case golden grid (tests/test_extraction_parity.py), and the knobs,
-#  routes and /status payload are unchanged.
+# WHERE TO START READING
+#  If you want the pipeline rather than the demo, read src/rax/grasp.py — 400 lines,
+#  no Flask, no threads, runnable headless (`python -m rax.grasp --arm mock`). This
+#  file is that pipeline plus everything an unattended public demo needs, so most of
+#  its bulk is the demo, not the robot.
 #
-#  What moved, and where:
-#    robots/profiles/          the arm as data — URDF, joint topology, camera mount,
-#                              gripper thresholds. Swapping arms is writing one of
-#                              these; see docs/porting.md.
-#    manipulation/arms/        ik_strategy.py (pitch-hold and pose IK), motion.py
-#    manipulation/approach/    the tunables, approach staging, the centring servo
-#    perception/               camera geometry, table plane, class priors,
-#                              localization, measurement, hand-eye, self-calibration
-#    models/detection/         the between-detection trackers
-#    mobility/slam/            the object map
-#
-#  What deliberately stayed here: the Flask layer, guest sessions, the tunnel, the
-#  3D viewer, jog, and run_mission / place_at — which after the extractions are
-#  narration and orchestration over the packaged pieces, not reusable logic.
-#
-#  RAX_PORT=<n> runs this alongside the original for A/B comparison. Note only one
-#  process at a time can hold the arm's serial port and the camera.
-#
-# ARCHITECTURE
+# THE LOOP
 #  * DETECT: YOLO-World (open vocabulary) runs in a PARALLEL thread (~2.5 s) so it
 #    never sits in the control path; the two cube colours also have dedicated
 #    strict-HSV trackers that are tighter during close approach. publish() draws
-#    every detection on the FPV, not just the cubes.
-#  * MAP: sense_2d folds detections into a 2D bird's-eye map. Range is measured
-#    monocularly (the table IS the base plane) via measure_object, or falls back to
-#    apparent size; elongated objects are ranged from their long axis. Entries are
-#    merged by POSITION (one object fires under several labels), expire after
-#    MAP_TTL_S, and only carry an orientation when one was actually measured.
-#  * PICK: run_mission takes the mapped (x, y), approaches in 3 stages (step 1
-#    closes ~90%, the rest are small corrections), centres by eye onto the
-#    fingertip pixel (HAND_UV), descends and closes on the servo current.
-#  * PLACE: place_at puts a held object on a mapped object or a clicked spot;
-#    grip_to_bottom is measured at grasp, so release height needs only the
-#    destination's height. Typed tasks ("green on red") via /task.
-#  * SAFETY: the arm relaxes (torque off) after IDLE_RELAX_S and wakes on the next
-#    motion; a latched servo overload is cleared and retried at connect. Run under
-#    supervise.py, which restarts this and camserver if either dies.
-#  * GUEST: a Host-header gate exposes only a small allowlist over the public
-#    Tailscale-Funnel host; everything else is admin-only. See ui/*.html.
+#    every detection on the FPV, not just the cubes. A label naming a colour is
+#    gated on actually containing that colour — rax.models.detection.color_filters.
+#  * LOCATE: monocular. The table IS the base plane, so an object's pixel ray meets
+#    it at a known height (PlaneRayLocalizer); apparent size against a class prior is
+#    the fallback (ApparentSizeLocalizer). Neither needs depth, which is why the
+#    OAK-D runs colour-only here — see the DEPTH OFF note in main().
+#  * MAP: sense_2d folds detections into a 2D bird's-eye map. Entries are merged by
+#    POSITION (one object fires under several labels), expire after MAP_TTL_S, and
+#    only carry an orientation when one was actually measured.
+#  * APPROACH: run_mission takes the mapped (x, y) and closes in 3 stages (step 1
+#    covers ~90%, the rest correct), re-measuring between them so error is corrected
+#    while there is still room to correct it. IK holds the tool pitch through it.
+#  * CENTRE: the last correction is by eye — servo the object onto the fingertip
+#    pixel (HAND_UV). The servo MEASURES its own gains by probing rather than
+#    modelling them, because the hand-eye TF is wrong (see the NOTE below) and a
+#    modelled sign would drive the wrong way. approach/visual_center.py.
+#  * GRASP: descend, close on the servo current, and measure fingertip height at the
+#    instant of contact — that one number is the whole carry's grip->bottom distance.
+#  * PLACE: place_at puts a held object on a mapped object or a clicked spot; release
+#    height needs only the destination's height plus that measured offset.
+#
+# TASKS: "red on green"
+#  A phrase naming a destination is an instruction, not a vocabulary. Typed into
+#  EITHER the task box or the detection-query box it runs as a task: Start checks
+#  reads_as_a_task() first, and /setquery expands it to the vocabulary the task needs
+#  so both the object AND its destination can reach the map. This used to be a trap —
+#  the phrase in the query box read as two class names, Start picked whichever came
+#  first, and the arm grasped the red cube and folded home reporting success. See
+#  tests/test_task_routing.py, which pins that exact run.
+#
+# SAFETY: the arm relaxes (torque off) after IDLE_RELAX_S and wakes on the next
+#  motion; a latched servo overload is cleared and retried at connect. Run under
+#  supervise.py, which restarts this and camserver if either dies.
+# GUEST: a Host-header gate exposes only a small allowlist over the public
+#  Tailscale-Funnel host; everything else is admin-only. See ui/*.html.
+#
+# RUNNING IT
+#  examples/mission_server/run_server.ps1   (detached; -Status, -Stop, -Port COMn)
+#  Read TROUBLESHOOTING.md before debugging any "camera not found" — on this rig it
+#  has twice been a host-side flag, not the hardware.
+#
+#  Environment:
+#    RAX_ARM=<profile>     which arm (default so101; see robots/profiles/)
+#    RAX_ARM_PORT=<port>   the arm's serial port, else the profile's default
+#    RAX_PORT=<n>          this server's HTTP port (default 8484)
+#    RAX_LEROBOT_SRC=<dir> a lerobot source checkout, if it is not pip-installed
+#    RAX_YOLO_WEIGHTS=<f>  YOLO-World weights (default yolov8s-worldv2.pt)
+#    GOOGLE_API_KEY=<k>    optional; enables the advisory vision checks
+#    RAX_CAMSURV_URL / RAX_CAMSURV_PASSWORD   optional room camera at /stream2
+#
+#  lerobot is a HARDWARE dependency and is imported at connect time only (see
+#  connect_hardware()), so this module imports, --help works and the tests run on a
+#  machine without it. It used to be an absolute path to one developer's home
+#  directory at module scope, which is why nobody else could run the file.
+#
+# RELATIONSHIP TO examples/legacy/stack_mission2.py
+#  That is the original single-file server, kept unchanged and runnable so the two
+#  can be compared on the same hardware rather than the old one replaced on trust.
+#  The extracted pieces were verified bit-identical against it over a 447-case golden
+#  grid (tests/test_extraction_parity.py); the knobs and /status payload are
+#  unchanged. RAX_PORT=<n> runs this alongside it — but only one process at a time
+#  can hold the arm's serial port and the camera.
 #
 # NOTE the hand-eye TF (handeye_tf.json) is rotationally wrong — table rays come
 # out too shallow — so absolute ranges are compressed and the map's positions are
-# approximate. Most of the localization care in here works around that.
+# approximate. Most of the localization care in here works around that: locating
+# from ONE fixed pose (locate_from_survey) turns a varying error into a constant one,
+# and the visual centring absorbs what is left.
 import json, math, os, re, secrets, subprocess, sys, tempfile, threading, time
+from typing import NamedTuple
 
 import cv2
 import numpy as np
 import requests as pyrequests
 from flask import Flask, Response, jsonify, request
 
-sys.path.insert(0, r"C:\Users\labot\Documents\lerobot\src")
+# ---- lerobot: an optional HARDWARE dependency, resolved at connect time ---------
+# This server drives the arm and the OAK-D through lerobot. That is a DRIVER
+# dependency, not an algorithm one — everything above the hardware line is RAX — and
+# every lerobot import now sits inside the function that needs it, so this module
+# imports (and --help works, and the tests run) on a machine that has never heard of
+# lerobot. See connect_hardware().
+#
+# RAX_LEROBOT_SRC points at a lerobot source checkout when it is not pip-installed.
+# This used to be an absolute path into one developer's home directory, which is
+# exactly why nobody else could run the file.
+LEROBOT = os.environ.get("RAX_LEROBOT_SRC", "")
+if LEROBOT:
+    _src = os.path.join(LEROBOT, "src")
+    sys.path.insert(0, _src if os.path.isdir(_src) else LEROBOT)
 
-from lerobot.model.kinematics import RobotKinematics
-from lerobot.perception.yolo_world import YoloWorldDetector
-from lerobot.manipulation.visual_servo.gaze_engine import parse_tf_string
-from lerobot.robots.utils import make_robot_from_config
-from lerobot.robots.so_follower import SO101FollowerConfig
-from lerobot.cameras.oakd.configuration_oakd import OAKDCameraConfig
+#: YOLO-World weights; ultralytics downloads them on first use if absent.
+YOLO_WEIGHTS = os.environ.get("RAX_YOLO_WEIGHTS", "yolov8s-worldv2.pt")
 
-# The gripper servo (ID 6) replies too slowly for lerobot's handshake ping
-# timeout (raw pings see it 100%; lerobot's missed 48/48). Skip the existence
-# assert: sync WRITES need no ACK, and every read in this script already
-# tolerates a miss (gripper_current returns None, observe retries).
-from lerobot.motors.feetech.feetech import FeetechMotorsBus as _FTBus
-
-_FTBus._handshake = lambda self: None
-
-LEROBOT = r"C:\Users\labot\Documents\lerobot"
 OUT = os.path.join(tempfile.gettempdir(), "rax_stack_mission")  # debug-image dumps
+
+# A vision model for the questions geometry cannot answer — see gemini_vision.py.
+# None when there is no key or no SDK, and every call site checks, so the pick behaves
+# exactly as it did before if it is absent. Built lazily in main() once say() works.
+GEMINI = None
 os.makedirs(OUT, exist_ok=True)
 
 # ---- the arm, described as data ------------------------------------------------
@@ -89,34 +123,42 @@ os.makedirs(OUT, exist_ok=True)
 #   RAX_ARM=<name> selects a profile; see robots/profiles/available_profiles().
 from rax.robots.profiles import load_profile
 from rax.perception.camera_geometry import (
-    CameraGeometry, EyeInHand, FixedCamera, intrinsics_from_dict, parse_tf)
+    CameraGeometry, EyeInHand, FixedCamera, intrinsics_from_dict, parse_tf,
+    tf_to_string)
 from rax.perception.object_priors import (
     PRIORS, CLASS_META, COCO_CLASSES, TABLE_CLASSES)
 from rax.perception.table_plane import Plane, fit_plane
 from rax.manipulation.arms.ik_strategy import make_ik
+from rax.manipulation.arms.kinematics import make_kinematics
 from rax.manipulation.arms.motion import MotionLimits, quintic_waypoints
 from rax.perception.locate import ApparentSizeLocalizer, PlaneRayLocalizer, rotate_xy
 from rax.perception.measure import ObjectMeasurer, classify_shape
 from rax.perception.handeye import (
+    GraspSample, fit_to_known_points,
     HandEyeSample, fit_consistency, fit_reprojection, load_hand_eye, save_hand_eye)
 from rax.models.detection.tracking import (
-    AnchorTracker, Track)
+    AnchorTracker, Track, clipped_edges, table_ray_is_usable)
 from rax.models.detection.detector_service import (
     DetectorConfig, DetectorService, box_iou)
 from rax.mobility.slam.object_map import (
     ObjectMap, fit_rect_from_support, sup_bin, yaw_blend)
 from rax.manipulation.approach import (
-    ApproachConfig, approach_target, cap_reach, stage_step)
+    ApproachConfig, approach_target, cap_reach, stage_step, stage_trim)
 from rax.manipulation.approach.derive import (
+    grasp_aim_offset_px,
+    grasp_bias_m,
     align_tolerance_px, grasp_height, right_trim_for_visibility)
 from rax.perception.selfcal import (
-    LocalizationSample, apply_to_config, diagnose, fit_localization)
+    MIN_SAMPLES, LocalizationModel, LocalizationSample, apply_to_config, diagnose,
+    fit_localization)
 from rax.manipulation.approach.visual_center import center_on_object
 from rax.common.mission_state import Abort, MissionState
 
 # Sibling module, not part of the published package: queueing strangers onto one
 # shared robot is this demo's problem, not the pick stack's.
 from guest_sessions import GuestConfig, GuestSessions
+from gemini_vision import ADVISORY_ONLY, GeminiVision, MISS_REASONS
+from gemini_vision import available as gemini_available
 
 ARM = load_profile(os.environ.get("RAX_ARM", "so101"))
 
@@ -131,7 +173,8 @@ GRIP_TIP_OFFSET_M = ARM.gripper.tip_offset_m
 CAM_TIP_M = ARM.camera.cam_tip_m
 ARM_PORT = ARM.port                    # the arm's serial port (was "COM4", 3 places)
 PORT = int(os.environ.get("RAX_PORT", 8484))   # this server's HTTP port
-CAMSURV = ("http://127.0.0.1:5000", "camsurv123")
+CAMSURV = (os.environ.get("RAX_CAMSURV_URL", "http://127.0.0.1:5000"),
+           os.environ.get("RAX_CAMSURV_PASSWORD", ""))
 
 JOINT_RATE_MAX = ARM.joint_rate_max_dps   # deg/s per joint hard clamp
 
@@ -165,7 +208,7 @@ latest_rgb = [None]            # for the YOLO thread
 robot = None
 kin = None
 cam = None
-T_ee_cam = parse_tf_string(TF)
+T_ee_cam = parse_tf(TF)
 fx = fy = cx0 = cy0 = 0.0
 
 # ---- shared perception objects -------------------------------------------------
@@ -238,17 +281,25 @@ DETECT_CFG = DetectorConfig(
 
 
 def _query_labels():
-    """Parse the active detection query into class labels, preserving order."""
+    """Parse the active detection query into class labels, preserving order.
+
+    Prefers what the detector is ACTUALLY running, then the expanded vocabulary, and
+    only then the raw query box — which since reads_as_a_task() may hold a task phrase
+    ("red on green") rather than a class list, and splitting that on commas would hand
+    back one nonsense label.
+    """
     if DETECT is not None:
         return DETECT.labels()
-    q = (state.get("query") or "red cube, green cube").lower()
+    q = (state.get("vocabulary") or state.get("query") or "red cube, green cube").lower()
+    if reads_as_a_task(q) is not None:
+        q = "red cube, green cube"
     return [p.strip() for p in q.split(",") if p.strip()]
 
 
 def _colour_ok(rgb, label, xyxy):
     """Reject a box that is not the colour its LABEL names. Colourless labels pass."""
     try:
-        from lerobot.perception.detection_filters import (
+        from rax.models.detection.color_filters import (
             bbox_color_match_fraction, color_names_in_query)
     except Exception:
         return True
@@ -266,29 +317,114 @@ def yolo_worker():
     DETECT.run_forever()
 
 
-def find_red(rgb, T_base_cam=None):
-    """Acquire via the detector OR a big strict-HSV blob (the saturation gate already
-    excludes wood grain, and the detector misses edge-clipped slivers); afterwards
-    window/anchor continuity tracks."""
-    if red_tracker.last is not None or red_tracker.p_anchor is not None:
-        tr = red_tracker.track(rgb, T_base_cam)
+#: A strict-HSV blob smaller than this is a speck of glare or a shadow edge, not the
+#: cube. Latching one anchors the tracker to noise and every later frame then "tracks"
+#: it, so acquisition is refused below this and the stale lock is cleared.
+CUBE_ACQUIRE_MIN_AREA_PX = 2500
+
+#: A detector box older than this is not evidence about where the cube is NOW. The
+#: detector runs at ~2.5s, so this allows roughly one missed cycle.
+CUBE_DET_MAX_AGE_S = 4.0
+
+
+# ---------------- vision-model assist, where the evidence says it helps ------------
+#: Off with RAX_VLM_ASSIST=0. On by default because it only ever runs where the
+#: classical detectors have ALREADY returned nothing — its alternative is not a working
+#: locate, it is an abandoned one.
+VLM_ASSIST = os.environ.get("RAX_VLM_ASSIST", "1") != "0"
+
+#: Calls allowed per locate. The model costs 1.3-1.6s typical (7s worst seen), and the
+#: survey takes SURVEY_READS frames — asking on every one would put a network round
+#: trip in the control path. One or two is enough: if the object is in frame at all,
+#: one look finds it.
+VLM_BUDGET_PER_LOCATE = 2
+_vlm_left = [0]
+
+
+def vlm_budget_reset(n: int = VLM_BUDGET_PER_LOCATE):
+    _vlm_left[0] = int(n) if VLM_ASSIST else 0
+
+
+def vlm_track(rgb, label):
+    """A Track from the vision model, or None. Only for when the detectors found none.
+
+    MEASURED, on this rig's own saved frames, which is why it sits here and not at the
+    hover. Where the object is genuinely in the picture the model's box centre agrees
+    with the strict-HSV blob to within ~5px on 5 of 8 frames — and on the one frame
+    where the green cube photographed TEAL from a steep angle, HSV latched onto an
+    unrelated blob 211px away while the model put the box on the actual cube.
+
+    It was tried at the centring hover first and did NOT help: of the eight frames the
+    servo saved after reporting "object not in view", seven contain no cube at all —
+    the model correctly answers "there is no green cube visible in the image, only a
+    blurry surface and part of the gripper". That failure is the camera being aimed
+    somewhere else, and no detector can fix a pose error. Hence: upstream, at the
+    survey, while the object is still in frame.
+    """
+    if not VLM_ASSIST or GEMINI is None or _vlm_left[0] <= 0:
+        return None
+    _vlm_left[0] -= 1
+    lab = str(label).strip().lower()
+    if lab in ("red", "green", "blue", "yellow"):
+        lab = f"{lab} cube"          # a bare colour is a poor thing to ask a model for
+    try:
+        fix = GEMINI.locate_object(rgb, lab)
+    except Exception as e:
+        say(f"vlm: locate failed ({type(e).__name__}: {e})")
+        return None
+    if not fix.ok:
+        say(f"vlm: no fix for '{lab}' — {fix.reason[:110]}")
+        return None
+    x1, y1, x2, y2 = (float(v) for v in fix.bbox_xyxy)
+    say(f"vlm: located '{lab}' at ({fix.uv[0]:.0f},{fix.uv[1]:.0f})px "
+        f"conf {fix.confidence:.0%}{' CLIPPED' if fix.clipped else ''} "
+        f"[{fix.latency_s:.1f}s] — the detector had nothing")
+    return Track((float(fix.uv[0]), float(fix.uv[1])), (x1, y1, x2, y2),
+                 int(max(x2 - x1, 0) * max(y2 - y1, 0)), bool(fix.clipped), time.time())
+
+def _find_cube(tracker, label, rgb, T_base_cam=None):
+    """Acquire-or-track one of the colour cubes. Three ways in, tried in order:
+
+    1. CONTINUITY. If the tracker already holds a fix (or a 3D anchor to reproject),
+       search near it. Cheapest, and the only one tight enough during close approach.
+    2. THE DETECTOR. Seed from the open-vocabulary box, which sees the cube in poses
+       and lighting the strict HSV bands miss.
+    3. A FULL-FRAME STRICT MASK. Catches what the detector misses -- edge-clipped
+       slivers especially -- and is the only path that works before the detector has
+       ever run.
+
+    WHY THIS IS SHARED. ``find_green`` used to be a bare one-liner, ``return
+    green_tracker.track(...)``: continuity only, no detector seed, and no area gate,
+    while red had all three. So green could not re-acquire after anything reset it --
+    and ``/calibmount`` resets the tracker before its sweep, which is precisely when
+    re-acquisition is the whole job. Observed: the green cube plainly in frame,
+    ``p_green`` empty, the mount calibration collecting 6 views instead of 10. Two
+    cube colours should not have two different levels of robustness by accident.
+    """
+    if tracker.last is not None or tracker.p_anchor is not None:
+        tr = tracker.track(rgb, T_base_cam)
         if tr is not None:
             return tr
-    inst, t = DETECT.instances("red cube")
-    if inst and time.time() - t < 4.0:
-        x1, y1, x2, y2 = inst[0]["xyxy"]
-        red_tracker.last = Track(((x1 + x2) / 2, (y1 + y2) / 2), tuple(inst[0]["xyxy"]),
+    if DETECT is not None:
+        inst, t = DETECT.instances(label)
+        if inst and time.time() - t < CUBE_DET_MAX_AGE_S:
+            x1, y1, x2, y2 = inst[0]["xyxy"]
+            tracker.last = Track(((x1 + x2) / 2, (y1 + y2) / 2), tuple(inst[0]["xyxy"]),
                                  int((x2 - x1) * (y2 - y1)), False, time.time())
-        return red_tracker.track(rgb, T_base_cam)
-    tr = red_tracker.track(rgb, None)   # full-frame strict mask
-    if tr is not None and tr.area_px >= 2500:
+            return tracker.track(rgb, T_base_cam)
+    tr = tracker.track(rgb, None)          # full-frame strict mask
+    if tr is not None and tr.area_px >= CUBE_ACQUIRE_MIN_AREA_PX:
         return tr
-    red_tracker.last = None             # too small: don't latch a speck
+    tracker.last = None                    # too small: don't latch a speck
     return None
 
 
+def find_red(rgb, T_base_cam=None):
+    return _find_cube(red_tracker, "red cube", rgb, T_base_cam)
+
+
 def find_green(rgb, T_base_cam=None):
-    return green_tracker.track(rgb, T_base_cam)
+    return _find_cube(green_tracker, "green cube", rgb, T_base_cam)
 
 
 def find_labels(rgb, label, max_age=4.0):
@@ -748,7 +884,8 @@ def triangulate(finder, tracker, label):
     p = np.linalg.solve(A, b)
     gaps = [float(np.linalg.norm((np.eye(3) - np.outer(d, d)) @ (p - o))) for o, d in rays]
     say(f"{label} at ({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f}) gaps mm {[round(g * 1e3, 1) for g in gaps]}")
-    if max(gaps) > 0.05 or not (0.08 < np.hypot(p[0], p[1]) < 0.42) or not (-0.12 < p[2] < 0.15):
+    r_tri = float(np.hypot(p[0], p[1]))
+    if max(gaps) > 0.05 or not (MAP_R_MIN < r_tri < MAP_R_MAX) or not (-0.12 < p[2] < 0.15):
         raise Abort(f"{label}: triangulation implausible")
     tracker.p_anchor = p.copy()
     tracker.anchor_t = time.time()
@@ -859,6 +996,12 @@ TABLE_Z0 = 0.0     # the table IS the robot's own base plane (the user's premise
 # Gate every localization on this before it is ever stored.
 MAP_R_MIN = ARM.reach_min_m
 MAP_R_MAX = ARM.reach_max_m
+# How far the fingertip can actually be DRIVEN, from the profile's measured
+# envelope. This was hardcoded as 0.42 in two places while the profile said 0.55
+# and the arm measures 0.47 -- three different numbers, none of them right. The
+# jog cap was the tightest, which is why jogging out flat stopped 5cm short of
+# the arm's real limit and looked like 'it will not straighten all the way'.
+GRASP_R_MAX = ARM.reach_grasp_max_m
 # An entry not re-observed for this long is STALE: the object was moved or taken
 # away, and the map should stop asserting it is there. Without this the map keeps
 # reporting a scene that no longer exists - and worse, a stale high-n entry sits in
@@ -911,7 +1054,50 @@ w2d_lock = WORLD.lock
 
 _rotate_xy = rotate_xy      # now perception/locate.py
 
+
+def _correct_xy(xy):
+    """Apply the live polar corrections to a localization that did NOT come from the
+    localizer — the silhouette solve (measure_object) and the bbox-to-table ray.
+
+    ``obj_xy_2d`` needs none of this: localizers() pushes range_scale and
+    bearing_offset_deg onto the strategies and ApparentSizeLocalizer applies both
+    internally. The other two position solves bypass it entirely, and until now they
+    were handed only the BEARING — so a fitted range_scale moved the map's apparent-size
+    fixes and left its silhouette fixes exactly where they were, in the same map, at the
+    same time. Bearing was already applied uniformly here; this makes range match.
+
+    Worth being explicit about the physics, because "they measure range differently" is
+    a real objection: the silhouette solve gets position by intersecting the table
+    plane, so a proportional range error is not its natural failure mode the way it is
+    for apparent-size ranging. But selfcal's model is defined on the OUTPUT of
+    localization — ``r_true = range_scale * r_observed + push_out_m``, whatever produced
+    r_observed — and it is fitted from samples drawn through whichever path the pick
+    happened to use. A correction that lands on some of those paths and not others
+    cannot be inverted, which is what :func:`_selfcal_uncorrect` has to do to keep the
+    fit absolute. Uniform application is what makes the model mean anything.
+
+    push_out is deliberately NOT applied here: run_mission applies it once, at the
+    single point where the pick's target is decided.
+    """
+    return LocalizationModel(range_scale=float(CFG.range_scale), push_out_m=0.0,
+                             bearing_offset_deg=float(CFG.bearing_offset_deg)).apply(xy)
+
+
 _LOC = [None]
+
+
+class Localizers(NamedTuple):
+    """The two range strategies, named so neither can be taken for the other.
+
+    They used to come back as a bare 2-tuple, unpacked positionally at each call site
+    — while rax.grasp.localizers() returns its pair in the OPPOSITE order (plane
+    first, because with a fixed camera the plane solve is the stronger estimator).
+    Two functions of the same name, same repo, reversed contract: nothing enforced
+    it and nothing warned. Fields make the ordering irrelevant.
+    """
+
+    apparent: object      # ApparentSizeLocalizer — range from the object's size prior
+    plane: object         # PlaneRayLocalizer — range from where its ray meets the table
 
 
 def localizers():
@@ -922,12 +1108,24 @@ def localizers():
     """
     if _LOC[0] is None:
         reach = (MAP_R_MIN, MAP_R_MAX)
-        _LOC[0] = (
-            ApparentSizeLocalizer(GEOM, PRIORS, reach_m=reach),
+        _apparent = ApparentSizeLocalizer(GEOM, PRIORS, reach_m=reach)
+        # THE PINHOLE RELATION GIVES DEPTH, NOT RANGE. Walking it along the sightline
+        # puts an off-axis object too close by cos(off-axis angle) — always inward,
+        # growing with the angle: ~10mm at 20cm, ~90mm at 45cm. The approach
+        # deliberately keeps the object off-centre, so this is live on every pick, and
+        # a radial push-out fudge is what was compensating for it.
+        #
+        # Seen directly with two cubes: the near-axis green cube mapped at 20.2cm from
+        # the camera against an observed 20cm, while the off-axis red cube mapped at
+        # 14.8cm against an observed 26cm — 11cm inward, and enough to report the two
+        # in the WRONG ORDER. RAX_AXIAL_DEPTH=0 restores the old behaviour.
+        _apparent.axial_depth = os.environ.get("RAX_AXIAL_DEPTH", "1") != "0"
+        _LOC[0] = Localizers(
+            apparent=_apparent,
             # The table solve is used by callers that judge the raw point themselves,
             # so it does not additionally gate on the workspace.
-            PlaneRayLocalizer(GEOM, PRIORS, reach_m=reach, z_plane=TABLE_Z0,
-                              gate_reach=False),
+            plane=PlaneRayLocalizer(GEOM, PRIORS, reach_m=reach, z_plane=TABLE_Z0,
+                                    gate_reach=False),
         )
     for loc in _LOC[0]:
         loc.range_scale = float(CFG.range_scale)
@@ -941,15 +1139,10 @@ def obj_xy_2d(bbox, T_cam, z_m=None, label=None):
     Returns (xy | None, range_m, assumed_size_m). The strategy, including the
     elongated-object long-axis branch and why it exists, lives with the code there.
     """
-    apparent, _plane = localizers()
+    apparent = localizers().apparent
     fix = apparent.locate(bbox, T_cam, label=label, z_m=z_m)
     return (fix.xy if fix.ok else None), fix.range_m, fix.size_m
 
-
-def _consolidate_2d():
-    """Collapse map entries that are really ONE physical object — ObjectMap.consolidate.
-    Caller holds w2d_lock."""
-    WORLD.consolidate()
 
 
 # Wrist roll that lines the JAWS UP ACROSS an object's long axis — the only way a
@@ -977,10 +1170,6 @@ def grasp_roll_for_yaw(yaw_deg, xy):
     return float(min(cands, key=lambda w: abs(w - GRASP_ROLL)))
 
 
-def _merge_radius(a, b=None):
-    """How close two detections must be to count as one object — see ObjectMap."""
-    return WORLD.merge_radius(a, b)
-
 
 _yaw_blend = yaw_blend      # circular mean of two axis angles; now object_map.py
 
@@ -998,6 +1187,72 @@ def world2d_update(label, xy, stereo, w_m, d_m, h_m, shape, yaw, measured,
                         shape=shape, yaw=yaw, measured=measured,
                         across_m=across_m, u_deg=u_deg)
 
+
+#: How far the silhouette solve's range may differ from the object's apparent size
+#: before it is disbelieved, as a ratio. Outside this band the two disagree about
+#: something basic and the transform-free one wins.
+MEASURE_RANGE_BAND = (0.72, 1.38)
+
+#: How many silhouette solves this gate has dropped, reported in /status.
+_measure_rejects = [0]
+
+
+def apparent_range_m(bbox_xyxy, label):
+    """Range implied by how big the object LOOKS, from the class prior. Or None.
+
+    ``fx * real_width / pixel_width`` — no hand-eye transform, no table plane, no arm
+    pose. That is the point: it is wrong only if the prior is wrong or the box is, so
+    it makes an honest referee for the solves that do depend on all of those.
+    """
+    lab = str(label).strip().lower()
+    # Only a MEASURED prior may referee. PRIORS.size_m falls back to a default edge for
+    # anything it does not know, and judging a laptop or a bottle against a cube-sized
+    # default would reject every honest measurement of it and empty the map of exactly
+    # the objects the class table does not cover.
+    known = next((c for c in (lab, f"{lab} cube") if c in CLASS_META), None)
+    if known is None:
+        return None
+    x1, _y1, x2, _y2 = (float(v) for v in bbox_xyxy)
+    w_px = x2 - x1
+    size = float(PRIORS.size_m(known) or 0.0)
+    if w_px < 4.0 or size <= 0.0 or GEOM.fx <= 0.0:
+        return None
+    return float(GEOM.fx * size / w_px)
+
+
+def measured_range_is_credible(m, bbox_xyxy, label):
+    """Does the silhouette solve agree with the object's own apparent size?
+
+    WHY THIS GATE EXISTS. The map preferred measure_object's position over the
+    apparent-size fallback whenever the box was fully visible, and on this rig that
+    solve degrades badly at the shallow viewing angles the arm actually surveys from.
+    It does not degrade toward noise; it degrades toward a confident wrong number, and
+    because sense_2d folds every frame in, the map AVERAGES those.
+
+    Observed with two cubes on the table: the operator could see green nearer than red
+    and the detector's own overlay agreed (green 20cm, red 26cm), while the map had red
+    at 35cm and green at 42cm — both far too distant, and their ORDER swapped. A map
+    that cannot say which of two objects is nearer cannot be driven on, whatever its
+    RMS is.
+
+    Apparent size is the referee because it shares no machinery with the thing it is
+    judging: no hand-eye transform, no table plane, no arm pose. When the two disagree
+    by more than a third, the one that depends on the known-wrong rotation is the one
+    to drop, and sense_2d falls through to the apparent-size path it already has.
+    """
+    if m is None:
+        return False
+    ref = apparent_range_m(bbox_xyxy, label)
+    if ref is None or ref <= 0.0:
+        return True                     # no referee available; nothing to object with
+    try:
+        rng = float(m["rng_m"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if rng <= 0.0:
+        return False
+    ratio = rng / ref
+    return MEASURE_RANGE_BAND[0] <= ratio <= MEASURE_RANGE_BAND[1]
 
 def sense_2d(joints=None, rgb=None):
     """Fold every detected instance of every queried label into the 2D map.
@@ -1026,8 +1281,13 @@ def sense_2d(joints=None, rgb=None):
             # the silhouette solve needs the WHOLE object, so it only runs on a
             # fully-visible box; the position fallbacks below do not.
             m = measure_object(rgb, tr.bbox_xyxy, T, label) if full_view else None
+            if m is not None and not measured_range_is_credible(m, tr.bbox_xyxy, label):
+                # Disagrees with the object's own apparent size: drop it and use the
+                # transform-free path below. See measured_range_is_credible.
+                _measure_rejects[0] += 1
+                m = None
             if m is not None:
-                xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
+                xy = _correct_xy(m["xy"])
                 world2d_update(label, xy, m["rng_m"], m["w_m"], m["d_m"], m["h_m"],
                                m["shape"], m["yaw_deg"], True,
                                across_m=m["across_m"],
@@ -1049,7 +1309,7 @@ def sense_2d(joints=None, rgb=None):
                 x1, y1, x2, y2 = tr.bbox_xyxy
                 p3 = ray_to_table(((x1 + x2) / 2.0, y2), T, TABLE_Z0)
                 if p3 is not None:
-                    cand = _rotate_xy(p3[:2], CFG.bearing_offset_deg)
+                    cand = _correct_xy(p3[:2])
                     if MAP_R_MIN < float(np.hypot(*cand)) < MAP_R_MAX:
                         xy, st = cand, float("nan")
             if xy is not None:
@@ -1237,7 +1497,7 @@ def solve_on_table(tr, T_base_cam):
     is exactly the "it should be further out" error. Here the size falls out of
     the solve instead of being assumed, so it is self-correcting.
     """
-    _apparent, plane = localizers()
+    plane = localizers().plane
     fix = plane.locate(tr.bbox_xyxy, T_base_cam, uv=tr.uv)
     if not fix.ok:
         return None, None
@@ -1296,7 +1556,7 @@ def load_tf_override():
         return None
     if d is None:
         return None
-    T_ee_cam = parse_tf_string(d["tf"])
+    T_ee_cam = parse_tf(d["tf"])
     _sync_geometry()
     return d
 
@@ -1505,6 +1765,75 @@ GRASP_PITCH = (75.0, 80.0, 70.0, 85.0, 90.0, 65.0, 60.0, 55.0,
                10.0, 5.0, 0.0)
 
 
+# ---------------- hand-eye from grasps: the only ground truth the rig has ----------
+#: (uv, T_base_ee) of the object, observed just before the descent. Paired at contact
+#: with FK's answer for where it actually was, and written to GRASP_FILE.
+_grasp_obs = [None]
+GRASP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_samples.jsonl")
+
+
+def note_grasp_observation(finder, label):
+    """Remember where the object APPEARED, just before committing to the descent.
+
+    Half of a calibration sample. The other half arrives when the jaws close: the
+    object is then between the fingertips and forward kinematics says where those are,
+    which owes nothing to the camera, the hand-eye transform or the table plane.
+
+    That independence is what the existing fitters lack. One solves for the transform
+    AND the target together and drifts along a flat direction; the other asks only that
+    the viewpoints agree, and on this rig they agreed to 0.3cm on the wrong place.
+    A grasp is the one moment the robot learns where something REALLY was.
+    """
+    _grasp_obs[0] = None
+    try:
+        j, rgb, _ = observe(overlay=False)
+        tr = finder(rgb, T_cam_of(j))
+        if tr is None or tr.clipped:
+            return
+        T_ee = np.asarray(kin.forward_kinematics(np.asarray(j, np.float64)), np.float64)
+        _grasp_obs[0] = (tuple(float(v) for v in tr.uv), T_ee.tolist(), str(label))
+    except Exception:
+        _grasp_obs[0] = None
+
+
+def record_grasp_sample(p_base):
+    """Pair the remembered pixel with where the grasp proved the object was."""
+    obs = _grasp_obs[0]
+    _grasp_obs[0] = None
+    if obs is None:
+        return False
+    uv, T_ee, label = obs
+    try:
+        with open(GRASP_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": time.time(), "label": label, "uv": list(uv),
+                                "T_base_ee": T_ee,
+                                "p_base": [float(v) for v in p_base]}) + "\n")
+    except Exception as e:
+        say(f"handeye: could not record the grasp sample ({type(e).__name__}: {e})")
+        return False
+    return True
+
+
+def load_grasp_samples():
+    """Every recorded (pixel, pose, true position) triple. Skips unreadable lines."""
+    out = []
+    try:
+        with open(GRASP_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    out.append(GraspSample(np.asarray(d["T_base_ee"], np.float64),
+                                           np.asarray(d["uv"], np.float64),
+                                           np.asarray(d["p_base"], np.float64)))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
 def plan_grasp_pitch(p_obj, q_seed):
     """Choose the gripper pitch to grasp with, and PROVE the arm can get there.
     Returns (pitch_deg, worst_ik_residual_m), or (None, best_residual) if nothing works.
@@ -1617,6 +1946,10 @@ def _set_carry(held, label=None, h_m=0.0, grip_to_bottom=None, tag=None):
         state["carry"] = (f"{label} (h={h_m*100:.1f}cm, "
                           f"grip->bottom {carry['grip_to_bottom']*100:.1f}cm)"
                           if held else None)
+    if not held:
+        # Outside the lock: clear_picked_flags takes w2d_lock, and nesting the two the
+        # other way round is how a deadlock gets built.
+        clear_picked_flags()
 
 
 # ================= self-calibrated table plane =================
@@ -1921,20 +2254,50 @@ def _refix_here(finder, label=None, tries=3):
     the approach reacts to them differently, so a caller handed a bare None could
     neither choose nor log anything true about what happened.
 
-    Corrected the SAME way as the initial fix — bearing offset, then push-out. A raw
-    re-measure would drag the target back inward and undo the correction, and because
-    the refine is accepted out to max_refine_jump_m it would do so silently.
+    Corrected the SAME way as the initial fix — bearing offset (inside the localizer),
+    then push-out. A raw re-measure would drag the target back inward and undo the
+    correction, and because the refine is accepted out to max_refine_jump_m it would do
+    so silently.
     """
     tr = _cube_track(finder, tries=tries)
     if tr is None:
         return None, "the detector did not find it from here"
+    j, rgb, _ = observe()
     if tr.clipped:
-        # A clipped box is NARROWER than the object, and its width is what the range
-        # is computed from, so a clipped read lands the object FURTHER away than it
-        # is — which walks the target forward, past the thing we are reaching for.
-        # Refuse it rather than steer on it.
-        return None, "it is half out of frame, so its apparent size reads too small"
-    j, _rgb, _ = observe()
+        # WHICH EDGE IS CLIPPED MATTERS — the same conclusion sense_2d reached, applied
+        # here too. Refusing every clipped box threw away the majority of the approach's
+        # re-measures: a real pick logged "half out of frame" on two of its three checks
+        # and drove the whole approach on the original estimate, which was 5.2cm out.
+        #
+        # A clipped box breaks APPARENT-SIZE ranging, because that reads distance from
+        # the box's width and a cut-off box is narrower than the object. It does not
+        # break the TABLE RAY, which reads position from where the object's bottom edge
+        # meets a known plane and needs neither the object's size nor its orientation.
+        # So the question is not "is it clipped" but "is the bottom edge real".
+        x1, y1, x2, y2 = tr.bbox_xyxy
+        cut = clipped_edges(tr.bbox_xyxy, rgb.shape[:2])
+        if not table_ray_is_usable(cut):
+            # Either the bottom is off-frame, so the contact point is below the picture,
+            # or a side is, so the visible centroid is not the object's centre and the
+            # bearing taken from it is biased inward by up to half the hidden width.
+            # (The range would survive a side cut — the ray's elevation comes from y2,
+            # which is intact — but the approach takes a refine's BEARING in full and
+            # caps only its reach, see cap_reach, which is the wrong way round for it.)
+            return None, (f"it is cut off at the {'+'.join(cut)}, so "
+                          + ("where it meets the table cannot be seen"
+                             if "bottom" in cut else
+                             "its centre, and the bearing taken from it, is not where "
+                             "it looks"))
+        p3 = ray_to_table(((x1 + x2) / 2.0, y2), T_cam_of(j), TABLE_Z0)
+        if p3 is None:
+            return None, f"cut off at the {'+'.join(cut)} and its table ray did not solve"
+        xy = _correct_xy(p3[:2])
+        if not (MAP_R_MIN < float(np.hypot(*xy)) < MAP_R_MAX):
+            return None, (f"cut off at the {'+'.join(cut)}; its table ray lands at "
+                          f"r={np.hypot(*xy)*100:.0f}cm, outside the mapped reach")
+        say("        (cut off at the %s — ranged from where its bottom edge "
+            "meets the table instead of from its width)" % "+".join(cut))
+        return push_out_radial(xy), None
     zs = [z for z in (read_depth_m(tr.uv) for _ in range(3)) if z is not None]
     z = float(np.median(zs)) if zs else None
     # Pass the LABEL. Without it the localizer sizes every object with the fallback
@@ -1943,7 +2306,18 @@ def _refix_here(finder, label=None, tries=3):
     xy, _rng, _sz = obj_xy_2d(tr.bbox_xyxy, T_cam_of(j), z_m=z, label=label)
     if xy is None:
         return None, "it was in view but did not localize inside the mapped reach"
-    return push_out_radial(_rotate_xy(xy, CFG.bearing_offset_deg)), None
+    # push-out only. The bearing offset is applied by the LOCALIZER — localizers()
+    # pushes CFG.bearing_offset_deg onto both strategies on every call, and
+    # ApparentSizeLocalizer.locate returns Fix(rotate_xy(xy, bearing_offset_deg), ...)
+    # (perception/locate.py:117). Rotating again here applied it TWICE to every
+    # close-up re-measure, so the refines steered onto a bearing double the intended
+    # correction while the initial fix used it once — the two sources of the pick's
+    # target disagreeing by exactly the offset.
+    #
+    # It was invisible because the offset defaults to 0.0, where double is still zero.
+    # The grasp-outcome selfcal below is the first thing that makes it non-zero
+    # automatically, which would have turned a latent bug into a live one.
+    return push_out_radial(xy), None
 
 
 def _cube_range_m(tr):
@@ -2020,10 +2394,19 @@ class _CenteringOps:
         return _cube_range_m(track)
 
     def move_pan(self, delta_deg, *, settle, step):
+        """Rotate the base and report the degrees actually achieved.
+
+        The clip below is why this has to be measured rather than assumed: with the
+        pan joint on its limit the commanded delta silently becomes zero, and the
+        centring probe would then divide its pixel measurement by a rotation that
+        never happened. Reading the encoder back also folds in servo under-travel.
+        """
         q = self.joints()
         lo, hi = J_LO[ARM.pan_joint], J_HI[ARM.pan_joint]
-        q[ARM.pan_joint] = float(np.clip(q[ARM.pan_joint] + float(delta_deg), lo, hi))
+        before = float(q[ARM.pan_joint])
+        q[ARM.pan_joint] = float(np.clip(before + float(delta_deg), lo, hi))
         goto_smooth(q, settle=settle, step=step)
+        return float(self.joints()[ARM.pan_joint]) - before
 
     def move_tip(self, p_base, *, settle, step):
         return _move_tip(np.asarray(p_base, np.float64), self.pitch, self.roll,
@@ -2038,16 +2421,24 @@ def _center_on_cube(finder, gp, j5, label=None):
 
     Returns the final (x, y), or None if the object was never in view.
     """
-    aim = (HAND_UV[0] + CFG.aim_du_px, HAND_UV[1] + CFG.aim_dv_px)
     ops = _CenteringOps(finder, gp, j5)
-    # Tolerance scaled to how big the object actually looks right now. A fixed pixel
-    # count means very different physical accuracy at 10cm and at 45cm.
+    # Both the tolerance AND the lateral grasp bias are derived from how big the
+    # object actually looks right now. A fixed pixel count means a different physical
+    # distance at every range — see derive.grasp_aim_offset_px for what that cost.
     tol = None
+    aim_du = CFG.aim_du_px
     tr = ops.track(tries=3)
     if tr is not None:
         rng = _cube_range_m(tr)
         if rng and rng > 0.01:
-            tol = align_tolerance_px(GEOM, PRIORS.size_m(label), rng)
+            size_m = PRIORS.size_m(label)
+            tol = align_tolerance_px(GEOM, size_m, rng)
+            # Bias the fingertip to the object's RIGHT so the near finger passes it
+            # instead of shoving it. CFG.aim_du_px stays an operator trim on top.
+            aim_du = grasp_aim_offset_px(GEOM, size_m, rng) + CFG.aim_du_px
+            say(f"center: aim bias {aim_du:.0f}px "
+                f"({-aim_du * rng / GEOM.fx * 100:.1f}cm right of the object at {rng*100:.0f}cm)")
+    aim = (HAND_UV[0] + aim_du, HAND_UV[1] + CFG.aim_dv_px)
     res = center_on_object(ops, aim, CFG, tolerance_px=tol)
     if res.xy is None:
         # "object not in view" fires on EVERY pick, so the final visual correction
@@ -2060,6 +2451,15 @@ def _center_on_cube(finder, gp, j5, label=None):
             path = os.path.join(OUT, f"center_miss_{int(time.time())}.jpg")
             cv2.imwrite(path, _rgb)
             say(f"center: saved the frame it could not find '{label}' in -> {path}")
+            # ...and ASK, rather than filing it for a human who will not look. The dump
+            # has existed for a while and the log kept saying "object not in view" for
+            # situations needing opposite responses: two real frames from this rig were
+            # (a) the cube present but cut off by the BOTTOM of the picture and motion
+            # blurred, and (b) the camera aimed at a bag of clutter with no cube at all.
+            # One wants a reframe, the other a re-survey. Off-thread and advisory — the
+            # answer arrives after the pick has moved on, and it is for the log.
+            if GEMINI is not None:
+                GEMINI.ask_async("explain_miss", _rgb, label)
         except Exception as e:
             say(f"center: could not save the debug frame ({type(e).__name__})")
     if not res.centered:
@@ -2163,6 +2563,7 @@ def locate_from_survey(label, finder=None, bearing_deg=None):
             say(f"survey: turning to face {label} at {bearing_deg:+.0f}deg "
                 f"(rough bearing from the map)")
     set_phase("LOCATE", f"surveying for {label} from the canonical pose")
+    vlm_budget_reset()
     q_start = observe(overlay=False)[0].astype(np.float64).copy()
     goto_smooth(survey_pose_for(bearing_deg), settle=0.45)
 
@@ -2182,12 +2583,14 @@ def locate_from_survey(label, finder=None, bearing_deg=None):
         j, rgb, _ = observe()
         T = T_cam_of(j)
         tr = finder(rgb, T) if finder else find_label(rgb, label, T)
+        if tr is None:
+            tr = vlm_track(rgb, label)      # only when the detectors found nothing
         if tr is None or tr.clipped:
             time.sleep(0.08)
             continue
         m = measure_object(rgb, tr.bbox_xyxy, T, label)
         if m is not None:
-            xy = _rotate_xy(m["xy"], CFG.bearing_offset_deg)
+            xy = _correct_xy(m["xy"])
         else:
             xy, _st, _sz = obj_xy_2d(tr.bbox_xyxy, T, z_m=None, label=label)
             if xy is None:
@@ -2217,6 +2620,24 @@ def locate_from_survey(label, finder=None, bearing_deg=None):
         say(f"survey: reads disagree by {spread*100:.1f}cm from ONE pose — "
             f"detector is unstable, treat this fix as rough")
     return xy, spread
+
+
+def _mapped_size_m(label):
+    """The characteristic edge the MAP measured for this label, or None.
+
+    Compared against the class prior it is a free consistency check on the range:
+    the two are the same measurement seen from different ends.
+    """
+    want = str(label).strip().lower()
+    with w2d_lock:
+        best, bn = None, -1
+        for _t, o in WORLD.objs.items():
+            lab = str(o.get("label", "")).lower()
+            if (want in lab or lab in want) and o.get("n", 0) > bn:
+                w_m, d_m = float(o.get("w_m") or 0.0), float(o.get("d_m") or 0.0)
+                if w_m > 0 and d_m > 0:
+                    best, bn = math.sqrt(w_m * d_m), o.get("n", 0)
+    return best
 
 
 def _mapped_xy(label):
@@ -2378,6 +2799,25 @@ def place_at(tag=None, xy=None, recenter=True):
             else:
                 say(f"place: re-centre jumped {moved*100:.1f}cm — rejected, staying blind")
 
+    # ---- 3b. last look at the carry, before this becomes irreversible ----
+    # The grasp check runs off-thread and can land AFTER place_at read carry["held"] at
+    # entry. Measured: CONTACT at 17:34:55, place committed at 17:34:57, the camera's
+    # "the red object is clearly visible on the surface below the gripper" at 17:35:02 —
+    # five seconds too late to matter. The carry was cleared and the place carried on
+    # regardless, opened its empty jaws over the destination, and the task reported
+    # "placed red on green cube" with the map recording a 10.2cm stack that did not
+    # exist. The cubes were side by side on the table.
+    #
+    # So the entry check is not enough: re-read it here, at the last moment before the
+    # descent, where the verdict has had the whole traverse to arrive. The gripper
+    # current cannot tell the object from a fingertip fouled on its corner; the camera
+    # can, and on that run it was the one that was right.
+    with lock:
+        still_held = carry["held"]
+    if not still_held:
+        raise Abort("the jaws are empty — the grasp check overturned the pick during "
+                    "the traverse, so there is nothing to place. Re-run the pick")
+
     # ---- 4. descend to the release height ----
     q = observe()[0].astype(np.float64)
     z0 = float(_tip(q)[2])
@@ -2410,14 +2850,68 @@ def place_at(tag=None, xy=None, recenter=True):
         # the carried object is no longer where it was picked from
         with w2d_lock:
             for t, o in list(WORLD.objs.items()):
-                if o["label"] == carry_label and o.get("picked"):
+                if o.get("picked") and map_label_matches(carry_label, o["label"]):
                     del WORLD.objs[t]
     set_phase("DONE", f"placed {carry_label} on {where}")
 
 
 
 
-def run_mission(target_label=None):
+#: Believe "the jaws are empty" over the current sensor at or above this confidence.
+#: Only in that ONE direction: an empty verdict makes the robot do LESS (it declines to
+#: carry on with a place it would botch), while a "holding" verdict would make it do
+#: more on the model's word alone. Fail-safe is not symmetric and neither is this.
+GRASP_EMPTY_TRUST = 0.85
+
+#: Whether to act on that. Deliberately NOT behind ADVISORY_ONLY: that flag guards
+#: verdicts which would AUTHORISE a motion on a remote model's word, and this one only
+#: ever withholds one. The worst case if the model is wrong is a pick reported as
+#: failed that actually held — recoverable, and visible in the log. The worst case of
+#: the reverse is the arm traversing to a destination and opening empty jaws over it.
+GRASP_TRUST_EMPTY = os.environ.get("RAX_GRASP_TRUST_EMPTY", "1") != "0"
+
+
+def _log_grasp_verdict(v, held_by_current):
+    """Report the model's read of the grasp next to the current sensor's — and, in one
+    direction only, act on it.
+
+    Disagreement points both ways. "Current says held, camera says empty" is a finger
+    fouled on the object or a grip on the table edge; "current says empty, camera says
+    holding" means the contact threshold is too high and good picks are being discarded.
+
+    Only the first is acted on. The gripper current says the jaws met RESISTANCE, which
+    reads identically for the object, a fingertip fouled on its corner, and the table
+    edge — it cannot tell you WHAT it met. The camera can, and it was right about every
+    miss observed on this rig. So a confident "empty" clears the carry flag: the arm
+    then refuses to place, instead of traversing to the destination and solemnly opening
+    its empty jaws, which is what it did before. The reverse would have a remote model
+    authorise a motion on nothing but its own say-so, and is left advisory.
+    """
+    if not v.ok:
+        say(f"        grasp check unavailable ({v.reason})")
+        return
+    agrees = (v.answer == "holding") == bool(held_by_current)
+    if v.answer == "unsure":
+        say(f"        grasp check: model could not tell — {v.reason}")
+        return
+    if agrees:
+        say(f"        grasp check: model agrees ({v.answer}, {v.confidence:.0%})")
+        return
+    say(f"        grasp check: DISAGREES — current said "
+        f"{'HELD' if held_by_current else 'EMPTY'}, camera says {v.answer.upper()} "
+        f"({v.confidence:.0%}) — {v.reason}")
+    if (held_by_current and v.answer == "empty"
+            and v.confidence >= GRASP_EMPTY_TRUST and GRASP_TRUST_EMPTY):
+        with lock:
+            still_holding = carry["held"]
+        if still_holding:
+            _set_carry(False)
+            set_phase("PICK", "grasp check says the jaws are empty — not carrying")
+            say(f"        carry CLEARED on the camera's word ({v.confidence:.0%}): a "
+                f"place from here would put nothing down. Re-run the pick.")
+
+
+def run_mission(target_label=None, reraise=False):
     """Close on the mapped cube in smooth stages, re-checking the map at every
     stage, then descend gradually and grip.
 
@@ -2427,7 +2921,7 @@ def run_mission(target_label=None):
     refines the target. Errors get corrected while there is still room to correct
     them, and the motion rates are low enough not to jerk.
     """
-    def _approach_target(cube_xy):
+    def _approach_target(cube_xy, stage=0):
         """Hover position for the approach: short of the cube and to its right.
 
         The geometry itself is approach_target() in manipulation/approach; what this
@@ -2453,7 +2947,17 @@ def run_mission(target_label=None):
         # and closed on air. Take the smaller of the two: never further than the
         # operator asked, and never further than stays visible.
         closest = max(float(np.hypot(*cube_xy)) - CFG.back_m, 0.05)
-        trim = float(CFG.right_trim_m)
+        # DECAY the trim across the stages — stage_trim() in manipulation/approach.
+        # Full offset on the first hop, where losing sight of the object is the real
+        # risk, shrinking to trim_final_frac by the last one, where the offset is
+        # nothing but pixel error handed to the centring servo. Applied BEFORE the
+        # visibility cap so the cap still bounds whatever the decay asked for.
+        # Land the decay on the offset the GRASP wants, not on a fraction of the
+        # visibility trim. One lateral offset, held from the first hop to the jaws,
+        # so the centring servo has no sideways move left to make beside the object.
+        trim = stage_trim(float(CFG.right_trim_m), stage=stage, total=int(CFG.steps),
+                          final_frac=float(CFG.trim_final_frac),
+                          final_m=grasp_bias_m(PRIORS.size_m(label)))
         cap = right_trim_for_visibility(GEOM, PRIORS.size_m(label), closest)
         if cap > 0.0:
             trim = min(trim, cap)
@@ -2475,12 +2979,41 @@ def run_mission(target_label=None):
         # map's average across viewpoints. Falls back to the map if the survey
         # cannot see the object at all, so a scan is still useful.
         cube_xy = None
+        used_survey = False
         if USE_SURVEY_LOCATE[0]:
             cube_xy, spread = locate_from_survey(label, finder)
+            used_survey = cube_xy is not None
             if cube_xy is None:
                 say(f"survey failed ({spread}); falling back to the 2D map")
         if cube_xy is None:
             cube_xy = _mapped_xy(label)
+        if cube_xy is None:
+            # LAST RESORT, and the place it actually earns its keep. The map is empty
+            # for this label, so the alternative is not a worse pick — it is no pick at
+            # all: "'red cube' is not on the 2D map", with the cube sitting in plain
+            # view of the camera. That happened repeatedly, because the strict-HSV
+            # bands miss an object whose colour shifts with the viewing angle (a green
+            # cube photographs teal from a steep look and is not found at all).
+            #
+            # Measured against this rig's own frames: where the object IS in the
+            # picture the model's box centre agrees with the HSV blob to within ~5px,
+            # and on the teal frame it boxed the cube while HSV had latched onto an
+            # unrelated blob 211px away. One look, then the ordinary geometry converts
+            # the pixel — the model is never asked how far away anything is.
+            vlm_budget_reset()
+            try:
+                j_v, rgb_v, _ = observe(overlay=False)
+                tr_v = vlm_track(rgb_v, label)
+            except Exception:
+                tr_v = None
+            if tr_v is not None:
+                xy_v, rng_v, _sz = obj_xy_2d(tr_v.bbox_xyxy, T_cam_of(j_v),
+                                             z_m=None, label=label)
+                if xy_v is not None:
+                    cube_xy = xy_v
+                    say(f"  [2/7] target    from the vision model: "
+                        f"({xy_v[0]*100:.1f},{xy_v[1]*100:.1f})cm, range {rng_v*100:.0f}cm "
+                        f"— the map had no '{label}'")
         if cube_xy is None:
             how = "the survey pose or " if USE_SURVEY_LOCATE[0] else ""
             raise Abort(f"'{label}' is not on the 2D map (looked in {how}the map). "
@@ -2535,7 +3068,7 @@ def run_mission(target_label=None):
             q = observe()[0].astype(np.float64)
             j5 = float(q[4])         # keep the wrist as-is; do NOT twist while approaching
             tip = _tip(q)
-            target_xy, trim_used = _approach_target(cube_xy)
+            target_xy, trim_used = _approach_target(cube_xy, stage=i)
             # Log the trim ACTUALLY applied. The [3/7] banner used to print the knob
             # while a derived value overrode it, so the log disagreed with the robot.
             say(f"approach {i+1}: cube=({cube_xy[0]*100:.1f},{cube_xy[1]*100:.1f})cm "
@@ -2557,8 +3090,27 @@ def run_mission(target_label=None):
             pitch, e = plan_grasp_pitch(
                 np.array([cube_xy[0], cube_xy[1], PICK_GRASP_Z]), q)
             if pitch is None:
-                raise Abort(f"r={np.hypot(*cube_xy)*100:.0f}cm is out of reach "
-                            f"(best IK {e*1e3:.0f}mm)")
+                r_cm = float(np.hypot(*cube_xy)) * 100.0
+                msg = (f"r={r_cm:.0f}cm is out of reach (best IK {e*1e3:.0f}mm; "
+                       f"this arm reaches {GRASP_R_MAX*100:.0f}cm with a flat wrist, "
+                       f"less as the grasp steepens)")
+                # Before blaming the arm, check whether the RANGE is even believable.
+                # Range and apparent size are the same measurement: an object twice as
+                # far is inferred twice as big. So a "5cm cube" that measures 10cm is
+                # not a big cube -- it is a doubled range, and the reach limit is a
+                # symptom, not the fault. Seen live: a cube 20cm away, its box clipped
+                # at the frame edge, mapped at 42cm and reported "51cm is out of reach"
+                # while the arm sat correctly refusing a target that was never there.
+                measured = _mapped_size_m(label)
+                prior = float(PRIORS.size_m(label))
+                if measured and prior > 0 and not (0.6 < measured / prior < 1.7):
+                    msg = (f"r={r_cm:.0f}cm is out of reach, BUT that range is not "
+                           f"trustworthy: '{label}' measures {measured*100:.1f}cm across "
+                           f"when a {label} is {prior*100:.1f}cm, so the range is off by "
+                           f"about {measured/prior:.1f}x and the object is nearer than "
+                           f"{r_cm:.0f}cm. Re-scan with it fully in frame (a box clipped "
+                           f"at the frame edge ranges badly), rather than raising reach")
+                raise Abort(msg)
             with lock:
                 state["obj3d"] = [float(cube_xy[0]), float(cube_xy[1]), PICK_GRASP_Z]
                 state["obj3d_label"] = label
@@ -2621,9 +3173,15 @@ def run_mission(target_label=None):
         gp, _e = plan_grasp_pitch(np.array([cube_xy[0], cube_xy[1], grasp_z]), q)
         gp = gp if gp else 70.0
         set_phase("PICK", "centering the cube under the jaws")
+        # The lateral aim is DERIVED per-object inside _center_on_cube, which logs it;
+        # printing HAND_UV+aim_du here would report an aim point that is not the one
+        # used, which is exactly how the old dialled offset stayed invisible.
         say(f"  [4/7] centering  pitch={gp:.0f}deg wrist_roll={j5:.0f}deg "
-            f"aim=({HAND_UV[0]+CFG.aim_du_px:.0f},{HAND_UV[1]+CFG.aim_dv_px:.0f})px")
+            f"fingertip=({HAND_UV[0]:.0f},{HAND_UV[1]:.0f})px")
         aligned = _center_on_cube(finder, gp, j5, label)
+        # Half a hand-eye sample: where the object APPEARED, from a pose we still know.
+        # The other half arrives at contact. See note_grasp_observation.
+        note_grasp_observation(finder, label)
         if aligned is not None:
             gx, gy = float(aligned[0]), float(aligned[1])
             say(f"        centred -> grasp at x={gx*100:+.1f} y={gy*100:+.1f} cm "
@@ -2665,6 +3223,26 @@ def run_mission(target_label=None):
             _set_carry(True, label=label, h_m=h_obj, grip_to_bottom=g2b)
             say(f"holding {label}: grip->bottom {g2b*100:.1f}cm, "
                 f"object height {h_obj*100:.1f}cm")
+            # CALIBRATION, FOR FREE. The jaws are around the object, so FK now says
+            # where it actually was — the same ground truth /selfcal/touch asks an
+            # operator to jog to by hand. Pair it with raw_xy, the localization this
+            # pick was aimed from, and this grasp becomes one calibration sample.
+            #
+            # BEFORE the lift, because lifting moves the object and FK would then
+            # describe where it is being carried, not where it was found. And only on
+            # CONTACT: a grasp that closed on air knows nothing about where anything is.
+            try:
+                tip_now = _tip(observe(overlay=False)[0])
+                _selfcal_record(label, raw_xy, tip_now[:2],
+                                source="survey" if used_survey else "map")
+                # The same instant, kept in the form a hand-eye fit can use: the pixel
+                # it was seen at, the pose it was seen from, and now the position the
+                # grasp PROVED. Unlike the map's estimate this owes nothing to the
+                # transform being fitted, which is what makes it usable as truth.
+                if record_grasp_sample(tip_now):
+                    say(f"handeye: grasp sample #{len(load_grasp_samples())} recorded")
+            except Exception as e:
+                say(f"selfcal: could not record this grasp ({type(e).__name__}: {e})")
         else:
             _set_carry(False)
         set_phase("PICK", "lifting")
@@ -2672,14 +3250,31 @@ def run_mission(target_label=None):
         ee_move_rel([0, 0, PICK_LIFT_M], settle=0.25)
         say(f"PICK {'SUCCESS' if held else 'FAILED - closed on air'}  "
             f"tip={np.round(_tip(observe(overlay=False)[0])*100,1).tolist()}cm")
+        # SECOND OPINION ON THE GRASP. `held` comes from a gripper current delta, which
+        # says the jaws met resistance — not that they met the OBJECT. It reads the same
+        # for a finger fouled on the cube's corner, for the table edge, and for a real
+        # grasp. The arm is stationary and holding at this point, so a frame now costs
+        # nothing on the critical path and answers the question directly. Advisory: it
+        # is logged next to `held` so the two can be compared over a run of picks before
+        # anything is allowed to branch on it.
+        if GEMINI is not None:
+            try:
+                GEMINI.ask_async("verify_grasp", observe(overlay=False)[1], label,
+                                 on_done=lambda v: _log_grasp_verdict(v, held))
+            except Exception:
+                pass
         say("=" * 52)
         set_phase("DONE" if held else "PICK",
                   f"{label} cube {'picked' if held else 'missed - closed on air'}")
 
     except Abort as e:
         set_phase("ABORTED", str(e))
+        if reraise:
+            raise
     except Exception as e:
         set_phase("ERROR", f"{type(e).__name__}: {e}")
+        if reraise:
+            raise
     finally:
         try:
             with lock:
@@ -3502,13 +4097,29 @@ def stream2():
 
 @app.route("/start", methods=["POST"])
 def start():
+    """Start button. Runs a TASK when the query names a destination, else a pick.
+
+    See reads_as_a_task(): "red on green" typed into the query box used to pick the
+    red cube and stop, because Start only ever ran run_mission and run_mission takes
+    the first label in the query as its target.
+
+    The two paths latch differently and must not be swapped: run_mission clears the
+    stop flag and owns state["running"] itself, while run_task relies on _run_bg for
+    both. Routing a task through the bare thread below would leave it unstoppable and
+    invisible to the busy check.
+    """
     with lock:
         busy = state["running"]
-    if not busy and (mission_thread[0] is None or not mission_thread[0].is_alive()):
-        mission_thread[0] = threading.Thread(target=run_mission, daemon=True)
-        mission_thread[0].start()
-        return jsonify(ok=True)
-    return jsonify(ok=False, reason="already running")
+        q = pending_instruction(state)   # not state["query"] - see pending_instruction
+    if busy or (mission_thread[0] is not None and mission_thread[0].is_alive()):
+        return jsonify(ok=False, reason="already running")
+    steps = reads_as_a_task(q)
+    if steps is not None:
+        say(f"start: '{q}' reads as a task ({len(steps)} step(s)) — placing, not just picking")
+        return _run_bg(run_task, q)
+    mission_thread[0] = threading.Thread(target=run_mission, daemon=True)
+    mission_thread[0].start()
+    return jsonify(ok=True, task=False)
 
 
 @app.route("/stop", methods=["POST"])
@@ -3601,12 +4212,18 @@ _WFLEX = ARM.slaved_joint                               # the algebraically-slav
 WFLEX_MIN, WFLEX_MAX = float(J_LO[_WFLEX]), float(J_HI[_WFLEX])
 
 
+
 def _slave_wflex(j1, j2, pitch_tgt):
-    """Hold the tool pitch by slaving the last pitch joint. See PitchHoldIK.slave."""
+    """Hold the tool pitch by slaving the last pitch joint. See PitchHoldIK.slave.
+
+    Not called from this file — the IK strategy does its own slaving internally. It
+    stays because tests/test_extraction_parity.py pins 60 golden values through it,
+    which is what keeps the extracted PitchHoldIK.slave honest against the original
+    monolith. Delete it and that check silently stops covering anything.
+    """
     q = np.zeros(ARM.n_joints, dtype=np.float64)
     q[1], q[2] = j1, j2
     return ik_strategy().slave(q, pitch_tgt)
-
 
 def _ik_hold_pitch(q_seed, p_tgt, pitch_tgt, j5_fixed, iters=80, tol=2e-3,
                    ret_err=False, _retry=True):
@@ -3712,7 +4329,10 @@ def jog_loop():
             th_tgt += math.radians(vth_f) * JOG_DT
         if abs(z_tgt - p[2]) < 0.06:
             z_tgt += vz_f * JOG_DT
-        r_tgt = float(np.clip(r_tgt, 0.12, 0.42))       # reach limits
+        # Was a hardcoded 0.42. The arm reaches 0.47 with a flat wrist, so this
+        # clipped 5cm short of the real limit -- jogging outward simply stopped,
+        # with nothing said, and the arm looked unable to extend.
+        r_tgt = float(np.clip(r_tgt, ARM.reach_min_m + 0.04, GRASP_R_MAX))
         z_tgt = max(z_tgt, -0.10)
         p_tgt = np.array([r_tgt * math.cos(th_tgt), r_tgt * math.sin(th_tgt), z_tgt])
         q_t = _ik_hold_pitch(q_cmd, p_tgt, pitch_tgt, j5_cmd)
@@ -3786,17 +4406,33 @@ def jogvec():
 @app.route("/setquery", methods=["POST"])
 def setquery():
     """Set the YOLO-World detection prompt live. Comma-separated synonyms help
-    (e.g. 'red cube, toy block, red box')."""
+    (e.g. 'red cube, toy block, red box').
+
+    A task phrase ("red on green") is not a vocabulary, but it is a perfectly natural
+    thing to type here. Rather than accept it as two odd class names, expand it to the
+    vocabulary the task actually needs — every object it mentions — so both the pick
+    and its destination can reach the map. Start then runs it as a task.
+    """
     q = (request.args.get("q") or "").strip()
     if not q or detector is None:
         return jsonify(ok=False, reason="empty query or detector not ready")
-    DETECT.request_query(q)     # applied by the detector thread
+    steps = reads_as_a_task(q)
+    vocab = q if steps is None else task_vocabulary(steps)
+    DETECT.request_query(vocab)     # applied by the detector thread
     with lock:
         state["query"] = q
-    return jsonify(ok=True, query=q)
-
-
-# Query presets ("coco" / "table") come from perception/object_priors.py.
+        state["vocabulary"] = vocab
+        # state["query"] is NOT a safe place to keep the phrase: the detector thread
+        # reports the vocabulary it actually applied back into it (on_query_change in
+        # main()), so a moment later "red on green" has become "red cube, green cube"
+        # and Start sees an ordinary two-class query again. Caught on the live server,
+        # not by the tests — the overwrite only happens once the detector cycles.
+        # state["intent"] holds what the operator ASKED for and nothing overwrites it.
+        state["intent"] = q if steps is not None else None
+    if steps is not None:
+        say(f"query: '{q}' reads as a task — detecting '{vocab}' so both the object "
+            f"and its destination can reach the map. Press Start (or Run task).")
+    return jsonify(ok=True, query=q, vocabulary=vocab, task=steps is not None)
 
 
 @app.route("/preset")
@@ -3807,76 +4443,6 @@ def preset():
     if q is None:
         return jsonify(ok=False, reason="unknown preset")
     return jsonify(ok=True, q=q)
-
-
-yolo_approach_running = [False]
-yolo_approach_process = [None]
-
-
-@app.route("/yolo-approach", methods=["POST"])
-def yolo_approach():
-    """Launch lerobot-yolo-track-approach with the given text query.
-    Note: This requires stopping the main control loop first (close this UI).
-    The YOLO approach will take full control of the robot via COM4."""
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify(ok=False, reason="empty query")
-
-    if yolo_approach_running[0]:
-        return jsonify(ok=False, reason="YOLO approach already running")
-
-    def run_yolo():
-        try:
-            yolo_approach_running[0] = True
-            say(f"Starting YOLO approach with query: {q}")
-            # Run lerobot-yolo-track-approach with the query
-            # NOTE: This will fail if COM4 is still in use by the main loop
-            cmd = [
-                "lerobot-yolo-track-approach",
-                "--robot.type=so101_follower",
-                f"--robot.port={ARM_PORT}",
-                "--robot.cameras={\"front\": {\"type\": \"oakd\", \"fps\": 30, \"width\": 640, \"height\": 480, \"use_depth\": true}}",
-                f"--query={q}",
-                "--model-path=./yolov8s-worldv2.pt",
-                "--camera-mount=gripper",
-                "--camera-frame-convention=opencv",
-                "--gripper-camera-tf=0.04,0,0.02,0,-0.35,0",
-                "--target-from-gripper-tf=true",
-                "--approach-style=plan_top",
-                "--search-scan-enabled=true",
-                "--depth-from-bbox-enabled=true",
-                "--target-physical-size-m=0.03",
-                "--depth-source-policy=bbox_preferred",
-                "--top-approach-height-m=0.05",
-                "--top-max-reach-m=0.35",
-                "--table-z-m=-0.02",
-                "--table-clearance-m=0.005",
-                "--plan-top-tilt-fraction=0.0",
-                "--plan-top-tilt-tolerance-deg=90",
-                "--plan-top-final-hover-m=0.05",
-                "--plan-top-gripper-tip-offset-m=0.02",
-                "--plan-top-center-enable=true",
-                "--smooth-center-alpha=0.25",
-                "--plan-top-keep-in-frame-enable=true",
-                "--plan-top-keep-in-frame-deadband-px=24",
-                "--plan-top-keep-in-frame-kp=0.40",
-                "--plan-top-keep-in-frame-max-step-deg=2.5",
-                "--show-window=true",
-                "--display-data=true",
-                "--display-sim3d=true"
-            ]
-            proc = subprocess.Popen(cmd, cwd=LEROBOT)
-            yolo_approach_process[0] = proc
-            proc.wait()
-            say("YOLO approach completed")
-        except Exception as e:
-            say(f"YOLO approach error: {e}")
-        finally:
-            yolo_approach_running[0] = False
-            yolo_approach_process[0] = None
-
-    threading.Thread(target=run_yolo, daemon=True).start()
-    return jsonify(ok=True, reason="YOLO approach launched in background. Close this UI to free COM4 if it fails to connect.")
 
 
 @app.route("/debugdepth", methods=["POST"])
@@ -3914,27 +4480,18 @@ def pushout():
     return jsonify(ok=True, cm=cm)
 
 
-@app.route("/setaimdu", methods=["POST"])
-def setaimdu():
-    """Live-tune the lateral aim offset (px). Negative shifts the aim point LEFT
-    in the image, which makes the robot move RIGHT relative to the cube."""
-    try:
-        px = float(request.args.get("px", request.form.get("px", 0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need a number")
-    px = CFG.set_knob("aim_du", px)
-    say(f"aim_du set to {px:.0f}px (left shift -> robot right)")
-    return jsonify(ok=True, px=px)
-
-
 @app.route("/setknob", methods=["POST"])
 def setknob():
     """Live-tune ANY knob by name: /setknob?name=survey_pitch_deg&value=68.2
 
-    The seven routes below this one are per-knob shims that predate ApproachConfig
-    owning its own bounds. This is the generic form they were meant to collapse into,
-    so a knob added to KNOBS is tunable the moment it exists rather than when someone
-    remembers to write it an eighth route. GET /setknob lists what there is to tune.
+    The single tuning route. Six per-knob shims (/setaimdu, /settrim, /setback,
+    /setsteps, /setrangescale, /setbearing) used to sit alongside it, each
+    re-implementing the same clamp-and-log against one hardcoded knob name; they
+    predated ApproachConfig owning its own bounds. A knob added to KNOBS is now
+    tunable the moment it exists. GET /setknob lists what there is to tune.
+
+    /setcubesize is deliberately NOT folded in here: it sets a perception prior
+    (PRIORS.fallback_edge_m), not an approach knob, so it has no entry in KNOBS.
     """
     name = (request.args.get("name") or "").strip()
     if not name:
@@ -3953,43 +4510,6 @@ def setknob():
     return jsonify(ok=True, name=name, was=was, value=now)
 
 
-@app.route("/settrim", methods=["POST"])
-def settrim():
-    """Live-tune the approach rightward trim (cm). Positive shifts the staged
-    approach target to the cube's right."""
-    try:
-        cm = float(request.args.get("cm", request.form.get("cm", 0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need a number")
-    cm = CFG.set_knob("right_trim_cm", cm)
-    say(f"approach right trim set to {cm:.1f}cm")
-    return jsonify(ok=True, cm=cm)
-
-
-@app.route("/setback", methods=["POST"])
-def setback():
-    """Live-tune the approach radial back-off (cm). Positive stops SHORT of the cube."""
-    try:
-        cm = float(request.args.get("cm", request.form.get("cm", 1.0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need a number")
-    cm = CFG.set_knob("back_cm", cm)
-    say(f"approach back-off set to {cm:.1f}cm")
-    return jsonify(ok=True, cm=cm)
-
-
-@app.route("/setsteps", methods=["POST"])
-def setsteps():
-    """Live-tune the number of staged approach steps."""
-    try:
-        n = int(request.args.get("n", request.form.get("n", 4)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need an integer")
-    n = CFG.set_knob("approach_steps", n)
-    say(f"approach steps set to {n}")
-    return jsonify(ok=True, n=n)
-
-
 @app.route("/setcubesize", methods=["POST"])
 def setcubesize():
     """Live-tune the assumed cube edge size (cm). Used by the 2D map apparent-size
@@ -4003,34 +4523,6 @@ def setcubesize():
     PRIORS.fallback_edge_m = cm / 100.0
     say(f"cube edge size set to {cm:.2f}cm")
     return jsonify(ok=True, cm=cm)
-
-
-@app.route("/setrangescale", methods=["POST"])
-def setrangescale():
-    """Live-tune the global range scale. >1.0 pushes mapped objects further out
-    (more spread); <1.0 pulls them closer. Use this if the whole map looks
-    compressed or stretched."""
-    try:
-        scale = float(request.args.get("scale", request.form.get("scale", 1.0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need a number")
-    scale = CFG.set_knob("range_scale", scale)
-    say(f"range scale set to {scale:.2f} — clear the 2D map and re-scan to see it")
-    return jsonify(ok=True, scale=scale)
-
-
-@app.route("/setbearing", methods=["POST"])
-def setbearing():
-    """Live-tune the map bearing offset (deg). Positive = rotate map CCW.
-    Use this when the camera shows objects on opposite sides but the 2D map
-    clusters them on one side (camera heading error)."""
-    try:
-        deg = float(request.args.get("deg", request.form.get("deg", 0.0)))
-    except (TypeError, ValueError):
-        return jsonify(ok=False, reason="need a number")
-    deg = CFG.set_knob("bearing_deg", deg)
-    say(f"map bearing offset set to {deg:.1f}deg — clear the 2D map and re-scan to see it")
-    return jsonify(ok=True, deg=deg)
 
 
 # ---------------- self-calibration: measure the localization error instead of dialling it ----------------
@@ -4055,11 +4547,134 @@ def setbearing():
 #   POST /selfcal/apply  — write them to CFG, but only if the fit is trustworthy
 _selfcal = {"pending": None, "samples": []}
 
+# AND THE SAME MEASUREMENT, TAKEN FOR FREE. The operator-in-the-loop procedure above
+# is correct and nobody runs it: it costs six jog-and-press cycles before it will even
+# report a fit, so push_out/range_scale/bearing stayed hand-dialled and the pick kept
+# missing in the way they were invented to patch.
+#
+# But a SUCCESSFUL GRASP IS ALREADY THIS EXACT SAMPLE. At the instant the jaws close on
+# something, forward kinematics says where that something is — the same ground truth
+# /selfcal/touch collects, and produced by the same fingertip, except the robot got
+# there by itself and the operator pressed nothing. Pair it with the localization the
+# pick aimed at and every successful pick is one calibration point, gathered during
+# ordinary use, spread across exactly the radii and bearings that are actually used.
+#
+# Samples persist to JSONL so they accumulate across restarts — a calibration that
+# needs six points is worthless if the buffer empties every time the server reloads.
+SELFCAL_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "selfcal_samples.jsonl")
+selfcal_log_lock = threading.Lock()
+
+#: Grasps this far from where the camera said the object was are not calibration data.
+#: Beyond it the pick was rescued by the centring servo or got lucky, and the pairing
+#: "camera said X, object was at Y" no longer describes one localization error.
+SELFCAL_MAX_PAIR_M = 0.15
+
 
 def _selfcal_off_axis_deg(uv):
     """Angle between a pixel's ray and the camera's own view direction."""
     d = np.array([(uv[0] - cx0) / fx, (uv[1] - cy0) / fy, 1.0])
     return float(math.degrees(math.acos(np.clip(1.0 / np.linalg.norm(d), -1.0, 1.0))))
+
+
+def _selfcal_uncorrect(xy, range_scale, bearing_offset_deg):
+    """Strip the corrections that were live when an observation was taken.
+
+    The fit must be ABSOLUTE — "the rig's range is 6% long" — not a delta on whatever
+    was dialled in at the time, or applying it a second time would double the very
+    correction it just measured. The localizer's forward correction is
+    ``r' = range_scale * r`` then ``theta' = theta + bearing`` (perception/locate.py),
+    and this is its exact inverse.
+
+    This inversion is only valid because every localization path applies the SAME
+    correction. It did not used to: the silhouette solve and the bbox-to-table ray got
+    the bearing offset but never range_scale, so a fitted scale moved some of the map's
+    fixes and not others and no single inverse existed. :func:`_correct_xy` is what
+    makes them uniform — change one and this stops being an inverse.
+    """
+    # LocalizationModel.unapply is the exact inverse of the correction the localizer
+    # applies, and lives with the model so the two cannot drift apart. push_out is 0
+    # here on purpose: raw_xy is captured BEFORE run_mission applies the push-out.
+    return LocalizationModel(range_scale=float(range_scale), push_out_m=0.0,
+                             bearing_offset_deg=float(bearing_offset_deg)).unapply(xy)
+
+
+def _selfcal_record(label, xy_observed, xy_true, source, off_axis_deg=0.0):
+    """Log one (camera said, arm found) pair. Returns the sample, or None if refused."""
+    obs = np.asarray(xy_observed, dtype=np.float64)
+    true = np.asarray(xy_true, dtype=np.float64)
+    err = float(np.linalg.norm(true - obs))
+    if err > SELFCAL_MAX_PAIR_M:
+        say(f"selfcal: not recording this grasp — camera and arm disagree by "
+            f"{err*100:.1f}cm, past the {SELFCAL_MAX_PAIR_M*100:.0f}cm bound where the "
+            f"pair still describes one localization error")
+        return None
+    sample = {
+        "label": str(label), "source": str(source),
+        "xy_true": [float(true[0]), float(true[1])],
+        "xy_observed": [float(obs[0]), float(obs[1])],
+        "off_axis_deg": float(off_axis_deg),
+        "range_m": float(np.hypot(*obs)),
+        # The correction state the observation was taken under, so it can be undone.
+        "range_scale": float(CFG.range_scale),
+        "bearing_offset_deg": float(CFG.bearing_offset_deg),
+        "t": time.time(),
+    }
+    _selfcal["samples"].append(sample)
+    try:
+        with selfcal_log_lock, open(SELFCAL_LOG, "a") as f:
+            f.write(json.dumps(sample) + "\n")
+    except Exception as e:
+        say(f"selfcal: sample kept in memory but not written ({type(e).__name__})")
+    say(f"selfcal: sample #{len(_selfcal['samples'])} from a successful grasp — "
+        f"camera said r={np.hypot(*obs)*100:.1f}cm, arm found r={np.hypot(*true)*100:.1f}cm "
+        f"(off by {(np.hypot(*true) - np.hypot(*obs))*100:+.1f}cm)")
+    return sample
+
+
+def _selfcal_load_log():
+    """Re-read persisted samples at startup. A bad line is skipped, not fatal."""
+    try:
+        with open(SELFCAL_LOG) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return 0
+    n = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            _selfcal["samples"].append(json.loads(line))
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+@app.route("/gemini", methods=["GET", "POST"])
+def r_gemini():
+    """Ask the vision model about the frame the camera is looking at RIGHT NOW.
+
+    The point is to be able to tune framing without burning a pick: aim the arm, hit
+    this, and it says whether the object is in view, clipped, occluded or absent —
+    the same question the centring step asks when it fails, minus the failure.
+    """
+    if GEMINI is None:
+        return jsonify(ok=False, reason="gemini is not configured (no GOOGLE_API_KEY "
+                                        "in the environment or .env.local, or the "
+                                        "google-genai SDK is not installed)")
+    label = request.args.get("label") or (_query_labels() or ["red cube"])[0]
+    try:
+        _j, rgb, _ = observe()
+    except Exception as e:
+        return jsonify(ok=False, reason=f"could not grab a frame ({type(e).__name__})")
+    v = GEMINI.explain_miss(rgb, label)
+    say(v.describe())
+    return jsonify(ok=v.ok, answer=v.answer, reason=v.reason,
+                   confidence=round(v.confidence, 2), latency_s=round(v.latency_s, 2),
+                   means=MISS_REASONS.get(v.answer, ""), model=GEMINI.model,
+                   calls=GEMINI.calls, failures=GEMINI.failures)
 
 
 @app.route("/selfcal/reset", methods=["POST"])
@@ -4120,8 +4735,23 @@ def selfcal_touch():
 
 
 def _selfcal_load_samples():
-    return [LocalizationSample(np.array(s["xy_true"]), np.array(s["xy_observed"]),
-                               s["off_axis_deg"]) for s in _selfcal["samples"]]
+    """The buffer as fittable samples, with each one's live corrections undone.
+
+    Samples predating the auto-recorder carry no correction state; they were taken
+    through /selfcal/observe, which calls obj_xy_2d directly, so they have whatever was
+    dialled in at the time and no record of it. Defaulting to the identity treats them
+    as raw — right whenever the knobs were untouched, which is the case they were
+    collected in.
+    """
+    out = []
+    for s in _selfcal["samples"]:
+        obs = _selfcal_uncorrect(np.array(s["xy_observed"], dtype=np.float64),
+                                 s.get("range_scale", 1.0),
+                                 s.get("bearing_offset_deg", 0.0))
+        out.append(LocalizationSample(np.array(s["xy_true"], dtype=np.float64), obs,
+                                      s.get("off_axis_deg", 0.0),
+                                      label=s.get("label", "")))
+    return out
 
 
 @app.route("/selfcal/status")
@@ -4134,9 +4764,9 @@ def selfcal_status():
 def selfcal_fit():
     """Report what the samples imply, WITHOUT changing anything."""
     samples = _selfcal_load_samples()
-    if len(samples) < 6:
-        return jsonify(ok=False, reason=f"only {len(samples)} samples (need 6+, spread "
-                                        f"across both range and bearing)")
+    if len(samples) < MIN_SAMPLES:
+        return jsonify(ok=False, reason=f"only {len(samples)} samples (need {MIN_SAMPLES}+, "
+                                        f"spread across both range and bearing)")
     fit = fit_localization(samples)
     for line in fit.summary().split("\n"):
         say(f"selfcal: {line}")
@@ -4155,8 +4785,8 @@ def selfcal_apply():
     unless ?force=1 — installing numbers that do not describe the rig is exactly
     how the dial-turning this replaces got started."""
     samples = _selfcal_load_samples()
-    if len(samples) < 6:
-        return jsonify(ok=False, reason=f"only {len(samples)} samples (need 6+)")
+    if len(samples) < MIN_SAMPLES:
+        return jsonify(ok=False, reason=f"only {len(samples)} samples (need {MIN_SAMPLES}+)")
     fit = fit_localization(samples)
     force = request.args.get("force") == "1"
     applied = apply_to_config(fit, CFG, force=force)
@@ -4202,6 +4832,42 @@ def relocate():
 
     threading.Thread(target=_rl, daemon=True).start()
     return jsonify(ok=True)
+
+
+@app.route("/handeye/graspfit", methods=["GET", "POST"])
+def handeye_graspfit():
+    """Fit the mount against the objects grasps have proved the position of.
+
+    GET reports what the samples imply and changes nothing. POST?apply=1 writes it.
+
+    This is the third fitter, and it exists because the other two cannot be right by
+    construction on this rig: /calib solves for the transform AND the target together
+    and drifts along a flat direction while reporting a perfect residual, and
+    /calibmount asks only that the viewpoints agree — which they did, to 0.3cm, on the
+    wrong place, making picking worse. Neither objective knows where anything actually
+    is. A grasp does.
+    """
+    global T_ee_cam
+    samples = load_grasp_samples()
+    fit = fit_to_known_points(samples, GEOM, T_seed=T_ee_cam)
+    body = {"ok": bool(fit.converged), "n": len(samples),
+            "rms_px": round(float(fit.rms_px), 2) if fit.rms_px == fit.rms_px else None,
+            "rms_px_before": round(float(fit.before.get("rms_px", float("nan"))), 2),
+            "tf": tf_to_string(fit.T_ee_cam), "reason": fit.reason, "applied": False}
+    if request.method == "POST" and request.args.get("apply") == "1":
+        if not fit.converged:
+            body["reason"] = f"refusing to apply: {fit.reason}"
+            return jsonify(body), 400
+        T_ee_cam = fit.T_ee_cam
+        _sync_geometry()
+        save_hand_eye(TF_FILE, fit)
+        _LOC[0] = None                     # localizers cached the old geometry
+        say(f"handeye: mount fitted from {len(samples)} grasps, "
+            f"{fit.before.get('rms_px', 0):.1f}px -> {fit.rms_px:.1f}px reprojection")
+        set_phase("IDLE", f"mount fitted from {len(samples)} grasps "
+                          f"({fit.rms_px:.1f}px)")
+        body["applied"] = True
+    return jsonify(body)
 
 
 @app.route("/calibmount", methods=["POST"])
@@ -4592,33 +5258,213 @@ def parse_task(text):
     return steps
 
 
-def _find_map_tag(label):
-    """The best-supported map entry whose label mentions `label`. Loose on purpose:
-    the user types 'red', the map holds 'red cube'."""
-    want = str(label).strip().lower()
-    with w2d_lock:
-        best, bn = None, -1
-        for t, o in WORLD.objs.items():
-            if o.get("picked"):
-                continue
-            if want in o["label"].lower() or o["label"].lower() in want:
-                if o["n"] > bn:
-                    best, bn = t, o["n"]
-        return best
+def reads_as_a_task(text):
+    """The parsed steps if `text` names a destination ("red on green"), else None.
 
+    THE TRAP THIS CLOSES. "red on green" is a placement instruction, but typed into
+    the detection-query box it was accepted as a *vocabulary* and Start then picked
+    whichever label came first — so the arm grabbed the red cube, reported DONE, and
+    never went near the green one. Nothing was broken; the phrase had simply been read
+    as two class names instead of as a task. A real run shows exactly that:
+
+        PICK START  target='red'  query='red cube, green cube'
+        ... PICK SUCCESS ... [DONE] red cube picked
+
+    The phrase is unambiguous — no detection vocabulary needs the word "on" — so both
+    entry points now honour it rather than one of them silently doing half the job.
+    """
+    try:
+        return parse_task(text)
+    except Abort:
+        return None
+
+
+def pending_instruction(st):
+    """What the operator last ASKED for — not what the detector ended up running.
+
+    state["query"] cannot answer this. The detector thread reports the vocabulary it
+    actually applied back into that key (on_query_change in main()), so a task phrase
+    put there survives only until the detector next cycles: "red on green" silently
+    becomes "red cube, green cube", and Start sees an ordinary two-class query and
+    runs a plain pick. That is the original bug wearing a different hat, and it only
+    shows up on a live server, which is where it was found.
+    """
+    return str(st.get("intent") or st.get("query") or "")
+
+def task_vocabulary(steps):
+    """Detection query covering every object a task mentions, picks and destinations.
+
+    A task needs BOTH objects on the map at once: the pick to drive at, the
+    destination to place on. Deriving the vocabulary from the task is what guarantees
+    that — otherwise the map only ever holds whatever the query happened to name, and
+    run_task aborts with "no 'green' on the 2D map" through no fault of the operator.
+
+    Bare colour words are expanded to the cube class they almost always mean
+    ("green" -> "green cube"), because a one-word colour is a weak YOLO-World prompt.
+    """
+    out = []
+    for pick, dest in steps:
+        for lab in (pick, dest):
+            lab = str(lab).strip().lower()
+            if not lab:
+                continue
+            if lab not in CLASS_META and f"{lab} cube" in CLASS_META:
+                lab = f"{lab} cube"
+            if lab not in out:
+                out.append(lab)
+    return ", ".join(out)
+
+def map_label_matches(want, label) -> bool:
+    """Does this map entry's label mean the thing the caller asked for?
+
+    Loose in BOTH directions on purpose: the operator types "red", the map holds
+    "red cube", and _target_finder hands the mission the bare colour "red" while the
+    detector wrote "red cube".
+
+    ONE function because the mismatch is what broke it. The `picked` flag was SET with
+    a loose test (`label.split()[0] in o["label"]`, so "red" marked "red cube") and
+    RETIRED with an exact one (`o["label"] == carry_label`, so "red cube" == "red" was
+    never true). The flag went on and never came off, `_find_map_tag` skips picked
+    entries, and so every object the arm successfully picked became permanently
+    invisible to tasks: "no 'red cube' on the 2D map" while the map plainly held one
+    and the camera was looking straight at it.
+    """
+    a, b = str(want).strip().lower(), str(label).strip().lower()
+    return bool(a) and bool(b) and (a in b or b in a)
+
+
+def clear_picked_flags(label=None):
+    """Un-flag map entries marked as 'in the jaws'. Returns how many were cleared.
+
+    ``picked`` means "this entry is the object currently held" — so when the jaws are
+    empty, by definition nothing is picked. Clearing it here rather than only on a
+    successful place is what makes it self-correcting: a pick that missed, a place, a
+    dropped object, and a carry cleared by the grasp check all end at the same place,
+    and none of them should leave the map poisoned.
+    """
+    n = 0
+    with w2d_lock:
+        for _t, o in WORLD.objs.items():
+            if o.get("picked") and (label is None or map_label_matches(label, o["label"])):
+                o["picked"] = False
+                n += 1
+    return n
+
+def _live_range_and_tip(label):
+    """(apparent range to `label` right now, current tip position), or (None, None).
+
+    Apparent size is the referee because it is transform-free: ``fx * real_width /
+    pixel_width`` needs no hand-eye rotation, no table plane and no arm pose. That is
+    exactly what a ghost map entry cannot survive — an entry 52cm away is refuted on
+    the spot by a cube filling 100 pixels.
+    """
+    try:
+        j, rgb, _ = observe(overlay=False)
+        finder, _tracker, _lab = _target_finder(label)
+        tr = finder(rgb, T_cam_of(j))
+        if tr is None or tr.clipped:
+            return None, None
+        rng = apparent_range_m(tr.bbox_xyxy, label)
+        if rng is None:
+            return None, None
+        tip = np.asarray(kin.forward_kinematics(np.asarray(j, np.float64)),
+                         dtype=np.float64)[:3, 3]
+        return float(rng), tip
+    except Exception:
+        return None, None
+
+
+def _find_map_tag(label):
+    """The map entry for `label` that best matches what the camera can see NOW.
+
+    Loose on the label: the user types 'red', the map holds 'red cube'.
+
+    WHY NOT SIMPLY THE BEST-SUPPORTED ENTRY, which is what this did. Observations taken
+    from different arm poses are rotated to different places by a hand-eye transform
+    that is wrong, so one physical object grows several map entries too far apart to
+    merge — and the ghost is not the lonely one. Measured, on a map cleared seconds
+    earlier and rebuilt from a single pose:
+
+        'green cube'  base r=37.1cm   18.6cm from the tip   n=40   <- the real cube
+        'green cube'  base r=52.0cm   34.3cm from the tip   n=98   <- the ghost, and
+                                                                      better supported
+
+    Picking by ``n`` chose the ghost, the arm drove at 52cm, hit its 47cm limit and
+    reported "out of reach" — an accurate message about entirely the wrong thing.
+
+    So: when the object is in view, prefer the entry whose distance from the gripper
+    matches how big the object actually looks. Support count only breaks ties among
+    entries the camera cannot arbitrate, and is the whole rule when nothing is visible.
+    """
+    want = str(label).strip().lower()
+    rng, tip = _live_range_and_tip(label)
+    with w2d_lock:
+        cands = [(t, o) for t, o in WORLD.objs.items()
+                 if not o.get("picked") and map_label_matches(want, o["label"])]
+        if not cands:
+            return None
+        if rng is None or tip is None:
+            return max(cands, key=lambda c: c[1]["n"])[0]
+        def mismatch(item):
+            o = item[1]
+            d = float(np.linalg.norm(
+                np.array([o["xy"][0], o["xy"][1], TABLE_Z0], dtype=np.float64) - tip))
+            return abs(d - rng)
+        best = min(cands, key=mismatch)
+        gap = mismatch(best)
+        # If even the best entry disagrees with the picture by more than the object is
+        # wide, the camera is not arbitrating anything useful — say so rather than
+        # quietly acting on it.
+        tol = max(3.0 * float(PRIORS.size_m(label) or 0.05), 0.12)
+        if gap > tol:
+            say(f"map: no '{want}' entry matches what the camera sees "
+                f"(closest is {gap*100:.0f}cm out) — using the best-supported one")
+            return max(cands, key=lambda c: c[1]["n"])[0]
+        if len(cands) > 1:
+            worst = max(cands, key=mismatch)
+            if worst[0] != best[0]:
+                say(f"map: {len(cands)} '{want}' entries; picked the one the camera "
+                    f"agrees with ({gap*100:.0f}cm out, vs {mismatch(worst)*100:.0f}cm)")
+        return best[0]
 
 def run_task(text):
     """Run a typed task: pick each object and place it on its destination."""
     steps = parse_task(text)
     say(f"task: {len(steps)} step(s) — " +
         ", ".join(f"{p} on {d}" for p, d in steps))
-    # Fail before moving if any destination is missing from the map, rather than
-    # picking something up and then discovering there is nowhere to put it.
-    for i, (pick, dest) in enumerate(steps, 1):
-        if _find_map_tag(dest) is None:
-            raise Abort(f"step {i}: no '{dest}' on the 2D map — Scan → 2D map first")
-        if _find_map_tag(pick) is None:
-            raise Abort(f"step {i}: no '{pick}' on the 2D map — Scan → 2D map first")
+    # Make sure the detector can SEE everything this task names before checking the
+    # map for it. A task's destination is often nothing the current query mentions, so
+    # without this the map cannot hold it and the check below fails on the operator's
+    # behalf rather than on the robot's.
+    vocab = task_vocabulary(steps)
+    with lock:
+        running_vocab = state.get("vocabulary") or state.get("query") or ""
+    if vocab and vocab != running_vocab:
+        set_phase("TASK", f"loading the task vocabulary: {vocab}")
+        _apply_query_now(vocab)
+        with lock:
+            state["vocabulary"] = vocab
+
+    # Fail before moving if any object is missing from the map, rather than picking
+    # something up and then discovering there is nowhere to put it. A missing object
+    # is far more often "nobody has scanned yet" than "it is not on the table", so
+    # scan once and look again before giving up on it.
+    def _missing():
+        want = []
+        for i, (pick, dest) in enumerate(steps, 1):
+            for lab in (dest, pick):
+                if _find_map_tag(lab) is None and (i, lab) not in want:
+                    want.append((i, lab))
+        return want
+
+    if _missing():
+        say("task: not everything is on the map yet — scanning first")
+        scan_2d(broad=False)
+    gone = _missing()
+    if gone:
+        raise Abort("step {}: no '{}' on the 2D map after a scan — check it is on the "
+                    "table and in view".format(*gone[0]))
+
     for i, (pick, dest) in enumerate(steps, 1):
         checkpoint()
         tag = _find_map_tag(dest)      # re-resolve: earlier steps reshape the map
@@ -4644,7 +5490,12 @@ def r_task():
 
 
 def pick_then_place(dest_tag=None, dest_xy=None, target_label=None):
-    run_mission(target_label=target_label)
+    # reraise=True: pressed on its own, Start swallows a failed pick and leaves the
+    # reason in the phase line, which is right for one button press. In a task the
+    # caller has to KNOW, or every failure downstream is reported as the generic
+    # "pick failed - not placing" and the real cause ("cannot see 'red'", an IK miss,
+    # a stop) is lost behind it.
+    run_mission(target_label=target_label, reraise=True)
     with lock:
         held = carry["held"]
         # run_mission clears state["running"] in its own finally, and checkpoint()
@@ -4922,8 +5773,41 @@ def _install_shutdown_handlers():
             pass            # not on the main thread, or unsupported on this platform
 
 
+def connect_hardware():
+    """Import the lerobot driver stack and return the pieces main() needs.
+
+    Deferred to here on purpose: lerobot is a HARDWARE dependency. Importing it at
+    module scope meant this file could not be imported — for a test, for --help, or
+    to read the routes — without a lerobot checkout on the machine. Everything above
+    this line is RAX and numpy.
+    """
+    try:
+        from lerobot.robots.utils import make_robot_from_config
+        from lerobot.robots.so_follower import SO101FollowerConfig
+        from lerobot.cameras.oakd.configuration_oakd import OAKDCameraConfig
+        from lerobot.perception.yolo_world import YoloWorldDetector
+        from lerobot.motors.feetech.feetech import FeetechMotorsBus as _FTBus
+    except ImportError as e:
+        raise SystemExit(
+            "lerobot is required to talk to the arm and the OAK-D, but it did not "
+            f"import ({e}).\n"
+            "  pip install lerobot   -- or, for a source checkout:\n"
+            "  set RAX_LEROBOT_SRC=<path to the lerobot repo>\n"
+            "Everything else in RAX runs without it: python -m rax.grasp --arm mock"
+        ) from e
+
+    # The gripper servo (ID 6) replies too slowly for lerobot's handshake ping timeout
+    # (raw pings see it 100%; lerobot's missed 48/48). Skip the existence assert: sync
+    # WRITES need no ACK, and every read in this file already tolerates a miss
+    # (gripper_current returns None, observe retries).
+    _FTBus._handshake = lambda self: None
+    return make_robot_from_config, SO101FollowerConfig, OAKDCameraConfig, YoloWorldDetector
+
+
 def main():
     global robot, kin, fx, fy, cx0, cy0, detector, cam, DETECT
+    (make_robot_from_config, SO101FollowerConfig,
+     OAKDCameraConfig, YoloWorldDetector) = connect_hardware()
     clear_gripper_overload()
     say("connecting robot + camera…")
     # The gripper servo (ID 6) answers intermittently — a marginal cable. Retry
@@ -4974,7 +5858,7 @@ def main():
     # lerobot checkout; that copy only adds two FIXED camera frames, so FK to
     # gripper_frame_link is bit-identical (verified over 300 random poses) — and
     # owning the file here is what lets a non-lerobot arm supply its own.
-    kin = RobotKinematics(ARM.urdf_path, ARM.ee_frame, list(ARM.joint_names))
+    kin = make_kinematics(ARM.urdf_path, ARM.ee_frame, list(ARM.joint_names))
     cam = robot.cameras["front"]
     say("colour stream only (depth OFF) — the pick works by eye, not by stereo")
     _fb = ARM.camera.intrinsics_fallback
@@ -4991,8 +5875,32 @@ def main():
     load_floor_plane()
     _tfd = load_tf_override()
     if _tfd:
+        _rms = _tfd.get("rms_px", 0)
         say(f"hand-eye: using CALIBRATED TF from {_tfd.get('fitted','?')} "
-            f"(reprojection {_tfd.get('rms_px',0):.0f}px) -> {_tfd['tf']}")
+            f"(reprojection {_rms:.0f}px) -> {_tfd['tf']}")
+        # rms_px is written by save_hand_eye from an actual reprojection fit, and a
+        # real fit never lands at exactly zero. A 0 means this file did NOT come from
+        # either fitter in this server — the shipped one says
+        # "source": "fingertip-constrained rotation fix", which nothing here writes —
+        # so it carries no measured quality at all and "reprojection 0px" reads as
+        # perfect when it means unmeasured. Say which it is.
+        if not _rms:
+            say("hand-eye: WARNING — that TF has no measured reprojection error "
+                f"(source={_tfd.get('source','?')!r}). It was not produced by "
+                "calibrate_handeye. Run /handeye to get a real residual before "
+                "trusting any range it produces.")
+    global GEMINI
+    if gemini_available():
+        GEMINI = GeminiVision(log=say)
+        say(f"gemini: {GEMINI.model} available. Grasp checks can now CLEAR a carry "
+            f"(a confident 'empty' only, never the reverse); miss diagnosis "
+            f"stays advisory. RAX_GRASP_TRUST_EMPTY=0 to disable")
+    else:
+        say("gemini: no GOOGLE_API_KEY or SDK — miss diagnosis and grasp checks are off")
+    _n_cal = _selfcal_load_log()
+    if _n_cal:
+        say(f"selfcal: {_n_cal} sample(s) carried over from previous runs "
+            f"(need {MIN_SAMPLES}+ to fit; POST /selfcal/fit to see where it stands)")
     # Sanity gate that costs nothing and would have caught this two days ago: the
     # camera is bolted to the gripper, so the fingertip has ONE fixed pixel, and we
     # measured it (HAND_UV). If the TF disagrees, every back-projected ray is wrong
@@ -5021,7 +5929,7 @@ def main():
     # demanded that a pen contain red/orange/green pixels and threw it away. (It
     # even reads the FRUIT "orange" as a colour name.) Colour gating is done
     # per-label in yolo_worker instead - see _colour_ok.
-    detector = YoloWorldDetector(LEROBOT + r"\yolov8s-worldv2.pt", conf=DET_CONF[0], imgsz=PICK_IMGSZ,
+    detector = YoloWorldDetector(YOLO_WEIGHTS, conf=DET_CONF[0], imgsz=PICK_IMGSZ,
                                  color_filter_min_frac=0.0)
     _q0 = "red cube, green cube"      # colour-ONLY: colourless terms like "toy
                                       # block"/"box" make YOLO-World fire on the

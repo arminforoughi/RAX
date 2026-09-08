@@ -153,7 +153,6 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <div class="qrow">
       <input id="query" type="text" placeholder="e.g. red cube, toy block">
       <button id="q-set" onclick="setQuery()">Set</button>
-      <button id="q-run" onclick="runYoloApproach()">Run YOLO Approach</button>
     </div>
     <div class="qrow">
       <button onclick="preset('coco')" title="All 80 COCO classes — everything YOLO knows">All YOLO classes</button>
@@ -166,22 +165,22 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <div class="qrow">
       <label>aim px</label>
       <input id="tune-aim" type="number" step="5" value="-90" title="Lateral aim offset (px). More negative = aim further LEFT in image = robot moves RIGHT.">
-      <button onclick="setTune('aim','/setaimdu?px=')">Set</button>
+      <button onclick="setTune('aim','/setknob?name=aim_du&value=')">Set</button>
     </div>
     <div class="qrow">
       <label>right trim cm</label>
       <input id="tune-trim" type="number" step="0.5" value="3.0" title="Approach target shifted this many cm to the cube's RIGHT.">
-      <button onclick="setTune('trim','/settrim?cm=')">Set</button>
+      <button onclick="setTune('trim','/setknob?name=right_trim_cm&value=')">Set</button>
     </div>
     <div class="qrow">
       <label>back cm</label>
       <input id="tune-back" type="number" step="0.2" value="1.0" title="Approach target stops this many cm SHORT of the cube radially.">
-      <button onclick="setTune('back','/setback?cm=')">Set</button>
+      <button onclick="setTune('back','/setknob?name=back_cm&value=')">Set</button>
     </div>
     <div class="qrow">
       <label>steps</label>
       <input id="tune-steps" type="number" step="1" value="4" title="Number of staged approach waypoints.">
-      <button onclick="setTune('steps','/setsteps?n=')">Set</button>
+      <button onclick="setTune('steps','/setknob?name=approach_steps&value=')">Set</button>
     </div>
     <div class="qrow">
       <label>cube cm</label>
@@ -191,7 +190,7 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <div class="qrow">
       <label>range scale</label>
       <input id="tune-scale" type="number" step="0.05" value="1.0" title="Multiply all ranges by this. >1 spreads objects out; <1 compresses.">
-      <button onclick="setTune('scale','/setrangescale?scale=')">Set</button>
+      <button onclick="setTune('scale','/setknob?name=range_scale&value=')">Set</button>
     </div>
     <div class="qrow">
       <label>reach cm</label>
@@ -201,7 +200,7 @@ font:600 9px ui-monospace,Consolas;letter-spacing:.4px;color:#6b7a86;text-transf
     <div class="qrow">
       <label>bearing deg</label>
       <input id="tune-bearing" type="number" step="5" value="0.0" title="Rotate the map left/right. Use when camera shows objects on opposite sides but map clusters them on one side.">
-      <button onclick="setTune('bearing','/setbearing?deg=')">Set</button>
+      <button onclick="setTune('bearing','/setknob?name=bearing_deg&value=')">Set</button>
     </div>
   </div>
   <pre id="log"></pre>
@@ -331,18 +330,6 @@ async function setTune(id, url){
     if(!r.ok) alert(r.reason || 'failed');
   }catch(e){ btn.textContent = 'Set'; alert(e.message); }
   setTimeout(()=>btn.textContent='Set', 1200);
-}
-async function runYoloApproach(){
-  const q = document.getElementById('query').value.trim();
-  if(!q) { alert('Enter a query first (e.g. "red cube")'); return; }
-  const btn = document.getElementById('q-run'); btn.textContent = '⟳ running…'; btn.disabled = true;
-  try{
-    const r = await (await fetch('/yolo-approach?q='+encodeURIComponent(q),{method:'POST'})).json();
-    btn.textContent = r.ok ? '✓ Done' : 'Run YOLO Approach';
-    if(!r.ok) alert('Error: ' + (r.reason||'unknown'));
-  }
-  catch(e){ btn.textContent = 'Run YOLO Approach'; alert('Connection error: ' + e.message); }
-  finally { btn.disabled = false; setTimeout(()=>document.getElementById('q-run').textContent='Run YOLO Approach', 2000); }
 }
 async function setPush(){
   const cm = parseFloat(document.getElementById('pushout').value);

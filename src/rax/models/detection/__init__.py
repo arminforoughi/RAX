@@ -23,12 +23,20 @@ from rax.models.detection.sam2_tracker import (
     Sam2Tracker,
     make_mask_tracker,
 )
-from rax.models.detection.tracking import AnchorTracker, PixelTracker, Track
+from rax.models.detection.tracking import (
+    AnchorTracker,
+    PixelTracker,
+    Track,
+    clipped_edges,
+    table_ray_is_usable,
+)
 
 __all__ = [
     "AnchorTracker",
     "PixelTracker",
     "Track",
+    "clipped_edges",
+    "table_ray_is_usable",
     "Detection",
     "PromptDetector",
     "YoloWorldDetector",

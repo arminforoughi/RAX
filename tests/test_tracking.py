@@ -154,3 +154,68 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- which edge is clipped, and what survives it -------------------------------------
+# Track.clipped is one bool for four different situations, and callers that acted on it
+# threw away boxes they could still have used. A real pick logged "half out of frame" on
+# two of its three approach checks, refused both, and drove the whole approach on an
+# initial estimate that was 5.2 cm out — the refusals WERE the correction it needed.
+
+from rax.models.detection.tracking import clipped_edges, table_ray_is_usable  # noqa: E402
+
+SHAPE = (480, 640)      # H, W — the OAK-D frame the server runs on
+
+
+def test_a_box_inside_the_frame_touches_no_edge():
+    assert clipped_edges((100, 100, 200, 200), SHAPE) == ()
+
+
+def test_each_edge_is_named_on_its_own():
+    assert clipped_edges((0, 100, 200, 200), SHAPE) == ("left",)
+    assert clipped_edges((100, 0, 200, 200), SHAPE) == ("top",)
+    assert clipped_edges((100, 100, 639, 200), SHAPE) == ("right",)
+    assert clipped_edges((100, 100, 200, 479), SHAPE) == ("bottom",)
+
+
+def test_a_corner_names_both_edges_in_reading_order():
+    assert clipped_edges((0, 0, 200, 200), SHAPE) == ("left", "top")
+    assert clipped_edges((100, 100, 639, 479), SHAPE) == ("right", "bottom")
+
+
+def test_a_top_cut_box_can_still_be_ranged():
+    """THE case this exists for. Closing on an object, the gripper looms into the top of
+    the frame and cuts the box there. Apparent-size ranging is dead — the width is a
+    lie — but where the object meets the table is still visible, and that needs neither
+    its size nor its orientation."""
+    assert table_ray_is_usable(clipped_edges((100, 0, 200, 300), SHAPE))
+
+
+def test_a_bottom_cut_box_cannot():
+    """The contact point is below the picture; the ray would hit the table short."""
+    assert not table_ray_is_usable(clipped_edges((100, 100, 200, 479), SHAPE))
+
+
+def test_a_side_cut_box_cannot():
+    """The visible centroid is not the object's centre, so the bearing is biased inward
+    by up to half the hidden width — and the approach takes a refine's bearing in full."""
+    assert not table_ray_is_usable(clipped_edges((0, 100, 200, 300), SHAPE))
+    assert not table_ray_is_usable(clipped_edges((100, 100, 639, 300), SHAPE))
+
+
+def test_an_unclipped_box_is_usable():
+    assert table_ray_is_usable(())
+
+
+def test_the_margin_matches_what_track_itself_uses():
+    """clipped_edges must agree with the bool Track computes, or the server would take
+    the table-ray branch on a box the tracker never called clipped (or worse, not take
+    it on one it did). Track uses: x1 <= 1 or y1 <= 1 or x2 >= W-2 or y2 >= H-2.
+    """
+    H, W = SHAPE
+    for bbox in ((1, 100, 200, 200), (100, 1, 200, 200),
+                 (100, 100, W - 2, 200), (100, 100, 200, H - 2),
+                 (2, 2, W - 3, H - 3), (100, 100, 200, 200)):
+        x1, y1, x2, y2 = bbox
+        track_says = x1 <= 1 or y1 <= 1 or x2 >= W - 2 or y2 >= H - 2
+        assert bool(clipped_edges(bbox, SHAPE)) == track_says, bbox

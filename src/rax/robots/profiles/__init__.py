@@ -198,6 +198,16 @@ class ArmProfile:
     reach_min_m: float = 0.08
     reach_max_m: float = 0.55
 
+    #: How far the FINGERTIP can actually be driven, metres. Distinct from
+    #: ``reach_max_m``, which is a plausibility bound on a localization ("a cube at
+    #: 92 cm is a broken solve"). This one is a kinematic fact: past it there is no
+    #: IK solution, so a target beyond it can be seen and mapped but never picked.
+    #:
+    #: Derive it, do not guess it -- ``workspace.analyze_workspace(ik, profile)`` then
+    #: ``ws.max_reach(pitch_deg, z_m)``. It is strongly pitch-dependent, and the value
+    #: here is the best case (a flat wrist); a steep grasp reaches far less.
+    reach_grasp_max_m: float = 0.47
+
     gripper: GripperProfile = field(default_factory=GripperProfile)
     camera: CameraProfile = field(default_factory=CameraProfile)
     bus: BusProfile | None = None

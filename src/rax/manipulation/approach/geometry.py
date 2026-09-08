@@ -19,7 +19,37 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["shift_right", "approach_target", "stage_step", "push_out_radial",
-           "cap_reach"]
+           "cap_reach", "stage_trim"]
+
+
+def stage_trim(right_trim_m: float, *, stage: int, total: int,
+               final_frac: float = 0.3, final_m: float | None = None) -> float:
+    """How much lateral trim this stage should hold, decaying over the approach.
+
+    The trim keeps the object to one side of the frame so it does not vanish under the
+    gripper mid-transit. That is worth the most on the first hop -- far out, moving
+    fast, the object small in frame -- and less on the last one, where every extra
+    centimetre is pixel error the centring servo then has to undo.
+
+    ``final_m`` is where the decay LANDS, in metres, and it is what you want: the
+    lateral offset the grasp itself needs (approach.derive.grasp_bias_m). Decaying to a
+    FRACTION instead -- which is what ``final_frac`` does, and all this used to do --
+    walks the gripper onto the object's centre line and leaves the centring servo to
+    shove it back out sideways at the hover, with the jaws already beside the object.
+    Observed on the rig as "it goes from middle, then goes to right, which makes it
+    push the object away". Landing the decay on the grasp offset means the approach and
+    the servo agree, and the gripper never crosses the object at all.
+
+    Linear from the full trim at stage 0 to the floor at the last stage. With one
+    stage there is no later hop to decay toward, so that stage is the grasp: it takes
+    ``final_m`` when given, and the full trim otherwise.
+    """
+    start = float(right_trim_m)
+    end = float(final_m) if final_m is not None else start * float(final_frac)
+    if total <= 1:
+        return end if final_m is not None else start
+    f = min(max(float(stage) / float(total - 1), 0.0), 1.0)
+    return start + (end - start) * f
 
 
 def shift_right(xy, distance_m: float) -> np.ndarray:
