@@ -1,0 +1,7 @@
+{
+  "_comment": "Where the gripper is in the wrist camera's view. The camera is bolted to the wrist, so these do not move: measured across a whole session the grasp point varied by +-1.8px horizontally. Detecting it live instead was the source of most of the erratic behaviour - the white finger tape reads as a blue cap (H~105 S~90), so the detector would sometimes lock onto the robot's own gripper.",
+  "grasp_point": [332, 407],
+  "finger_left": [274, 405],
+  "finger_right": [393, 403],
+  "exclude_radius": 70
+}
