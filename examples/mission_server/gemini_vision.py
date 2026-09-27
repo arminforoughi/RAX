@@ -312,6 +312,55 @@ unobstructed and sharp enough to detect — if you pick that, the detector is at
 If part of the {label} touches an edge of the frame, say which edge it is cut off by. \
 Give a one-sentence reason describing where in the frame the object actually is."""
 
+#: Asked ONCE, in the instant before the jaws close. Not in a servo loop -- a call takes
+#: 2-3 s and a servo runs at frame rate -- but this is not a loop, it is a decision, and
+#: it is the decision every failure on this rig has turned on: the classical pipeline
+#: says "aligned" and the jaws still shut on air. A model looking at the same frame can
+#: say which way the gripper is wrong, in the gripper's own terms.
+# THE MARKER IS THE WHOLE POINT OF THIS PROMPT. Without it the model judged the object
+# against the CENTRE OF THE IMAGE -- it said so itself, "the green object is located to
+# the right of the center line" -- but this camera is mounted off to one side and the
+# jaws close at a pixel about 120 px right of centre. So its advice was right for a
+# reference point the controller does not use, and acting on it moved a good alignment
+# 1.2 cm off and closed the jaws on air. Twice. Telling it where the fingers actually
+# close, and drawing that spot on the frame, is what makes the answer usable.
+_AIM_PROMPT = """You are looking through a camera mounted on a robot gripper, pointing
+down at a table. The robot is about to close its fingers on the {label}.
+
+A magenta CROSS-HAIR is drawn on the image at the exact spot where the two fingers will
+close. That cross-hair, NOT the centre of the image, is where the {label} has to be.
+
+Answer with ONE label describing what the GRIPPER should do:
+- "between": the {label} already covers the cross-hair -- close now.
+- "left": the gripper must move LEFT, i.e. the {label} is LEFT of the cross-hair.
+- "right": the gripper must move RIGHT, i.e. the {label} is RIGHT of the cross-hair.
+- "forward": the gripper must move FORWARD, away from the camera -- the {label} is
+  ABOVE the cross-hair in the picture.
+- "back": the gripper has gone PAST the {label} -- it is BELOW the cross-hair.
+- "unsure": the cross-hair or the {label} are not clearly visible.
+
+Judge it in the image, against the cross-hair: left and right mean left and right AS
+SEEN HERE. Say in your reason where the {label} is relative to the cross-hair.
+Reply as JSON: {{"label": "...", "confidence": 0.0-1.0, "reason": "..."}}"""
+
+_PLACE_PROMPT = """You are looking through a camera mounted on a robot gripper, pointing
+down at a table. The gripper is HOLDING a {carried} and hovering above a {dest}, about
+to lower the {carried} and set it down ON TOP of the {dest}.
+
+Answer with ONE label describing what the GRIPPER should do before it opens:
+- "between": the {carried} is already directly above the {dest} -- release now.
+- "left": the gripper must move LEFT, i.e. the {dest} is LEFT of the cross-hair.
+- "right": the gripper must move RIGHT, i.e. the {dest} is RIGHT of the cross-hair.
+- "forward": the gripper must move FORWARD, away from the camera -- the {dest} is
+  ABOVE the cross-hair in the picture.
+- "back": the gripper has gone PAST the {dest} -- it is BELOW the cross-hair.
+- "unsure": the {dest} or the cross-hair are not clearly visible.
+
+A magenta CROSS-HAIR marks where the gripper is holding the {carried}, which is the spot
+the {dest} has to be under. Judge against the CROSS-HAIR, not the centre of the image:
+left and right mean left and right AS SEEN HERE.
+Reply as JSON: {{"label": "...", "confidence": 0.0-1.0, "reason": "..."}}"""
+
 _GRASP_PROMPT = """You are looking at a frame from a camera on a robot gripper, taken \
 just after it closed its jaws and lifted, trying to hold a {label}.
 
@@ -505,6 +554,27 @@ class GeminiVision:
         """Is the object actually in the jaws right now?"""
         return self._ask(_GRASP_PROMPT.format(label=label), [self._jpeg(rgb)],
                          {"holding", "empty", "unsure"})
+
+    def aim_advice(self, rgb, label: str) -> Verdict:
+        """About to close the jaws -- is the object between them, and if not, which way?
+
+        The one question worth a network call on the critical path. Everything else the
+        model is asked here is commentary after the fact; this one can still change the
+        outcome, and it is asked at the single moment when a 2-3 s answer is affordable
+        because the arm is stopped anyway.
+        """
+        return self._ask(_AIM_PROMPT.format(label=label), [self._jpeg(rgb)],
+                         {"between", "left", "right", "forward", "back", "unsure"})
+
+    def place_advice(self, rgb, carried: str, dest: str) -> Verdict:
+        """About to open the jaws over a destination -- is the load above it?
+
+        The mirror of ``aim_advice`` at the other decision this rig gets wrong by a
+        centimetre. Same label set on purpose, so one nudge routine serves both.
+        """
+        return self._ask(_PLACE_PROMPT.format(carried=carried, dest=dest),
+                         [self._jpeg(rgb)],
+                         {"between", "left", "right", "forward", "back", "unsure"})
 
     def same_object(self, crop_a, crop_b, label: str) -> Verdict:
         """Are these two crops the same physical object?"""

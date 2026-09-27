@@ -72,7 +72,10 @@ def test_so101_named_poses_and_gripper():
     # the idle pose "look higher", but that was judged against a wrist frame still 45 deg
     # out of calibration; once the frame was corrected, 13.2 pointed the camera at the
     # room and left the idle 2D map empty. 33.2 (pitch 24.9) is the table-viewing pose.
-    assert p.home_deg == (-14.1, -99.1, 90.8, 33.2, -4.7)
+    # Trailing roll -4.7 -> 104.6 on 2026-09-09: a POSE change, measured off the joint
+    # with torque cut on id 5 alone, not a recalibration. The survey keeps its own -4.7
+    # (asserted below), which is the point of the two being separate constants.
+    assert p.home_deg == (-14.1, -99.1, 90.8, 33.2, 104.6)
     assert p.view_deg == (5.0, 37.1, 48.1, -40.4, 90.0)
     # SURVEY_TILT is pinned to its own constant rather than derived from HOME[1:],
     # because deriving one from the other couples a cosmetic idle-pose preference to the

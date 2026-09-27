@@ -43,10 +43,22 @@ JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wri
 # tuned pose below is valid again -- it is an angle in that convention, not a raw
 # encoder reading, so it survived the motor swap.
 #
-# CAVEAT: wrist_roll (id 5) was recentered the same arbitrary way on 2026-08-12 and
-# has NOT yet been re-fitted to a physical reference, so the -4.7 here is the one
-# component still open. See [[rax-known-defects]].
-HOME_DEG = (-14.1, -99.1, 90.8, 33.2, -4.7)
+# wrist_roll: -4.7 -> +104.6 (2026-09-09). This is a POSE change, not a calibration
+# one -- id 5's zero is still the arbitrary one written on 2026-08-12, and the
+# calibration JSON was deliberately not touched. What changed is where the hand RESTS:
+# the operator wanted the gripper twisted roughly a quarter turn from the old rest
+# orientation, so the angle was taken from the joint itself rather than guessed. Torque
+# was cut on id 5 alone (the other five kept holding), the wrist was set by hand, and
+# the joint reported +104.57 dead steady over a 4-minute window -- that reading IS the
+# number below. Do not "tidy" it to 105 or to 90: it is a measurement of where the
+# hand physically sits, and the sign question (+90 vs -90 look identical on a 2-jaw
+# gripper but flip the wrist camera) is settled by it having been measured, not chosen.
+#
+# SURVEY_TILT_DEG deliberately keeps its own -4.7 roll: the survey is what every range
+# estimate is computed from, and its camera orientation is the one the 0.4 cm
+# repeatability and the hand-eye TF were measured against. Rolling HOME does not roll
+# the survey. See [[rax-known-defects]].
+HOME_DEG = (-14.1, -99.1, 90.8, 33.2, 104.6)
 
 # The tilt the SURVEY localizes from -- deliberately NOT HOME_DEG[1:] any more.
 # It used to be derived from HOME, which coupled a cosmetic "how does the idle pose

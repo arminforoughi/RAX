@@ -478,7 +478,17 @@ def test_pose_ik_branch_runs():
     ik = make_ik(kin, generic)
     assert isinstance(ik, PoseIK)
 
-    seed = np.array(p.home_deg, dtype=np.float64)
+    # HOME's own roll is NOT usable as a seed here, and that is a property of this
+    # generic branch rather than of HOME. PoseIK solves the roll iteratively, and it
+    # cannot unwind much more than 90 deg of seed-to-target roll inside its iteration
+    # budget: measured against roll_deg=0.0, a seed roll of -4.7/0/45 lands 0.01-0.08 mm
+    # while 90/104.6/180 lands 13.7-14.2 mm. HOME's roll went to 104.6 on 2026-09-09
+    # (and VIEW_DEG's has been 90.0 for far longer), so seeding from a named pose was
+    # only ever passing by luck. Seed roll-neutral: what this test exists to cover is
+    # that the branch runs and respects limits, not how far it can unwind a wrist.
+    # The SHIPPING so101 IK is PitchHoldIK, which sets roll directly instead of solving
+    # for it -- verified bit-identical from a -4.7 and a +104.6 seed.
+    seed = np.array([*p.home_deg[:4], 0.0], dtype=np.float64)
     for tgt in ([0.22, 0.05, 0.05], [0.28, -0.08, 0.04]):
         q, e = ik.solve(seed, np.array(tgt), pitch_deg=70.0, roll_deg=0.0)
         assert e < 0.005, f"PoseIK missed {tgt} by {e * 1000:.1f} mm"
