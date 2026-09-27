@@ -489,7 +489,17 @@ def start(ms, port: int = 8486) -> None:
     #: Grasp pitch. Steep, because a lying tube is approached from directly above: the
     #: jaws have to straddle a 16mm cylinder, and a shallow wrist puts one finger into
     #: the table before the other reaches the far side.
-    GRASP_PITCH = 78.0
+    #: The hand comes STRAIGHT DOWN onto the tube: the pitch chain sums to 90 degrees,
+    #: so the gripper's approach axis is perpendicular to the table.
+    #:
+    #: It is set ONCE, before the approach, and held for the rest of the pick. Both
+    #: halves of that matter and each was got wrong separately. Holding a pitch the arm
+    #: merely happened to be at (25 degrees, from the look pose) reaches for a lying tube
+    #: at a slant. But CHANGING it during the approach is worse: the camera is bolted to
+    #: the wrist, so tilting it sweeps the whole picture upward while the jaw cells sit at
+    #: the bottom, and the cap climbs away from the jaws on every step -- measured, dy
+    #: going +87 -> +285 over one descent while the horizontal error stayed inside 51px.
+    GRASP_PITCH = 90.0
 
     def _cap_now(want_uv=None, colour=None, tries=6):
         """The freshest cap OF THIS COLOUR, nearest ``want_uv``. Waits for the frame loop.
@@ -719,6 +729,51 @@ def start(ms, port: int = 8486) -> None:
 
         AIM = ms.jaw_frame().centre_uv
 
+        # ---- PITCH: straight down, set once, before anything approaches -----------
+        tphase("PITCH", f"tipping the hand to {GRASP_PITCH:.0f}deg, straight down")
+        q_p = ms.observe(False)[0].astype(float)
+        pitch_before = float(sum(q_p[i] for i in ms.ARM.pitch_chain))
+        tip_p = ms._tip(q_p)
+        q_pitched, e_p = ms._ik_hold_pitch(q_p, np.asarray(tip_p, float),
+                                           GRASP_PITCH, j5, ret_err=True)
+        if e_p <= 0.03:
+            ms.goto_smooth(ms._clamp_joints(np.asarray(q_pitched, float)),
+                           settle=0.30, step=2.2)
+            pitch_hold = GRASP_PITCH
+            tsay(f"        wrist {pitch_before:+.0f} -> {pitch_hold:+.0f}deg, in place")
+        else:
+            pitch_hold = pitch_before
+            tsay(f"        cannot hold {GRASP_PITCH:.0f}deg here (residual "
+                 f"{e_p*100:.1f}cm) — keeping {pitch_hold:+.0f}deg")
+
+        # DID THE CAP SURVIVE THE TILT? Tipping the hand down swings the camera, so the
+        # tube can leave the frame. Back the pitch off until it is visible rather than
+        # approaching blind: an approach that cannot see the cap cannot place it.
+        c_after = _cap_now(last_uv[0], colour)
+        if c_after is None:
+            for back in (20.0, 40.0):
+                trial = GRASP_PITCH - back
+                tsay(f"        cap lost at {pitch_hold:+.0f}deg — trying {trial:+.0f}deg")
+                q_t, e_t = ms._ik_hold_pitch(ms.observe(False)[0].astype(float),
+                                             np.asarray(ms._tip(ms.observe(False)[0]),
+                                                        float),
+                                             trial, j5, ret_err=True)
+                if e_t <= 0.03:
+                    ms.goto_smooth(ms._clamp_joints(np.asarray(q_t, float)),
+                                   settle=0.30, step=2.2)
+                    pitch_hold = trial
+                c_after = _cap_now(last_uv[0], colour)
+                if c_after is not None:
+                    break
+        if c_after is None:
+            raise RuntimeError("the cap is not visible at any workable wrist pitch")
+        last_uv[0] = (c_after["x"], c_after["y"])
+        cap = c_after
+        xy_p = _table_xy((c_after["x"], c_after["y"]))
+        if xy_p is not None:
+            xy = xy_p
+            tsay(f"        re-fixed looking down: ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm")
+
         # ---- THE GRASP POSE, solved ONCE, in joint space --------------------------
         #
         # NO CARTESIAN IK INSIDE THE LOOP, and that is the whole point of this rewrite.
@@ -750,9 +805,7 @@ def start(ms, port: int = 8486) -> None:
         # Solving with an unweighted orientation was no better: it let the IK choose
         # whatever wrist angle was convenient for each target, so the pitch still moved,
         # just unpredictably. `_ik_hold_pitch` pins it.
-        pitch_hold = float(sum(q_start[i] for i in ms.ARM.pitch_chain))
-        tsay(f"        holding the wrist at {pitch_hold:+.1f}deg "
-             f"(as found — parallel to the table, not tipped over for the grasp)")
+        tsay(f"        holding the wrist at {pitch_hold:+.1f}deg for the whole pick")
 
         q_grasp, err = ms._ik_hold_pitch(q_start, np.array([xy[0], xy[1], GRASP_Z]),
                                          pitch_hold, j5, ret_err=True)
