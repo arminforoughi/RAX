@@ -72,6 +72,10 @@ class X250FollowerConfig:
     max_relative_target: float | str | None = 8.0
     home_on_connect: bool = False
     baudrate: int = 1_000_000
+    #: Energise the joints on connect. pick.py never enables torque itself -- it assumes
+    #: the driver holds the arm and only releases on disconnect -- so this defaults on.
+    #: A read-only probe passes False and the arm stays limp.
+    torque_on_connect: bool = True
 
 
 class _Camera:
@@ -226,6 +230,11 @@ class X250Follower:
         logger.info("X250 connected on %s: %d joints, %d camera(s), calibration %s",
                     self.config.port, len(self.motors), len(self.cameras),
                     "loaded" if self.is_calibrated else "MISSING (reads only)")
+        if self.config.torque_on_connect and self.is_calibrated:
+            self.set_torque(True)
+            logger.info("torque ON — every joint pinned to where it already was")
+        elif self.config.torque_on_connect:
+            logger.warning("torque left OFF: no calibration, so nothing may be commanded")
         if self.config.home_on_connect:
             logger.warning("home_on_connect is ignored: homing needs a calibration and "
                            "a known-safe pose, neither of which this driver assumes")
@@ -241,6 +250,23 @@ class X250Follower:
         self._connected = False
 
     def set_torque(self, on: bool) -> None:
+        """Energise or release the joints.
+
+        TURNING TORQUE ON POINTS EVERY SERVO AT ITS GOAL POSITION REGISTER, and that
+        register still holds whatever was last written to it -- which, after a session
+        that ended with the arm somewhere else, is not where the arm is now. Enabling
+        torque then snaps the joint to that stale value at full speed. So every goal is
+        first set to the joint's OWN present position: the arm is told to stay exactly
+        where it already is, and energising becomes a no-op it can be watched doing.
+        """
+        if on:
+            present = self.bus.read_positions(self.motors.values())
+            for name, i in self.motors.items():
+                if i in present:
+                    try:
+                        self.bus.write(i, "goal_position", present[i])
+                    except Exception as e:
+                        logger.warning("could not pin '%s' before energising: %s", name, e)
         for i in self.motors.values():
             try:
                 self.bus.write(i, "torque_enable", 1 if on else 0)

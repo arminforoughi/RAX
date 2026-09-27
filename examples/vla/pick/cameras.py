@@ -136,3 +136,54 @@ def find_by_motion(port: str, max_index: int = 6, nudge: float = 6.0):
         return top, wrist, diffs
     finally:
         robot.disconnect()
+
+
+# --------------------------------------------------------------------------------
+# Choosing the cameras: look, then pass the numbers in.
+# --------------------------------------------------------------------------------
+# WHY THERE IS NO AUTOMATIC WRIST DETECTOR HERE. There was, twice, and both versions
+# were wrong in the dangerous direction -- they NAMED a camera confidently and named the
+# wrong one. The first scored brightness at the fingertip positions and ranked the
+# overhead bench view (0.93) above the wrist (0.24), because a pale bench is bright
+# everywhere. The second scored "lower-middle darker than the rest, with some white in
+# it" and passed a camera pointed at a tripod once its exposure drifted. The measured
+# reason the obvious test fails: the fingertip positions in gripper_geometry.json are
+# the tips themselves, which are DARK (21 and 24 of 255 in the wrist view) -- the white
+# tape is beside them, not on them.
+#
+# An index is not an identity on this rig anyway: these Sonix cameras all report the
+# same hardcoded serial SN0001, so Windows cannot tell two of them apart and they swap
+# indices and drop off. The reliable procedure is to look at a frame from each index and
+# pass the numbers explicitly, which is also what pick.py's README advises.
+
+def preview(indices=range(6), out_dir="."):
+    """Save one frame per index and report what each looks like. Moves nothing.
+
+    Run this, look at the files, and pass the index whose frame shows the mat with the
+    gripper in the bottom of the picture as --wrist-cam.
+    """
+    from pathlib import Path as _P
+
+    out = {}
+    for i in indices:
+        cap = open_index(int(i))
+        if cap is None:
+            logger.info("index %d: unavailable", i)
+            continue
+        frame = None
+        for _ in range(4):
+            ok, f = cap.read()
+            if ok and f is not None:
+                frame = f
+            time.sleep(0.05)
+        cap.release()
+        time.sleep(0.3)
+        if frame is None:
+            logger.info("index %d: opened but gave no frame", i)
+            continue
+        path = str(_P(out_dir) / f"camera_{i}.jpg")
+        cv2.imwrite(path, frame)
+        out[int(i)] = path
+        logger.info("index %d: %dx%d mean %.0f -> %s",
+                    i, frame.shape[1], frame.shape[0], frame.mean(), path)
+    return out
