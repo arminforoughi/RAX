@@ -5146,6 +5146,10 @@ GUEST_ENDPOINTS = {
     "guest_pick", "guest_scan", "guest_query", "guest_targets",
     "guest_home", "feedback", "stop",
     "urdf_route", "geom",          # read-only, needed by the shared 3D viewer
+    # The room camera looks at the same table the guest is already watching from the
+    # arm, so it gives them nothing they cannot see -- and the guest page only asks
+    # for it once camstatus says there is a camera behind /stream2 to ask for.
+    "stream2", "camstatus",
 }
 
 
@@ -5215,7 +5219,8 @@ def guest_status():
         grip = state.get("gripper")
     _a, left, _t = guest_state()
     return jsonify(phase=phase, detail=detail, running=running, gripper=grip,
-                   left=round(left), mine=guest_is_caller())
+                   left=round(left), mine=guest_is_caller(),
+                   room_cam=room_cam_available())
 
 
 @app.route("/guest/pick", methods=["POST"])
@@ -5743,6 +5748,44 @@ def stream():
                        + str(len(buf)).encode() + b"\r\n\r\n" + buf + b"\r\n")
             time.sleep(0.1)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=f")
+
+
+#: Last known state of the room camera, and when it was checked. The probe can take
+#: seconds when the camera is unplugged, so nothing reads it synchronously.
+_ROOMCAM = {"ok": False, "checked": 0.0, "busy": False}
+ROOMCAM_TTL_S = 25.0
+
+
+def room_cam_available(max_age_s=ROOMCAM_TTL_S):
+    """Is there a room camera serving frames? Cached, never blocks.
+
+    Returns the last answer immediately and refreshes it in the background when stale.
+    The first call after a restart therefore says False until the probe lands, which is
+    the right way round: a UI that hides an absent camera is better than one that shows
+    an empty black rectangle and lets the operator assume it is working.
+    """
+    now = time.time()
+    if now - _ROOMCAM["checked"] > max_age_s and not _ROOMCAM["busy"]:
+        _ROOMCAM["busy"] = True
+
+        def _probe():
+            try:
+                ok = _overhead_frame() is not None
+            except Exception:
+                ok = False
+            was = _ROOMCAM["ok"]
+            _ROOMCAM.update(ok=ok, checked=time.time(), busy=False)
+            if ok != was:
+                say(f"room camera {'is serving frames again' if ok else 'stopped serving frames'}")
+
+        threading.Thread(target=_probe, daemon=True).start()
+    return bool(_ROOMCAM["ok"])
+
+
+@app.route("/camstatus")
+def camstatus():
+    """Which cameras are live. Used by the UIs to decide what to render."""
+    return jsonify(room=room_cam_available())
 
 
 @app.route("/stream2")
