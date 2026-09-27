@@ -456,154 +456,180 @@ def start(ms, port: int = 8486) -> None:
                      f"({xy2[0]*100:+.1f},{xy2[1]*100:+.1f})cm, {moved*100:.1f}cm from "
                      f"the first fix — too far to be the same tube. Keeping the first.")
 
-        # ---- GRID, BEFORE ANYTHING ROLLS -----------------------------------------
-        # THE CAP GOES IN THE JAW CELLS FIRST. The previous order squared the wrist and
-        # then tried to align, and the roll is exactly what makes alignment impossible:
-        # the camera rides past the roll joint, so a 71 degree roll swings the whole view
-        # and the cap stops being where it was. Every grid check that run reported "cap
-        # not visible" and the arm descended blind on a stale fix -- which is to say it
-        # never put the cap in the grid at all, which was the whole job.
+        # ---- APPROACH: pick.py's logic, which is already in this branch ----------
         #
-        # So: align while the camera is still, square up, then confirm the alignment
-        # survived the roll, and only then descend.
-        def _grid_align(stage, tries=4):
-            """Drive the tip until the cap sits in the jaw cells. Returns the cap, or None.
+        # THE IMAGE CORRECTS THE BEARING AND NOTHING ELSE. This is the part I kept
+        # rewriting from first principles and kept getting wrong. pick.py drives the
+        # descent like this:
+        #
+        #     if abs(ex) > 30: base += sign * clip(abs(ex)/(14*scale), 0.4, 3.2/scale)
+        #
+        # A base nudge of between 0.4 and 3.2 degrees, shrinking as the arm gets lower,
+        # and the VERTICAL pixel error `ey` is computed and deliberately never used to
+        # move anything. Depth follows a fixed profile; vision only fixes which way the
+        # arm is pointing.
+        #
+        # That is why it does not overshoot and my metric version did. Rotating the base
+        # SWINGS the hand across the target; correcting the tip in x and y, which is what
+        # I was doing from a table-plane cast, REACHES the arm out. Told to close a few
+        # centimetres of image error, the first extends the arm forward into the bench,
+        # and it does it on the strength of a cast whose error grows exactly where the
+        # sightline is shallow.
+        #
+        # So: the radius is set once, by the fix taken over the tube, and afterwards only
+        # the base turns and only z comes down.
+        AIM = ms.jaw_frame().centre_uv
+        GRASP_RADIUS_PX = 70.0     # pick.py's, and the [grip] log agrees: <=67px picked
+        AT_DEPTH = 0.85            # ...and it must also be down, or it closes on air
 
-            The correction is METRIC and needs no gain: the cap's pixel and the grip
-            centre's pixel are both cast onto the table through the calibrated hand-eye
-            transform, and the vector between those two points is exactly how far the tip
-            has to move. Nothing here is tuned.
-            """
-            nonlocal xy
-            last = None
-            for k in range(tries):
-                ms.checkpoint()
-                jg = ms.jaw_frame()
-                c = _cap_now(last_uv[0], colour)
-                if c is None:
-                    tsay(f"        [grid/{stage}] the {colour} cap is not in view")
-                    return None
-                last_uv[0] = (c["x"], c["y"])
-                last = c
-                off = math.hypot(c["x"] - jg.centre_uv[0], c["y"] - jg.centre_uv[1])
-                if ms.GRID.in_grip((c["x"], c["y"]), jg):
-                    tsay(f"        [grid/{stage}] cap IS in the jaw cells "
-                         f"(cell {ms.GRID.cell_of((c['x'], c['y']))}), {off:.0f}px "
-                         f"from the grip centre")
-                    return c
-                p_cap = _table_xy((c["x"], c["y"]))
-                if p_cap is None:
-                    tsay(f"        [grid/{stage}] cannot cast the cap onto the table — "
-                         f"no correction")
-                    return c
-                # THE CORRECTION IS cap-on-table MINUS THE TIP, and the tip comes from
-                # forward kinematics.
-                #
-                # The first version took the difference between two CASTS -- the cap's
-                # pixel and the grip centre's pixel, both projected onto the table -- on
-                # the theory that a common hand-eye error would cancel. It does not
-                # cancel, because the two points are not at the same height: the cap is
-                # on the table and the jaws are 13cm above it, so the jaws' pixel
-                # projects far down its own sightline and lands way in front of where the
-                # hand actually is. The "correction" that comes out is a lunge, and the
-                # arm drove straight past a tube it only needed to creep forward onto.
-                #
-                # FK is the number this rig trusts; it is the camera's pose on the wrist
-                # that has always been the suspect one, and only the cap needs the camera.
-                tip = ms._tip(ms.observe(False)[0])
-                dx, dy = p_cap[0] - float(tip[0]), p_cap[1] - float(tip[1])
-                want = math.hypot(dx, dy)
-                # AND IT CREEPS. A correction bigger than this is not trusted in one
-                # move: the cap is re-measured after every step, so an honest 4cm error
-                # is closed in two passes rather than one lunge that overshoots.
-                if want > TUBE_MAX_STEP_M:
-                    k = TUBE_MAX_STEP_M / want
-                    dx, dy = dx * k, dy * k
-                tsay(f"        [grid/{stage}] cap in cell "
-                     f"{ms.GRID.cell_of((c['x'], c['y']))}, jaws hold "
-                     f"{sorted(ms.GRID.grip_cells(jg))} — {off:.0f}px off, tip needs "
-                     f"{want*100:.1f}cm, moving {math.hypot(dx, dy)*100:.1f}cm")
-                if want < 0.002:
-                    return c
-                if ms._move_tip(np.array([tip[0] + dx, tip[1] + dy, float(tip[2])]),
-                                GRASP_PITCH, j5, settle=0.20, step=1.2) is None:
-                    tsay(f"        [grid/{stage}] that correction is unreachable")
-                    return c
-                xy = (xy[0] + dx, xy[1] + dy)
-            return last
+        # THE SIGN OF THE BASE CORRECTION IS MEASURED, NOT ASSUMED. Which way the cap
+        # slides when the base turns depends on how the camera is mounted, and a wrong
+        # sign hides under detector noise while driving the arm steadily the wrong way.
+        # pick.py probes for it with +7/-10/+14 until the cap moves clear of noise.
+        tphase("PROBE", "measuring which way the base moves the cap")
+        sign_base, probe_px = 0.0, 0.0
+        q_probe = ms.observe(False)[0].astype(float)
+        u0 = cap["x"]
+        for nudge in (3.0, -5.0, 7.0):
+            ms.checkpoint()
+            q = q_probe.copy()
+            q[ms.ARM.pan_joint] = float(np.clip(q_probe[ms.ARM.pan_joint] + nudge,
+                                                ms.J_LO[ms.ARM.pan_joint],
+                                                ms.J_HI[ms.ARM.pan_joint]))
+            ms.goto_smooth(ms._clamp_joints(q), settle=0.25, step=2.0)
+            c = _cap_now(last_uv[0], colour)
+            if c is not None:
+                moved = c["x"] - u0
+                if abs(moved) >= 8.0:
+                    sign_base = 1.0 if (moved / nudge) > 0 else -1.0
+                    probe_px = abs(moved)
+                    tsay(f"        base {nudge:+.0f}deg moved the cap {moved:+.0f}px "
+                         f"-> correcting with sign {sign_base:+.0f}")
+                    break
+            tsay(f"        base {nudge:+.0f}deg moved the cap under the noise floor")
+        ms.goto_smooth(ms._clamp_joints(q_probe), settle=0.25, step=2.0)
+        cap = _cap_now(last_uv[0], colour) or cap
+        if sign_base == 0.0:
+            tsay("        could not measure the base direction — descending without "
+                 "a bearing correction")
 
-        tphase("GRID", "putting the cap in the jaw cells")
-        last_uv = [(cap["x"], cap["y"])]
-        cap = _grid_align("hover") or cap
-
-        # ---- SQUARE ---------------------------------------------------------------
-        # The jaws must close ACROSS the tube. The wrist camera rides past the roll joint
-        # on this arm, so rolling turns the picture with the hand: the tube's measured
-        # angle moves by roll_gain degrees per degree of roll, and the jaw line does not
-        # move at all. Measured +1.00 here.
+        # ---- SQUARE, a nudge only -------------------------------------------------
         tphase("SQUARE", "turning the jaws across the tube")
         if not TUBE_YAW_ALIGN:
             tsay("        tube yaw alignment is off — holding the wrist where it is")
         elif cap.get("angle") is None or not cap.get("confident"):
             tsay("        the tube's angle is not confidently measured — "
                  "holding the wrist rather than guessing")
+        elif (cap["elong"] or 0.0) < TUBE_ROLL_MIN_ELONGATION:
+            tsay(f"        elongation {cap['elong']:.1f} is under "
+                 f"{TUBE_ROLL_MIN_ELONGATION:.1f} — not worth rolling on")
         else:
             jg = ms.jaw_frame()
-            # Folded: a tube has no head or tail, so 1 and 179 degrees differ by 2, not
-            # 178. A controller handed the larger number rolls the wrong way through the
-            # wrist's whole travel.
             err = _fold(cap["angle"] - (jg.axis_deg + 90.0))
             gain = float(getattr(jg, "roll_gain", 1.0)) or 1.0
-            tsay(f"        axis {cap['angle']:+.0f}deg from an elongation of "
-                 f"{cap['elong']:.1f}; jaws at {jg.axis_deg:+.0f}deg")
-            if (cap["elong"] or 0.0) < TUBE_ROLL_MIN_ELONGATION:
-                tsay(f"        elongation {cap['elong']:.1f} is under "
-                     f"{TUBE_ROLL_MIN_ELONGATION:.1f} — the angle is not worth rolling "
-                     f"on, holding the wrist")
-                err = 0.0
+            tsay(f"        axis {cap['angle']:+.0f}deg (elongation {cap['elong']:.1f}), "
+                 f"jaws {jg.axis_deg:+.0f}deg -> {err:+.0f}deg out of square")
             if abs(err) < float(ms.CFG.yaw_deadband_deg):
-                tsay(f"        already square within {err:+.1f}deg — leaving the wrist")
+                tsay(f"        square within {err:+.1f}deg — leaving the wrist")
             else:
-                # CLAMPED, and a clamped correction is not a failure: the next pick sees
-                # the tube again and takes another bite. Rolling the whole way at once
-                # swings the camera off the target on one frame's evidence.
-                want = err / gain
-                step = float(np.clip(want, -TUBE_MAX_ROLL_DEG, TUBE_MAX_ROLL_DEG))
+                step = float(np.clip(err / gain, -TUBE_MAX_ROLL_DEG, TUBE_MAX_ROLL_DEG))
                 lo, hi = ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]
                 j5_new = float(np.clip(j5 + step, lo, hi))
-                if abs(step) < abs(want) - 0.5:
-                    tsay(f"        wants {want:+.0f}deg of roll, taking "
-                         f"{step:+.0f} (capped at {TUBE_MAX_ROLL_DEG:.0f})")
-                tsay(f"        rolling {j5:+.0f} to {j5_new:+.0f}deg")
+                tsay(f"        rolling {step:+.0f}deg ({j5:+.0f} -> {j5_new:+.0f})")
                 q = ms.observe(False)[0].astype(float)
                 q[ms.ARM.roll_joint] = j5_new
                 ms.goto_smooth(ms._clamp_joints(q), settle=0.30, step=2.0)
                 j5 = j5_new
-                # THE ROLL MOVES THE CAMERA, so the alignment just made may no longer
-                # hold. Re-align rather than assume; this is the step whose absence made
-                # every later grid check report "cap not visible".
-                again = _grid_align("after the roll", tries=3)
-                if again is None:
-                    tsay("        the roll took the tube out of view — rolling back")
-                    q = ms.observe(False)[0].astype(float)
-                    q[ms.ARM.roll_joint] = j5 - err / gain
-                    ms.goto_smooth(ms._clamp_joints(q), settle=0.30, step=2.0)
-                    j5 = float(ms.observe(False)[0][ms.ARM.roll_joint])
-                    _grid_align("after rolling back", tries=2)
-                else:
-                    cap = again
 
-        # ---- DESCEND, re-aligning at every stage ----------------------------------
-        for frac in (0.45, 0.8, 1.0):
+        # ---- DESCEND: look, nudge the base, drop one increment --------------------
+        tphase("APPROACH", "lining the cap up with the jaws while coming down")
+        # POLAR, NOT CARTESIAN, AND THIS IS NOT A STYLE CHOICE. The descent target has to
+        # be expressed as (radius, bearing, height) because vision owns the BEARING and
+        # kinematics owns the other two. Commanding a Cartesian point instead solves IK
+        # for every joint including the pan, which silently undoes the base correction
+        # made a moment earlier -- the two would fight each other every step, and the
+        # image error would never close no matter how right the nudge was.
+        #
+        # pick.py sidesteps this by commanding joints directly and never doing Cartesian
+        # IK during the descent. Same idea here: the radius is frozen at the fix taken
+        # over the tube, the height follows the profile, and the bearing is the one thing
+        # the camera is allowed to move.
+        z0 = float(ms._tip(ms.observe(False)[0])[2])
+        radius = math.hypot(xy[0], xy[1])
+        bearing = math.degrees(math.atan2(xy[1], xy[0]))
+        tsay(f"        radius {radius*100:.1f}cm frozen; bearing {bearing:+.1f}deg is "
+             f"what the camera corrects")
+        n_steps, misses, last_dist, reached = 12, 0, None, False
+        for step in range(n_steps):
             ms.checkpoint()
-            z = HOVER_Z + (GRASP_Z - HOVER_Z) * frac
-            _grid_align(f"{int(frac*100)}%", tries=2)
-            if ms._move_tip(np.array([xy[0], xy[1], z]), GRASP_PITCH, j5,
-                            settle=0.18, step=1.0) is None:
-                tsay(f"        z={z*100:.1f}cm unreachable — closing from here")
+            # LOOK FIRST, THEN MOVE. The other order descends an increment and only then
+            # checks, so a lost detection keeps reaching -- pick.py's comment records an
+            # arm that carried on down through five "not in view" steps and finished well
+            # forward of the tube with nothing in the jaws.
+            c = _cap_now(last_uv[0], colour)
+            a = ((step + 1) / n_steps)
+            if c is None:
+                misses += 1
+                # Losing it CLOSE is how an approach ends: the tube passes under the
+                # jaws. Losing it far away is a real failure and must not be driven
+                # through.
+                if last_dist is not None and last_dist < 170 and a >= 0.7:
+                    tsay(f"        the cap passed under the jaws at {last_dist:.0f}px, "
+                         f"{100*a:.0f}% down — completing the descent")
+                    reached = True
+                    break
+                tsay(f"        {step+1:2d}: cap not in view — holding, not descending "
+                     f"({misses}/4)")
+                if misses >= 4:
+                    tsay(f"        lost the {colour} cap while still "
+                         f"{'%.0fpx away' % last_dist if last_dist else 'far off'}")
+                    break
+                time.sleep(0.25)
+                continue
+            misses = 0
+            last_uv[0] = (c["x"], c["y"])
+            ex, ey = AIM[0] - c["x"], AIM[1] - c["y"]
+            dist = float(math.hypot(ex, ey))
+            last_dist = dist
+            tsay(f"        {step+1:2d}/{n_steps}: cap {ms.GRID.cell_of((c['x'], c['y']))} "
+                 f"-> jaws {ms.GRID.cell_of(AIM)}  dx {ex:+.0f} dy {ey:+.0f} "
+                 f"dist {dist:.0f}px")
+
+            # CLOSING NEEDS BOTH: lined up in the picture AND down at tube height. Image
+            # alignment fixes the bearing and says nothing about depth; pick.py logged a
+            # run that converged to 7px at 41% descent and closed on air above the tube.
+            if dist < GRASP_RADIUS_PX and a >= AT_DEPTH:
+                tsay(f"        between the jaws ({dist:.0f}px) and at depth "
+                     f"({100*a:.0f}%) — closing")
+                reached = True
                 break
-            tsay(f"        descend {int(frac*100):3d}%  z={z*100:4.1f}cm  "
-                 f"tip={np.round(ms._tip(ms.observe(False)[0])*100, 1).tolist()}cm")
+            if dist < GRASP_RADIUS_PX:
+                tsay(f"        lined up ({dist:.0f}px) but only {100*a:.0f}% down — "
+                     f"continuing")
+
+            # ONE OBSERVATION, ONE MOVE. The base and the descent are independent, so
+            # they go in a single command rather than two look-move round trips.
+            # pick.py's gain, unchanged: between 0.4 and 3.2 degrees of bearing, and
+            # shrinking as the arm gets lower, because the same pixel error means less
+            # distance the closer the camera is.
+            scale = 1.0 + 1.1 * a
+            if abs(ex) > 30 and sign_base != 0.0:
+                mag = float(np.clip(abs(ex) / (14.0 * scale), 0.4, 3.2 / scale))
+                bearing += math.copysign(mag, ex * sign_base)
+                tsay(f"        bearing {math.copysign(mag, ex*sign_base):+.1f}deg "
+                     f"-> {bearing:+.1f}deg")
+
+            z = z0 + (GRASP_Z - z0) * a
+            tgt = np.array([radius * math.cos(math.radians(bearing)),
+                            radius * math.sin(math.radians(bearing)), z])
+            if ms._move_tip(tgt, GRASP_PITCH, j5, settle=0.14, step=1.0) is None:
+                tsay(f"        z={z*100:.1f}cm at r={radius*100:.0f}cm unreachable — "
+                     f"closing from here")
+                break
+
+        if not reached and last_dist is not None and last_dist >= GRASP_RADIUS_PX:
+            tsay(f"        finished the descent {last_dist:.0f}px from the jaws — "
+                 f"closing anyway, and the episode records how far off it was")
 
         # ---- CLOSE ----------------------------------------------------------------
         tphase("GRASP", "closing across the tube")
