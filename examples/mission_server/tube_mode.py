@@ -39,6 +39,7 @@ import os
 import threading
 import time
 
+import cv2
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -69,35 +70,20 @@ def _hole_grid(x, y):
 
 
 #: A lab tube's nominal shape, from `rax.perception.object_priors`: 16 mm across,
-#: 100 mm long. The orientation test compares a measurement against these.
+#: 100 mm long.
 TUBE_D_M, TUBE_L_M = 0.016, 0.100
 
-#: How far a measured dimension may be from the nominal one and still count as a match.
-#: Generous, because this rig's height measurement is known to read low (see
-#: _dest_geometry in mission_server) -- the test is meant to reject measurements that
-#: match NEITHER pose, not to grade the ones that do.
-_FIT = 0.45
-
-
-def _orientation(w_m: float, d_m: float, h_m: float):
-    """True = upright, False = lying, None = the measurement says neither.
-
-    See the caller for why "neither" is a necessary third answer and not a cop-out.
-    """
-    if max(w_m, d_m, h_m) <= 0.0:
-        return None
-
-    def near(value, want):
-        return abs(value - want) <= _FIT * want
-
-    foot_long, foot_short = max(w_m, d_m), min(w_m, d_m)
-    # Upright: tall as the tube is long, on a small roughly-round footprint.
-    if near(h_m, TUBE_L_M) and near(foot_long, TUBE_D_M):
-        return True
-    # Lying: as long as the tube across the table, only a diameter high.
-    if near(foot_long, TUBE_L_M) and near(h_m, TUBE_D_M):
-        return False
-    return None
+# The shape-based orientation classifier that used to live here is gone with the map it
+# read from. It compared a mapped object's w/d/h against a standing tube and a lying one
+# and returned None when it matched neither -- which was the right shape of answer, and
+# the reason it existed was that the naive height test called a tube "upright" while the
+# camera plainly showed it lying.
+#
+# THE PRINCIPLE SURVIVES, in `tubes()`, on better evidence. Orientation now comes from
+# the tube's own silhouette rather than from three numbers fused over a base sweep, and
+# it still has three answers: an elongated body means LYING at a measured angle, and no
+# elongated body means UNKNOWN -- a tube standing in a rack and one pointing end-on at
+# the camera look the same from here, and nothing available can separate them.
 
 
 def start(ms, port: int = 8486) -> None:
@@ -106,7 +92,7 @@ def start(ms, port: int = 8486) -> None:
     from rax.manipulation.episodes import EpisodeLog
     from rax.manipulation.grip import CurrentRise, reconcile
     from rax.perception.tube_caps import draw as draw_caps
-    from rax.perception.tube_caps import find_caps
+    from rax.perception.tube_caps import find_caps, tube_axis
     from rax.robots.urdf_visuals import link_visuals
 
     app = Flask("tube_mode", static_folder=None)
@@ -124,11 +110,30 @@ def start(ms, port: int = 8486) -> None:
     # never imports this module -- the dependency points one way.
     def cap_overlay(img):
         caps = find_caps(img, exclude=[ms.HAND_UV], exclude_r=70)
-        ms.LAST_CAPS[0] = [{"colour": c.colour, "x": c.x, "y": c.y, "area": c.area,
-                            "bbox": list(c.bbox)} for c in caps]
+        found = []
+        for c in caps:
+            ax = tube_axis(img, (c.x, c.y))
+            found.append({"colour": c.colour, "x": c.x, "y": c.y, "area": c.area,
+                          "bbox": list(c.bbox),
+                          "angle": None if ax is None else ax.angle_deg,
+                          "elong": None if ax is None else ax.elongation,
+                          "axis_len": None if ax is None else ax.length,
+                          "confident": bool(ax is not None and ax.is_confident)})
+        ms.LAST_CAPS[0] = found
         ms.LAST_CAPS[1] = time.time()
         if caps:
             img[:, :] = draw_caps(img, caps)
+            for f in found:
+                if f["angle"] is None:
+                    continue
+                a = math.radians(f["angle"])
+                half = f["axis_len"] / 2.0
+                col = (60, 220, 90) if f["colour"] == "green" else (235, 170, 60)
+                p0 = (int(f["x"] - half * math.cos(a)), int(f["y"] - half * math.sin(a)))
+                p1 = (int(f["x"] + half * math.cos(a)), int(f["y"] + half * math.sin(a)))
+                cv2.line(img, p0, p1, col, 2)
+                cv2.putText(img, f"{f['angle']:+.0f}d", (int(f["x"]) + 10, int(f["y"]) + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
 
     def tsay(msg):
         ms.say(msg)
@@ -175,67 +180,70 @@ def start(ms, port: int = 8486) -> None:
 
     # ---- the map ---------------------------------------------------------------
     def tubes():
-        out = []
-        for o in ms.world2d_snapshot():
-            label = str(o.get("label", ""))
-            if not any(w in label.lower() for w in TUBE_WORDS):
-                continue
-            # WHICH WAY IS IT LYING? THREE ANSWERS, AND ONE OF THEM IS "DON'T KNOW".
-            #
-            # The obvious test is the measured height: a 100 mm tube standing reads
-            # ~100 mm tall, one on its side reads ~16 mm, its diameter. That test was
-            # tried here and it QUIETLY LIED. The first tube this rig mapped measured
-            # w/d/h = 9/13/41 mm, which the height test called "standing" -- while the
-            # wrist camera plainly showed it lying on the turntable.
-            #
-            # The reason is that 9/13/41 is not the measurement of a tube in ANY pose.
-            # Standing, a tube is about 16x16x100; lying, about 100x16x16. This is
-            # neither, so the silhouette solve had measured a fragment -- most likely
-            # just the cap. Feeding a number that shape into a two-way test does not
-            # produce a wrong answer honestly labelled, it produces a confident one.
-            #
-            # So the test is run against BOTH hypotheses and has to positively match one:
-            # standing means the height is near the tube's length; lying means the
-            # footprint's long side is. Matching neither returns None -- orientation
-            # unknown -- and the viewer then draws a dashed footprint ring instead of a
-            # tube pointing somewhere. That is the same discipline the object map applies
-            # with `yaw_known`, which it sets only when the solve really produced an
-            # angle: "drawing that as a definite orientation is a lie".
-            w_m, d_m, h_m = (float(o.get("w_m", 0.0)), float(o.get("d_m", 0.0)),
-                             float(o.get("h_m", 0.0)))
-            standing = _orientation(w_m, d_m, h_m)
-            out.append({"id": o.get("tag"), "colour": _colour_of(label),
-                        "x": round(float(o["x"]), 4), "y": round(float(o["y"]), 4),
-                        "z": 0.0, "held": False, "rack": None, "hole": None,
-                        "source": "seen" if o.get("age", 99) < 8 else "mapped",
-                        # WHICH DIMENSIONS TO DRAW. When the orientation classified, the
-                        # measurement matched a tube and can be drawn as measured. When it
-                        # did not, the measurement is a fragment (the 9/13/41 mm case is a
-                        # cap, not a tube) and drawing it would render a stub that is
-                        # neither the object nor honestly vague -- so fall back to the
-                        # nominal tube and let the dashed footprint carry the uncertainty.
-                        "d": round(min(w_m, d_m, h_m), 4) if standing is not None
-                             else TUBE_D_M,
-                        "l": round(max(w_m, d_m, h_m), 4) if standing is not None
-                             else TUBE_L_M,
-                        # None -> the viewer draws an uncertainty footprint, not a pose
-                        "standing": standing,
-                        "yaw": float(o.get("yaw", 0.0)),
-                        # An orientation we could not classify is not a known yaw either,
-                        # however confident the map's own silhouette solve was about the
-                        # angle of whatever fragment it measured.
-                        "yaw_known": bool(o.get("yaw_known", False)) and standing is not None,
-                        "measured": bool(o.get("measured", False)),
-                        "w": w_m, "h_m": h_m, "age": o.get("age"),
-                        "label": label})
+        """Every tube in the CURRENT VIEW, mapped onto the table plane.
+
+        NO YOLO, AND NO SWEEP. The detector's part in this is over: caps are found by
+        colour (measured on this camera), the body's axis by contrast, and the position
+        by casting the cap's pixel onto the table plane through the calibrated hand-eye
+        transform -- which reprojects the fingertip to 0 px on this rig, so the cast is
+        as good as the plane height.
+
+        That replaces a 29-class vocabulary, a prompt, and a base sweep with one frame.
+        It is also the only version that has worked here: pointed at tubes, the broad
+        scan mapped ten objects and no tubes (three "toothbrush", three "pen"), and the
+        targeted scan found one of the two tubes on the bench. The cap detector finds
+        both, every frame.
+
+        WHAT IS STILL HONEST ABOUT IT. Only what the camera can see right now is
+        listed -- there is no memory and nothing is carried over, so a tube that leaves
+        the view leaves the map rather than lingering as a stale fix. And `yaw_known`
+        follows the axis measurement's own confidence: a tube seen end-on is barely
+        elongated and its angle means little, so it is reported as unknown rather than
+        as whatever the fit returned.
+        """
+        caps, t = ms.LAST_CAPS[0], ms.LAST_CAPS[1]
+        if not caps or time.time() - t > 2.5:
+            return []
+        try:
+            q = ms.observe(False)[0]
+            T = ms.T_cam_of(q)
+        except Exception:
+            return []
         with ms.lock:
             held_label = ms.carry["label"] if ms.carry["held"] else None
-        if held_label:
-            for t in out:
-                if t["label"] == held_label:
-                    # Upright in the jaws: the gripper closes across the tube and lifts
-                    # it, so for once the orientation is known without measuring.
-                    t.update(held=True, standing=True, yaw_known=True)
+
+        out = []
+        for i, c in enumerate(caps, start=1):
+            try:
+                p = ms.ray_to_table((c["x"], c["y"]), T)
+            except Exception:
+                continue
+            if p is None:
+                continue
+            x, y = float(p[0]), float(p[1])
+            r = math.hypot(x, y)
+            # A cast that lands outside the arm's own workspace is a broken solve, not a
+            # distant tube -- the same plausibility bound the rest of the stack uses.
+            if not (ms.ARM.reach_min_m <= r <= ms.ARM.reach_max_m):
+                continue
+            held = held_label is not None and c["colour"] in str(held_label)
+            out.append({"id": i, "colour": c["colour"],
+                        "x": round(x, 4), "y": round(y, 4), "z": 0.0,
+                        "held": bool(held), "rack": None, "hole": None,
+                        "source": "seen",
+                        "d": TUBE_D_M, "l": TUBE_L_M,
+                        # THREE ANSWERS, from the tube's own silhouette. A confident
+                        # elongated body is a tube LYING at a measured angle. No
+                        # elongated body is UNKNOWN, not "standing": a tube upright in a
+                        # rack and one pointing end-on at the camera present the same
+                        # circle, and nothing here can tell them apart. Reporting either
+                        # as a fact is the lie the object map is careful not to tell
+                        # with its own `yaw_known`.
+                        "standing": False if c["confident"] else None,
+                        "yaw": float(c["angle"] or 0.0),
+                        "yaw_known": bool(c["confident"]),
+                        "uv": [round(c["x"], 1), round(c["y"], 1)],
+                        "label": f"{c['colour']} tube"})
         return out
 
     def _colour_of(label):
@@ -250,16 +258,187 @@ def start(ms, port: int = 8486) -> None:
                  "colour": "#8a93a0",
                  "holes": [[round(h[0], 4), round(h[1], 4)] for h in holes]}]
 
+
+    # ---- the pick: look, go over, square up, put the cap in the grid --------------
+    #: Fingertip height while travelling over the table, metres.
+    HOVER_Z = 0.13
+    #: Fingertip height at the grasp. A tube lying down puts its centre one radius up,
+    #: and the jaws close AROUND it, so the tip wants to arrive level with that centre
+    #: rather than on the table. 8mm is the tube's own radius.
+    GRASP_Z = 0.010
+    #: Grasp pitch. Steep, because a lying tube is approached from directly above: the
+    #: jaws have to straddle a 16mm cylinder, and a shallow wrist puts one finger into
+    #: the table before the other reaches the far side.
+    GRASP_PITCH = 78.0
+
+    def _cap_now(want_uv=None, tries=6):
+        """The freshest cap, nearest ``want_uv`` when given. Waits for the frame loop.
+
+        The caps are measured by the overlay hook at frame rate, so this does not run a
+        second detection pass -- it waits for one it has not already seen.
+        """
+        for _ in range(tries):
+            caps, t = ms.LAST_CAPS[0], ms.LAST_CAPS[1]
+            if caps and time.time() - t < 1.2:
+                if want_uv is None:
+                    return max(caps, key=lambda c: c["area"])
+                return min(caps, key=lambda c: (c["x"] - want_uv[0]) ** 2
+                           + (c["y"] - want_uv[1]) ** 2)
+            time.sleep(0.15)
+        return None
+
+    def _table_xy(uv):
+        """Cast a pixel onto the table plane -> base-frame (x, y), or None."""
+        try:
+            pt = ms.ray_to_table((float(uv[0]), float(uv[1])),
+                                 ms.T_cam_of(ms.observe(False)[0]))
+        except Exception:
+            return None
+        return None if pt is None else (float(pt[0]), float(pt[1]))
+
+    def cap_pick(colour, uv_hint):
+        """Pick a tube by its cap. Four stages, and no detector network anywhere.
+
+        LOOK -> OVER -> SQUARE -> GRID, which is the sequence the operator asked for and
+        also the one pick.py uses on the X250. What it replaces is a base sweep that
+        searched for a YOLO label: on this bench that mapped ten objects and no tubes
+        with the broad vocabulary, found one of two with a targeted query, and spent a
+        minute of arm motion doing it. The cap detector sees both tubes in the frame the
+        arm is already looking at.
+
+        EVERY CORRECTION IS METRIC, VIA THE TABLE PLANE, and that is what makes the grid
+        stage exact rather than a tuned gain. The cap's pixel and the grip centre's pixel
+        are both cast onto the table through the calibrated hand-eye transform, and the
+        difference between those two points IS the distance the tip must move. No pixels
+        per centimetre to measure, no gain to drift: the same transform that reprojects
+        this rig's fingertip to 0px does the whole job.
+        """
+        q0 = ms.observe(False)[0].astype(float)
+        j5 = float(q0[ms.ARM.roll_joint])
+
+        # ---- LOOK -----------------------------------------------------------------
+        tphase("LOOK", f"finding the {colour} cap")
+        cap = _cap_now(uv_hint)
+        if cap is None or cap["colour"] != colour:
+            cap = next((c for c in (ms.LAST_CAPS[0] or []) if c["colour"] == colour), None)
+        if cap is None:
+            raise RuntimeError(f"no {colour} cap in view")
+        xy = _table_xy((cap["x"], cap["y"]))
+        if xy is None:
+            raise RuntimeError("could not cast the cap onto the table plane")
+        tsay(f"        cap at ({cap['x']:.0f},{cap['y']:.0f})px -> "
+             f"({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm, r={math.hypot(*xy)*100:.1f}cm")
+
+        # ---- OVER -----------------------------------------------------------------
+        tphase("OVER", f"moving over the tube at r={math.hypot(*xy)*100:.0f}cm")
+        if ms._move_tip(np.array([xy[0], xy[1], HOVER_Z]), GRASP_PITCH, j5,
+                        settle=0.20, step=1.6) is None:
+            raise RuntimeError(f"cannot reach over ({xy[0]*100:+.0f},{xy[1]*100:+.0f})cm")
+
+        # Re-measure from directly above. The first fix was taken from a shallow angle
+        # where the sightline grazes the table and range error is amplified; this one
+        # looks straight down at it.
+        cap = _cap_now((cap["x"], cap["y"])) or cap
+        xy2 = _table_xy((cap["x"], cap["y"]))
+        if xy2 is not None:
+            moved = math.hypot(xy2[0] - xy[0], xy2[1] - xy[1])
+            tsay(f"        from above: ({xy2[0]*100:+.1f},{xy2[1]*100:+.1f})cm "
+                 f"({moved*100:.1f}cm from the first fix)")
+            xy = xy2
+
+        # ---- SQUARE ---------------------------------------------------------------
+        # The jaws must close ACROSS the tube. The wrist camera rides past the roll
+        # joint on this arm, so rolling turns the picture with the hand: the tube's
+        # measured angle moves by roll_gain degrees per degree of roll, and the jaw line
+        # does not move at all. Measured +1.00 here.
+        tphase("SQUARE", "turning the jaws across the tube")
+        if float(ms.CFG.yaw_align) < 0.5:
+            tsay("        yaw_align is off (measured 0/6 against 6/6 on cubes) — "
+                 "holding the wrist where it is")
+        elif cap.get("angle") is None or not cap.get("confident"):
+            tsay("        the tube's angle is not confidently measured — "
+                 "holding the wrist rather than guessing")
+        else:
+            jg = ms.jaw_frame()
+            # Folded: a tube has no head or tail, so 1 and 179 degrees differ by 2,
+            # not 178. A controller handed the larger number rolls the wrong way
+            # through the wrist's whole travel.
+            err = _fold(cap["angle"] - (jg.axis_deg + 90.0))
+            gain = float(getattr(jg, "roll_gain", 1.0)) or 1.0
+            if abs(err) < float(ms.CFG.yaw_deadband_deg):
+                tsay(f"        already square within {err:+.1f}deg — leaving the wrist")
+            else:
+                lo, hi = ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]
+                j5_new = float(np.clip(j5 + err / gain, lo, hi))
+                tsay(f"        tube at {cap['angle']:+.0f}deg, jaws at {jg.axis_deg:+.0f}deg "
+                     f"-> rolling {j5:+.0f} to {j5_new:+.0f}deg")
+                q = ms.observe(False)[0].astype(float)
+                q[ms.ARM.roll_joint] = j5_new
+                ms.goto_smooth(ms._clamp_joints(q), settle=0.25, step=2.0)
+                j5 = j5_new
+
+        # ---- GRID -----------------------------------------------------------------
+        # Descend in stages, and before each one put the cap in the jaw cells.
+        for frac in (0.45, 0.8, 1.0):
+            ms.checkpoint()
+            z = HOVER_Z + (GRASP_Z - HOVER_Z) * frac
+            jg = ms.jaw_frame()
+            cap = _cap_now((cap["x"], cap["y"]))
+            if cap is None:
+                tsay("        cap lost (the gripper occludes it this close) — "
+                     "descending on the last fix")
+            else:
+                inside = ms.GRID.in_grip((cap["x"], cap["y"]), jg)
+                off_px = math.hypot(cap["x"] - jg.centre_uv[0], cap["y"] - jg.centre_uv[1])
+                if inside:
+                    tsay(f"        [grid] cap IN the jaw cells, {off_px:.0f}px from centre")
+                else:
+                    p_cap = _table_xy((cap["x"], cap["y"]))
+                    p_jaw = _table_xy(jg.centre_uv)
+                    if p_cap and p_jaw:
+                        dx, dy = p_cap[0] - p_jaw[0], p_cap[1] - p_jaw[1]
+                        tip = ms._tip(ms.observe(False)[0])
+                        tsay(f"        [grid] cap OUTSIDE the jaw cells "
+                             f"(cell {ms.GRID.cell_of((cap['x'], cap['y']))} vs "
+                             f"{sorted(ms.GRID.grip_cells(jg))}), {off_px:.0f}px — "
+                             f"correcting {math.hypot(dx, dy)*100:.1f}cm")
+                        ms._move_tip(np.array([tip[0] + dx, tip[1] + dy, float(tip[2])]),
+                                     GRASP_PITCH, j5, settle=0.18, step=1.2)
+                        xy = (xy[0] + dx, xy[1] + dy)
+            if ms._move_tip(np.array([xy[0], xy[1], z]), GRASP_PITCH, j5,
+                            settle=0.18, step=1.0) is None:
+                tsay(f"        z={z*100:.1f}cm unreachable — closing from here")
+                break
+            tsay(f"        descend {int(frac*100):3d}%  z={z*100:4.1f}cm  "
+                 f"tip={np.round(ms._tip(ms.observe(False)[0])*100, 1).tolist()}cm")
+
+        # ---- CLOSE ----------------------------------------------------------------
+        tphase("GRASP", "closing across the tube")
+        held, idle = ms.close_with_current(step=4.0, delay=0.08)
+        tsay(f"        {'CONTACT' if held else 'NO CONTACT'} (idle current {idle:.0f})")
+        if not held:
+            return "closed on nothing"
+        ms._set_carry(True, label=f"{colour} tube", h_m=TUBE_D_M)
+        tphase("LIFT", "lifting clear")
+        tip = ms._tip(ms.observe(False)[0])
+        ms._move_tip(np.array([tip[0], tip[1], HOVER_Z]), GRASP_PITCH, j5,
+                     settle=0.22, step=1.2)
+        return f"holding the {colour} tube"
+
+
+    def _fold(deg, period=180.0):
+        return ((float(deg) + period / 2.0) % period) - period / 2.0
+
     # ---- the run ---------------------------------------------------------------
-    def run(label, dest_hole):
+    def run(label, dest_hole, colour, uv_hint):
         ep = episodes.start("tube_pick", label, arm=ms.ARM.name, simulated=False,
                             dest=("rack hole %d" % dest_hole) if dest_hole is not None
                             else None)
 
         def action(n):
-            tphase("PICK", f"'{label}', attempt {n} — the server's own pick")
-            ok, detail = ms.attempt_pick(label, tries=1)
-            if not ok:
+            tphase("PICK", f"{label}, attempt {n}")
+            detail = cap_pick(colour, uv_hint)
+            if "nothing" in detail:
                 raise RuntimeError(detail)
             if dest_hole is None:
                 return detail
@@ -282,7 +461,7 @@ def start(ms, port: int = 8486) -> None:
                                 else f"still holding — the release did not happen: {detail}")
 
         def between(n):
-            tphase("RETRY", f"attempt {n}: back to home and re-acquire")
+            tphase("RETRY", f"attempt {n}: back to the look pose and re-acquire")
             try:
                 ms.goto_smooth(ms._clamp_joints(np.array(ms.HOME, np.float64)),
                                settle=0.3, step=1.5)
@@ -428,8 +607,11 @@ def start(ms, port: int = 8486) -> None:
         with lock:
             tstate["running"] = True
         sample_idle()
-        threading.Thread(target=run, args=(label, hole), daemon=True).start()
-        return jsonify(ok=True, label=label, hole=hole)
+        colour = found[0]["colour"]
+        uv_hint = tuple(found[0].get("uv") or (0, 0))
+        threading.Thread(target=run, args=(label, hole, colour, uv_hint),
+                         daemon=True).start()
+        return jsonify(ok=True, label=label, colour=colour, hole=hole)
 
     @app.route("/rack", methods=["POST"])
     def r_rack():

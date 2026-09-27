@@ -29,7 +29,8 @@ import numpy as np
 import pytest
 
 from rax.perception.tube_caps import (
-    CAP_HSV, MAX_AREA, MIN_AREA, MIN_SAT, MIN_VAL, Cap, draw, find_caps)
+    CAP_HSV, MAX_AREA, MIN_AREA, MIN_SAT, MIN_VAL, Cap, draw, find_caps, fold,
+    tube_axis, twist_error)
 
 
 def frame_with(*blobs, bg_hsv=(20, 25, 165), size=(480, 640)):
@@ -177,3 +178,114 @@ class TestBoundsAndRobustness:
         vis = draw(img, find_caps(img))
         assert vis.shape == img.shape
         assert not np.array_equal(vis, img)
+
+
+# ---------------------------------------------------------------------------------
+class TestTubeAxis:
+    """Which way the tube lies. The ported orient.tube_axis returned None for BOTH
+    tubes at every window size on this bench, for two separate reasons.
+
+    THE TUBE IS NOT ALWAYS THE BRIGHT THING. The port keeps pixels ABOVE Otsu's level,
+    correct on a near-black rubber mat and wrong on a pale wooden turntable, where the
+    background is brighter than the tube.
+
+    AND "LARGEST" SELECTS THE BENCH. Measured in a 220x220 window around the blue cap:
+    wood 35950 px at 220x220, elongation 1.00; tube 2459 px at 42x85, elongation 2.02.
+    Largest picks the wood, which is then thrown out for not being elongated, and the
+    function returns None with the tube sitting there unexamined.
+
+    The obvious repair — reject anything touching the window edge — is also wrong, and
+    that is the case worth keeping a test for: the blue tube is longer than the window
+    and legitimately runs off one side.
+    """
+
+    def _scene(self, bg_v=165, tube_v=120, angle=0.0, length=96, width=26,
+               centre=(160, 160), size=320):
+        """A tube laid on a background, either of which may be the brighter."""
+        img = np.zeros((size, size, 3), np.uint8)
+        img[:, :] = (20, 25, bg_v)
+        box = cv2.boxPoints(((centre[0], centre[1]), (length, width), angle))
+        cv2.fillPoly(img, [np.int32(box)], (15, 20, tube_v))
+        return cv2.cvtColor(img, cv2.COLOR_HSV2BGR)
+
+    def test_it_finds_a_tube_DARKER_than_the_background(self):
+        # The pale-turntable case, which the port cannot see at all.
+        ax = tube_axis(self._scene(bg_v=180, tube_v=110, angle=30.0), (160, 160))
+        assert ax is not None
+        assert abs(fold(ax.angle_deg - 30.0)) < 8
+
+    def test_it_still_finds_a_tube_BRIGHTER_than_the_background(self):
+        # The black-mat case the port was written for must keep working.
+        ax = tube_axis(self._scene(bg_v=40, tube_v=200, angle=-25.0), (160, 160))
+        assert ax is not None
+        assert abs(fold(ax.angle_deg - (-25.0))) < 8
+
+    def test_a_tube_running_OFF_the_window_is_still_found(self):
+        # The blue tube's case. Rejecting any edge contact loses it.
+        img = self._scene(angle=90.0, length=300, width=26, centre=(160, 160))
+        ax = tube_axis(img, (160, 160), r=70)
+        assert ax is not None, "a tube longer than the window must still be measured"
+
+    def test_a_featureless_background_yields_no_axis(self):
+        img = np.zeros((320, 320, 3), np.uint8)
+        img[:, :] = (20, 25, 165)
+        assert tube_axis(cv2.cvtColor(img, cv2.COLOR_HSV2BGR), (160, 160)) is None
+
+    def test_a_round_blob_is_not_an_axis(self):
+        img = np.zeros((320, 320, 3), np.uint8)
+        img[:, :] = (20, 25, 165)
+        cv2.circle(img, (160, 160), 34, (15, 20, 110), -1)
+        assert tube_axis(cv2.cvtColor(img, cv2.COLOR_HSV2BGR), (160, 160)) is None
+
+    def test_angles_are_folded_so_a_tube_has_no_head_or_tail(self):
+        a = tube_axis(self._scene(angle=10.0), (160, 160))
+        b = tube_axis(self._scene(angle=190.0), (160, 160))
+        assert a is not None and b is not None
+        assert abs(fold(a.angle_deg - b.angle_deg)) < 8
+
+    def test_elongation_reports_confidence(self):
+        slim = tube_axis(self._scene(length=120, width=18), (160, 160))
+        stub = tube_axis(self._scene(length=44, width=30), (160, 160))
+        assert slim is not None and slim.is_confident
+        assert stub is None or not stub.is_confident
+
+    def test_none_and_empty_are_handled(self):
+        assert tube_axis(None, (10, 10)) is None
+        assert tube_axis(np.zeros((0, 0, 3), np.uint8), (10, 10)) is None
+
+
+class TestTwistError:
+    """A parallel gripper has to close ACROSS the tube."""
+
+    def _tube(self, angle):
+        img = np.zeros((320, 320, 3), np.uint8)
+        img[:, :] = (20, 25, 175)
+        box = cv2.boxPoints(((160, 160), (110, 24), angle))
+        cv2.fillPoly(img, [np.int32(box)], (15, 20, 105))
+        return cv2.cvtColor(img, cv2.COLOR_HSV2BGR)
+
+    def test_a_tube_square_to_the_jaws_needs_no_twist(self):
+        # jaws horizontal (0 deg) want the tube vertical (90 deg)
+        err, _ax = twist_error(self._tube(90.0), (160, 160), 0.0)
+        assert abs(err) < 8
+
+    def test_a_tube_along_the_jaws_needs_a_quarter_turn(self):
+        err, _ax = twist_error(self._tube(0.0), (160, 160), 0.0)
+        assert abs(abs(err) - 90.0) < 10 or abs(err) > 80
+
+    def test_the_error_is_folded_not_wrapped(self):
+        # 1 and 179 differ by 2 degrees. A controller fed 178 drives the wrong way
+        # through its whole range.
+        err, _ax = twist_error(self._tube(89.0), (160, 160), 0.0)
+        assert -90.0 <= err < 90.0
+        assert abs(err) < 15
+
+    def test_the_jaw_axis_is_a_parameter_not_a_config_file(self):
+        # It differs per arm and per mount; this module must not know which arm it is.
+        import inspect
+        assert "jaw_axis_deg" in inspect.signature(twist_error).parameters
+
+    def test_no_tube_means_no_error(self):
+        img = np.zeros((320, 320, 3), np.uint8)
+        img[:, :] = (20, 25, 165)
+        assert twist_error(cv2.cvtColor(img, cv2.COLOR_HSV2BGR), (160, 160), 0.0) is None
