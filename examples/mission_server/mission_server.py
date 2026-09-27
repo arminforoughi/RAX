@@ -9654,6 +9654,16 @@ def main():
     start_rerun()
     threading.Thread(target=rerun_thread, daemon=True).start()
     start_tunnel()
+    # The tube UI, in THIS process on a second port. In-process because the bus and the
+    # OAK-D are owned here: a second process opening either is what produces the
+    # "[TxRxResult] Port is in use!" loop this server has been found stuck in. Off unless
+    # RAX_TUBE_PORT is set, and a failure to start it must never take the server with it.
+    if os.environ.get("RAX_TUBE_PORT"):
+        try:
+            import tube_mode
+            tube_mode.start(sys.modules[__name__], int(os.environ["RAX_TUBE_PORT"]))
+        except Exception as e:
+            say(f"tube UI did not start: {type(e).__name__}: {e}")
     _install_shutdown_handlers()
     set_phase("IDLE", "ready — press Start")
     say(f"UI: http://100.110.89.78:{PORT}  (Tailscale)")
