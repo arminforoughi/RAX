@@ -146,10 +146,15 @@
       <h2>Put it in</h2>
       <select id="rack"></select>
       <div class="row" style="margin-top:9px">
-        <button class="go" id="b-pick">Pick &amp; place</button>
+        <button class="go" id="b-pick">Pick this one</button>
         <button class="stop" id="b-stop">Stop</button>
       </div>
       <div class="row" style="margin-top:7px">
+        <button class="go" id="b-all">Pick ALL &rarr; drop right</button>
+      </div>
+      <div class="row" style="margin-top:7px">
+        <button id="b-scan">Scan</button>
+        <button id="b-clearmap">Clear map</button>
         <button id="b-reset">Reset</button>
       </div>
     </div>
@@ -413,8 +418,9 @@ function renderTubes(){
     tr.innerHTML =
       `<td><span class="dot" style="background:${CAPCOL[t.colour]||'#8a93a0'}"></span>`
       + `#${t.id} ${t.colour}</td>`
-      + `<td>${where}<br><span class="src">${t.standing ? 'upright' : 'lying'}`
-      + `${t.yaw_known === false ? ', angle unknown' : ''}</span></td>`
+      + `<td>${where}<br><span class="src">`
+      + `${t.n ? t.n + ' looks' : ''}${t.age != null ? ', ' + t.age + 's ago' : ''}`
+      + `</span></td>`
       + `<td><span class="src ${t.source}">${t.source}</span></td>`;
     tr.onclick = ()=>{ sel=t.id; renderTubes(); draw(); };
     tb.appendChild(tr);
@@ -484,6 +490,9 @@ const post = (u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/
                             body:JSON.stringify(b||{})});
 $('b-pick').onclick = ()=>{ if(sel===null) return;
   post('/pick', {tube: sel, rack: $('rack').value || null}); };
+$('b-all').onclick   = ()=> post('/pickall');
+$('b-scan').onclick  = ()=> post('/scan');
+$('b-clearmap').onclick = ()=> post('/clearmap');
 $('b-stop').onclick  = ()=> post('/stop');
 $('b-reset').onclick = ()=> post('/reset');
 

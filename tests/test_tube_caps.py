@@ -149,8 +149,27 @@ class TestBoundsAndRobustness:
     def test_a_speck_is_too_small(self):
         assert find_caps(frame_with((320, 240, 4, BLUE))) == []
 
-    def test_a_huge_blob_is_too_big(self):
-        assert find_caps(frame_with((320, 240, 90, BLUE))) == []
+    def test_A_CAP_SEEN_CLOSE_UP_IS_STILL_A_CAP(self):
+        """The regression that made the arm grab the tube's body instead of its cap.
+
+        Apparent area is a function of RANGE, and the whole point of an approach is to
+        reduce the range. MAX_AREA was 3200, measured when the cap read 40x48px from
+        25cm — a measurement of one viewing distance being used as a gate. Mid-approach
+        the cap measured 55x66 = 2679px and was still growing, so one more increment
+        crossed the limit, the box vanished, the arm lost track and closed over the
+        BODY. The operator saw it "grab the tail".
+        """
+        for r in (22, 40, 60, 90):
+            caps = find_caps(frame_with((320, 240, r, BLUE)))
+            assert len(caps) == 1, f"a cap of radius {r}px was dropped"
+            assert caps[0].colour == "blue"
+
+    def test_a_blob_filling_the_frame_is_still_refused(self):
+        # The bound is not gone, only loosened: something saturated covering most of the
+        # picture is not one cap.
+        img = np.zeros((480, 640, 3), np.uint8)
+        img[:, :] = BLUE
+        assert find_caps(cv2.cvtColor(img, cv2.COLOR_HSV2BGR)) == []
 
     def test_the_area_bounds_bracket_a_real_cap(self):
         # The real caps measured 909 and 1734 px.

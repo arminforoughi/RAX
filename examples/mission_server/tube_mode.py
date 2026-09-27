@@ -94,6 +94,21 @@ TUBE_MAX_ROLL_DEG = 20.0
 #: than one lunge. 2cm is a nudge at this scale and keeps a bad fix from becoming a dive.
 TUBE_MAX_STEP_M = 0.02
 
+#: WHERE THIS GRIPPER ACTUALLY STOPS ON AIR. Measured, by commanding it shut with
+#: nothing between the jaws and reading it back five times: 6.5, 6.5, 6.5, 6.4.
+#:
+#: The profile says closed_pct = 2.0, and that is a COMMAND value, not an achieved one --
+#: the jaws meet their own stop before the servo reaches the commanded position. Using it
+#: as the air baseline put the holding floor at 7.0, half a unit above where empty jaws
+#: actually rest, so a close on nothing sat one sample of noise away from reading as a
+#: grasp. One run settled at exactly 6.4 and was called EMPTY by luck.
+GRIP_AIR_PCT = 6.5
+#: Above this is a tube. The gap is deliberately wide because the populations have NOT
+#: been measured on this gripper the way the X250's were over 113 demonstrations
+#: (holding > 31.9, air 30.2, no overlap). Every close logs its settled value, which is
+#: what turns this threshold into a measurement.
+GRIP_HOLDING_PCT = 10.5
+
 #: How elongated the silhouette must be before its angle is allowed to move the wrist.
 #: `is_confident` is 2.0, which is enough to SAY which way a tube lies; acting on it
 #: deserves more. The reading that drove the 70-degree roll sat at 2.3.
@@ -132,16 +147,40 @@ TUBE_D_M, TUBE_L_M = 0.016, 0.100
 # the camera look the same from here, and nothing available can separate them.
 
 
+#: Where tubes get dropped, base-frame metres. To the RIGHT of the workspace, laid out
+#: in a row so several can be put down without stacking them on each other.
+DROP_X, DROP_Y0, DROP_PITCH_M = 0.24, -0.13, 0.035
+DROP_SLOTS = 5
+
+#: Two fixes of the same tube closer than this are the same tube. A tube is 16mm across
+#: and the cast's own scatter is a couple of centimetres, so this has to be bigger than
+#: the noise and smaller than the gap between two tubes an operator would set out.
+MAP_MERGE_M = 0.045
+#: A mapped tube nobody has seen for this long is stale, but NOT deleted -- it is still
+#: roughly where it was. It is reported as "mapped" rather than "seen" so the UI can say
+#: which, and so nothing downstream mistakes an old fix for a fresh one.
+MAP_FRESH_S = 3.0
+
+
 def start(ms, port: int = 8486) -> None:
     """Serve the tube UI on ``port``, backed by mission-server module ``ms``."""
     from rax.manipulation.attempt import with_retries
     from rax.manipulation.episodes import EpisodeLog
-    from rax.manipulation.grip import CurrentRise, reconcile
+    from rax.manipulation.grip import CurrentRise, reconcile, settled
     from rax.perception.tube_caps import draw as draw_caps
     from rax.perception.tube_caps import find_caps, tube_axis
     from rax.robots.urdf_visuals import link_visuals
 
     app = Flask("tube_mode", static_folder=None)
+    # THE MAP. Tubes persist here once seen, so the arm knows roughly where they are
+    # after it has moved or backed off -- which the "only what is in frame right now"
+    # version could not: a tube left the map the moment the camera looked elsewhere, so
+    # a pick-all could never find the second tube after approaching the first.
+    #
+    # Each entry is a running position, not a snapshot, so repeated looks average out the
+    # cast's scatter instead of the last one overwriting everything before it.
+    tube_map = {}          # id -> {id, colour, x, y, n, t, angle, yaw_known, picked}
+    next_id = [1]
     lock = threading.Lock()
     tstate = {"phase": "IDLE", "note": "ready", "running": False, "log": [],
               "idle_current": 0.0, "used_holes": []}
@@ -154,6 +193,49 @@ def start(ms, port: int = 8486) -> None:
     # THE BOXES THE OPERATOR ASKED FOR, and they are not only decoration: the same
     # detection is what the grid aim steers on. Registered as a hook so mission_server
     # never imports this module -- the dependency points one way.
+    def _map_observe():
+        """Fold the caps in view into the map. Called wherever the arm is looking."""
+        caps, t = ms.LAST_CAPS[0], ms.LAST_CAPS[1]
+        if not caps or time.time() - t > 2.0:
+            return
+        try:
+            T = ms.T_cam_of(ms.observe(False)[0])
+        except Exception:
+            return
+        for c in caps:
+            try:
+                pt = ms.ray_to_table((c["x"], c["y"]), T)
+            except Exception:
+                continue
+            if pt is None:
+                continue
+            x, y = float(pt[0]), float(pt[1])
+            if not (ms.ARM.reach_min_m <= math.hypot(x, y) <= ms.ARM.reach_max_m):
+                continue
+            with lock:
+                hit = None
+                for e in tube_map.values():
+                    if e["colour"] != c["colour"] or e.get("picked"):
+                        continue
+                    if math.hypot(e["x"] - x, e["y"] - y) <= MAP_MERGE_M:
+                        hit = e
+                        break
+                if hit is None:
+                    tube_map[next_id[0]] = {
+                        "id": next_id[0], "colour": c["colour"], "x": x, "y": y,
+                        "n": 1, "t": time.time(), "angle": c.get("angle"),
+                        "yaw_known": bool(c.get("confident")), "picked": False}
+                    next_id[0] += 1
+                else:
+                    # RUNNING MEAN, not replacement: every look is a noisy cast and the
+                    # last one is not better than the average of the ones before it.
+                    k = hit["n"] + 1
+                    hit["x"] += (x - hit["x"]) / k
+                    hit["y"] += (y - hit["y"]) / k
+                    hit["n"], hit["t"] = k, time.time()
+                    if c.get("confident"):
+                        hit["angle"], hit["yaw_known"] = c.get("angle"), True
+
     def cap_overlay(img):
         # DETECT ON THE CLEAN FRAME, DRAW ON THE ANNOTATED ONE. The hooks run at the end
         # of publish(), by which point the grid, the jaw cells and the hand-eye marker
@@ -192,6 +274,10 @@ def start(ms, port: int = 8486) -> None:
                           "confident": bool(ax is not None and ax.is_confident)})
         ms.LAST_CAPS[0] = found
         ms.LAST_CAPS[1] = time.time()
+        try:
+            _map_observe()
+        except Exception:
+            pass
         if caps:
             img[:, :] = draw_caps(img, caps)
             for f in found:
@@ -253,70 +339,31 @@ def start(ms, port: int = 8486) -> None:
 
     # ---- the map ---------------------------------------------------------------
     def tubes():
-        """Every tube in the CURRENT VIEW, mapped onto the table plane.
+        """Every tube the map knows about, seen or remembered.
 
-        NO YOLO, AND NO SWEEP. The detector's part in this is over: caps are found by
-        colour (measured on this camera), the body's axis by contrast, and the position
-        by casting the cap's pixel onto the table plane through the calibrated hand-eye
-        transform -- which reprojects the fingertip to 0 px on this rig, so the cast is
-        as good as the plane height.
-
-        That replaces a 29-class vocabulary, a prompt, and a base sweep with one frame.
-        It is also the only version that has worked here: pointed at tubes, the broad
-        scan mapped ten objects and no tubes (three "toothbrush", three "pen"), and the
-        targeted scan found one of the two tubes on the bench. The cap detector finds
-        both, every frame.
-
-        WHAT IS STILL HONEST ABOUT IT. Only what the camera can see right now is
-        listed -- there is no memory and nothing is carried over, so a tube that leaves
-        the view leaves the map rather than lingering as a stale fix. And `yaw_known`
-        follows the axis measurement's own confidence: a tube seen end-on is barely
-        elongated and its angle means little, so it is reported as unknown rather than
-        as whatever the fit returned.
+        NOT ONLY WHAT IS IN FRAME. The first version listed the current view and nothing
+        else, so a tube vanished from the map the moment the camera looked away -- which
+        makes picking several impossible, because approaching the first one loses the
+        second. Entries persist, carry how many looks went into them, and say whether
+        they were seen recently or are being remembered.
         """
-        caps, t = ms.LAST_CAPS[0], ms.LAST_CAPS[1]
-        if not caps or time.time() - t > 2.5:
-            return []
-        try:
-            q = ms.observe(False)[0]
-            T = ms.T_cam_of(q)
-        except Exception:
-            return []
-        with ms.lock:
-            held_label = ms.carry["label"] if ms.carry["held"] else None
-
-        out = []
-        for i, c in enumerate(caps, start=1):
-            try:
-                p = ms.ray_to_table((c["x"], c["y"]), T)
-            except Exception:
-                continue
-            if p is None:
-                continue
-            x, y = float(p[0]), float(p[1])
-            r = math.hypot(x, y)
-            # A cast that lands outside the arm's own workspace is a broken solve, not a
-            # distant tube -- the same plausibility bound the rest of the stack uses.
-            if not (ms.ARM.reach_min_m <= r <= ms.ARM.reach_max_m):
-                continue
-            held = held_label is not None and c["colour"] in str(held_label)
-            out.append({"id": i, "colour": c["colour"],
-                        "x": round(x, 4), "y": round(y, 4), "z": 0.0,
-                        "held": bool(held), "rack": None, "hole": None,
-                        "source": "seen",
-                        "d": TUBE_D_M, "l": TUBE_L_M,
-                        # THREE ANSWERS, from the tube's own silhouette. A confident
-                        # elongated body is a tube LYING at a measured angle. No
-                        # elongated body is UNKNOWN, not "standing": a tube upright in a
-                        # rack and one pointing end-on at the camera present the same
-                        # circle, and nothing here can tell them apart. Reporting either
-                        # as a fact is the lie the object map is careful not to tell
-                        # with its own `yaw_known`.
-                        "standing": False if c["confident"] else None,
-                        "yaw": float(c["angle"] or 0.0),
-                        "yaw_known": bool(c["confident"]),
-                        "uv": [round(c["x"], 1), round(c["y"], 1)],
-                        "label": f"{c['colour']} tube"})
+        now = time.time()
+        with lock:
+            out = []
+            for e in sorted(tube_map.values(), key=lambda v: v["id"]):
+                if e.get("picked"):
+                    continue
+                out.append({
+                    "id": e["id"], "colour": e["colour"],
+                    "x": round(e["x"], 4), "y": round(e["y"], 4), "z": 0.0,
+                    "held": False, "rack": None, "hole": None,
+                    "source": "seen" if now - e["t"] < MAP_FRESH_S else "mapped",
+                    "d": TUBE_D_M, "l": TUBE_L_M,
+                    "standing": False if e["yaw_known"] else None,
+                    "yaw": float(e["angle"] or 0.0),
+                    "yaw_known": bool(e["yaw_known"]),
+                    "n": e["n"], "age": round(now - e["t"], 1),
+                    "label": f"{e['colour']} tube"})
         return out
 
     def _colour_of(label):
@@ -325,11 +372,95 @@ def start(ms, port: int = 8486) -> None:
                 return "gold" if c in ("yellow", "orange") else c
         return "blue"
 
+    def drop_xy(slot):
+        return (DROP_X, DROP_Y0 - slot * DROP_PITCH_M)
+
+    def place_right(colour, slot):
+        """Put the held tube down on the right — BY EYE, the same way it was picked up.
+
+        SAME STRATEGY, DIFFERENT TARGET. A cap going between the jaws and a held tube
+        going over a rack hole are the same problem: something in the picture has to end
+        up in the jaw cells while the arm follows a planned descent. So this runs the
+        very same `_vision_approach`, with the hole detector supplying the target instead
+        of the cap detector.
+
+        The holes come from `rax.perception.rack_holes`, which finds them by Hough
+        circles and decides FREE by darkness -- an empty hole looks into the rack's own
+        shadow and reads near-black, while one with a tube in it shows the cap. That
+        needs no colour model and does not care which cap is already in the way.
+
+        FALLS BACK TO THE BLIND DROP, and says so. If no rack is visible the arm still
+        has to put the tube down somewhere, so it goes to the configured slot -- but the
+        log distinguishes the two, because one of them is a measurement and the other is
+        a guess about where a rack was assumed to be.
+        """
+        from rax.perception.rack_holes import find_holes, pick_free_hole
+
+        x, y = drop_xy(slot)
+        tphase("CARRY", f"carrying the {colour} tube to the right")
+        q_now = ms.observe(False)[0].astype(float)
+        pitch_hold = float(sum(q_now[i] for i in ms.ARM.pitch_chain))
+        j5_now = float(q_now[ms.ARM.roll_joint])
+
+        # over the drop area first, high, so the rack comes into view
+        q_over, e_over = ms._ik_hold_pitch(q_now, np.array([x, y, 0.12]),
+                                           pitch_hold, j5_now, ret_err=True)
+        if e_over > 0.03:
+            raise RuntimeError(f"cannot carry to ({x*100:+.0f},{y*100:+.0f})cm "
+                               f"(IK residual {e_over*100:.1f}cm)")
+        ms.goto_smooth(ms._clamp_joints(np.asarray(q_over, float)), settle=0.25, step=2.6)
+
+        def see_hole():
+            src = ms.latest_rgb[0]
+            if src is None:
+                return None
+            bgr = cv2.cvtColor(np.asarray(src), cv2.COLOR_RGB2BGR)
+            holes = find_holes(bgr)
+            h = pick_free_hole(holes, prefer=ms.jaw_frame().centre_uv)
+            if h is None:
+                return None
+            return {"x": float(h.x), "y": float(h.y),
+                    "bbox": (h.x - h.r, h.y - h.r, h.x + h.r, h.y + h.r)}
+
+        ms.observe(True)
+        target = see_hole()
+        if target is None:
+            tsay("        no free rack hole in view — putting it down at the "
+                 "configured slot instead (a guess, not a measurement)")
+            q_down, e_d = ms._ik_hold_pitch(ms.observe(False)[0].astype(float),
+                                            np.array([x, y, GRASP_Z + 0.012]),
+                                            pitch_hold, j5_now, ret_err=True)
+            if e_d <= 0.03:
+                ms.goto_smooth(ms._clamp_joints(np.asarray(q_down, float)),
+                               settle=0.20, step=2.0)
+        else:
+            tphase("DROP", f"lining the tube up with a free hole, slot {slot}")
+            hole_uv = [(target["x"], target["y"])]
+            aim_u = ms.jaw_frame().centre_uv[0]
+            sign = _probe_base(see_hole, hole_uv, aim_u)
+            pt = _table_xy((target["x"], target["y"])) or (x, y)
+            q_goal, e_g = ms._ik_hold_pitch(ms.observe(False)[0].astype(float),
+                                            np.array([pt[0], pt[1], GRASP_Z + 0.030]),
+                                            pitch_hold, j5_now, ret_err=True)
+            if e_g > 0.03:
+                raise RuntimeError(f"cannot reach the hole (residual {e_g*100:.1f}cm)")
+            _vision_approach(see_hole, ms._clamp_joints(np.asarray(q_goal, float)),
+                             sign, "the hole", hole_uv)
+
+        ms.send_joints(ms.observe(False)[0], gripper=float(ms.ARM.gripper.place_open_pct))
+        time.sleep(0.4)
+        ms._set_carry(False)
+        ms.goto_smooth(ms._clamp_joints(np.asarray(q_over, float)), settle=0.20, step=2.6)
+        tsay(f"        released over slot {slot}")
+        return f"dropped at slot {slot}"
+
     def racks():
-        holes = _hole_grid(*RACK_XY)
-        return [{"name": "tube", "x": RACK_XY[0], "y": RACK_XY[1], "yaw": 0.0,
-                 "colour": "#8a93a0",
-                 "holes": [[round(h[0], 4), round(h[1], 4)] for h in holes]}]
+        """The drop row, drawn as 'holes' so the existing viewer shows the slots."""
+        return [{"name": "drop", "x": DROP_X,
+                 "y": DROP_Y0 - (DROP_SLOTS - 1) * DROP_PITCH_M / 2.0,
+                 "yaw": 0.0, "colour": "#8a93a0",
+                 "holes": [[round(drop_xy(i)[0], 4), round(drop_xy(i)[1], 4)]
+                           for i in range(DROP_SLOTS)]}]
 
 
     # ---- the pick: look, go over, square up, put the cap in the grid --------------
@@ -341,9 +472,16 @@ def start(ms, port: int = 8486) -> None:
     #: and every one of them re-measures the cap first.
     #: pick.py aims to 150px before approaching. Same here: the point is only to get the
     #: tube off the edge of the picture, not to line it up -- the approach does that.
-    AIM_TOL_PX, AIM_STEPS = 150.0, 8
+    AIM_TOL_PX, AIM_STEPS = 150.0, 6
+    #: How far down the planned descent before a close is allowed. pick.py's 0.85: image
+    #: alignment fixes the bearing and says nothing about height, and it logged a run that
+    #: converged to 7px at 41% and closed on air above the tube.
+    AT_DEPTH = 0.85
     #: Increments in the approach. Each one looks first.
-    N_APPROACH = 10
+    N_APPROACH = 8
+    #: Bites of forward reach taken after the interpolation ends, if the cap still is not
+    #: in the cells. Small, and re-looked between each.
+    CREEP_ON_STEP_M, N_CREEP_ON, CREEP_ON_MAX_M = 0.005, 14, 0.07
     #: pick.py's, and this rig's own [grip] log agrees with it: across 13 trials the
     #: target read <=67px from the grip centre on every pick that worked.
     GRASP_RADIUS_PX = 70.0
@@ -393,7 +531,7 @@ def start(ms, port: int = 8486) -> None:
                     return max(caps, key=lambda c: c["area"])
                 return min(caps, key=lambda c: (c["x"] - want_uv[0]) ** 2
                            + (c["y"] - want_uv[1]) ** 2)
-            time.sleep(0.15)
+            time.sleep(0.06)
         return None
 
     def _table_xy(uv):
@@ -404,6 +542,138 @@ def start(ms, port: int = 8486) -> None:
         except Exception:
             return None
         return None if pt is None else (float(pt[0]), float(pt[1]))
+
+    def _vision_approach(see, q_goal, sign_base, what, last_uv):
+        """Interpolate the joints toward ``q_goal`` while the BASE tracks what it sees.
+
+        THE ONE APPROACH BOTH STAGES USE. Putting a cap between the jaws and putting a
+        held tube over a rack hole are the same problem seen twice: a thing in the
+        picture has to end up in the jaw cells while the arm follows a planned descent.
+        Everything that was learned the hard way lives here once --
+
+          * LOOK BEFORE MOVING. A lost target means HOLD, not carry on: pick.py records
+            an arm that descended through five "not in view" steps and finished past its
+            target with nothing in the jaws.
+          * THE VERTICAL PIXEL ERROR IS NOT AN ERROR. "Extending the arm moves the cap UP
+            31.8px per unit, because the wrist camera tilts as the arm reaches: image
+            alignment says retract while physical alignment says extend." Measured here
+            over one descent, dy went +87 -> +285 while dx stayed inside 51px. Folding dy
+            into a distance makes that distance grow monotonically and no threshold on it
+            can ever be met. Alignment is HORIZONTAL; the vertical belongs to the plan.
+          * FLIP ONLY ON A REAL REGRESSION. pick.py's +4px margin is against its own
+            150px-scale errors; at a handful of pixels it fires on detector noise, and it
+            did -- "the error grew 1 -> 5px, wrong way, flipping", four times in one
+            descent, each flip undoing the last while the aim was fine.
+          * NO IK IN THE LOOP. q_goal is solved once by the caller, holding the wrist
+            pitch. Re-solving per step lets the wrist wander, and the camera is bolted to
+            it, so the relationship between a correction and its effect stops being
+            stable.
+
+        ``see`` returns a dict with x, y and bbox, or None. Returns (reached, last_dist).
+        """
+        q_start = ms.observe(False)[0].astype(float)
+        aim = ms.jaw_frame().centre_uv
+        misses, last_dist, last_ex, reached = 0, None, 0.0, False
+        for step in range(N_APPROACH):
+            ms.checkpoint()
+            a = (step + 1) / N_APPROACH
+            t = see()
+            if t is None:
+                misses += 1
+                if last_dist is not None and last_dist < 170 and a >= 0.7:
+                    tsay(f"        {what} passed under the jaws at {last_dist:.0f}px, "
+                         f"{100*a:.0f}% down — completing the descent")
+                    q_fin = q_goal.copy()
+                    q_fin[ms.ARM.pan_joint] = ms.observe(False)[0][ms.ARM.pan_joint]
+                    ms.goto_smooth(ms._clamp_joints(q_fin), settle=0.20, step=2.0)
+                    return True, last_dist
+                tsay(f"        {step+1:2d}: {what} not in view — HOLDING ({misses}/4)")
+                if misses >= 4:
+                    break
+                time.sleep(0.12)
+                continue
+            misses = 0
+            last_uv[0] = (t["x"], t["y"])
+            ex = aim[0] - t["x"]
+            ey = aim[1] - t["y"]
+            dist = abs(float(ex))
+            jg = ms.jaw_frame()
+            bb = t.get("bbox")
+            corners = ([(bb[0], bb[1]), (bb[2], bb[1]), (bb[0], bb[3]), (bb[2], bb[3])]
+                       if bb else [])
+            in_grip = (ms.GRID.in_grip((t["x"], t["y"]), jg)
+                       or any(ms.GRID.in_grip(k, jg) for k in corners))
+            tsay(f"        {step+1:2d}/{N_APPROACH}: "
+                 f"{ms.GRID.cell_of((t['x'], t['y']))} -> jaws {ms.GRID.cell_of(aim)}  "
+                 f"dx {ex:+.0f} dy {ey:+.0f}  {100*a:.0f}% down"
+                 f"{'  IN GRIP' if in_grip else ''}")
+
+            if (last_dist is not None and sign_base != 0.0
+                    and abs(ex) > 30.0 and abs(ex) > abs(last_ex) + 15.0):
+                sign_base *= -1.0
+                tsay(f"        the error grew {abs(last_ex):.0f} -> {abs(ex):.0f}px "
+                     f"— wrong way, flipping to sign {sign_base:+.0f}")
+            last_ex, last_dist = ex, dist
+
+            if (in_grip or dist < GRASP_RADIUS_PX) and a >= AT_DEPTH:
+                tsay(f"        aligned to {dist:.0f}px and {100*a:.0f}% down — done")
+                reached = True
+                break
+
+            q = q_start + (q_goal - q_start) * a
+            q[ms.ARM.roll_joint] = q_start[ms.ARM.roll_joint]
+            pan_now = ms.observe(False)[0][ms.ARM.pan_joint]
+            if abs(ex) > 30 and sign_base != 0.0:
+                scale = 1.0 + 1.1 * a
+                d_pan = sign_base * float(np.clip(abs(ex) / (14.0 * scale),
+                                                  0.4, 3.2 / scale))
+                q[ms.ARM.pan_joint] = float(np.clip(
+                    pan_now + d_pan, ms.J_LO[ms.ARM.pan_joint],
+                    ms.J_HI[ms.ARM.pan_joint]))
+            else:
+                q[ms.ARM.pan_joint] = pan_now
+            ms.goto_smooth(ms._clamp_joints(q), settle=0.10, step=2.2)
+
+        if not reached and last_dist is not None:
+            tsay(f"        finished {last_dist:.0f}px off — continuing anyway; the "
+                 f"episode records how far")
+        return reached, last_dist
+
+    def _probe_base(see, last_uv, aim_u):
+        """Which way the base joint moves what we are watching. pick.py's probe.
+
+        The 18px floor is its, and its comment says why: "A 3-unit probe moved the cap
+        less than the +-8px noise floor, so the sign stayed a guess -- and then the
+        flip-on-worse rule toggled it at random every step, leaving dx pinned at +100 for
+        an entire descent while 'correcting'."
+        """
+        for probe_q in (7.0, -10.0, 14.0):
+            ms.checkpoint()
+            t0 = see()
+            if t0 is None:
+                continue
+            before_x = t0["x"]
+            q_from = ms.observe(False)[0].astype(float)
+            q_try = q_from.copy()
+            q_try[ms.ARM.pan_joint] = float(np.clip(
+                q_from[ms.ARM.pan_joint] + probe_q,
+                ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
+            ms.goto_smooth(ms._clamp_joints(q_try), settle=0.20, step=2.6)
+            after = see()
+            ms.goto_smooth(ms._clamp_joints(q_from), settle=0.20, step=2.6)
+            if after is None:
+                continue
+            moved = after["x"] - before_x
+            if abs(moved) < 18.0:
+                tsay(f"        base {probe_q:+.0f} moved it only {moved:+.0f}px "
+                     f"— under the noise floor")
+                continue
+            gain = moved / probe_q
+            sign = 1.0 if ((aim_u - before_x) * gain) > 0 else -1.0
+            tsay(f"        base gain {gain:+.2f}px/deg -> sign {sign:+.0f}")
+            return sign
+        tsay("        could not measure the base direction")
+        return 0.0
 
     def cap_pick(colour, uv_hint):
         """Pick a tube by its cap, in pick.py's order: LOOK, AIM, PROBE, APPROACH, GRASP.
@@ -434,7 +704,7 @@ def start(ms, port: int = 8486) -> None:
         # ---- LOOK: go up, and see the whole bench ---------------------------------
         tphase("LOOK", "going up to the look pose")
         ms.goto_smooth(ms._clamp_joints(np.array(ms.HOME, np.float64)),
-                       settle=0.30, step=2.0)
+                       settle=0.20, step=2.8)
         j5 = float(ms.observe(False)[0][ms.ARM.roll_joint])
 
         cap = _cap_now(uv_hint or None, colour)
@@ -449,175 +719,136 @@ def start(ms, port: int = 8486) -> None:
 
         AIM = ms.jaw_frame().centre_uv
 
-        # ---- PROBE: which way does the base move the cap? -------------------------
+        # ---- THE GRASP POSE, solved ONCE, in joint space --------------------------
+        #
+        # NO CARTESIAN IK INSIDE THE LOOP, and that is the whole point of this rewrite.
+        # pick.py interpolates JOINT poses toward its demonstrated grasp and adds a base
+        # correction on top; it never solves IK during the descent. Every version of this
+        # that used _move_tip per step re-solved all five joints each increment, so the
+        # camera's orientation was not determined by what was commanded -- which makes
+        # the relationship between "the correction I applied" and "which way the cap
+        # moved" unstable, and that is why the sign appeared to behave at random.
+        #
+        # The SO-101 has no demonstrated grasp pose, so one is SOLVED, once, here. After
+        # this the approach is pure joint interpolation plus a base nudge, exactly as
+        # pick.py does it.
+        tphase("PLAN", "solving the grasp pose once, holding the wrist where it is")
+        q_start = ms.observe(False)[0].astype(float)
+
+        # THE WRIST PITCH DOES NOT CHANGE. It is read from the arm here and held for the
+        # whole pick -- the approach, the grasp and the lift.
+        #
+        # This is the fault that produced every "it is going the opposite way". A grasp
+        # pitch of 78 degrees was being commanded, tipping the wrist far over from the
+        # ~25 it sits at, and THE CAMERA IS BOLTED TO THAT WRIST: tilting it sweeps the
+        # entire picture upward, and the jaw cells are at the bottom of the picture. So
+        # the cap climbed away from the jaws on every step while the approach was
+        # supposedly closing on it. Measured, one descent:
+        #
+        #     dy: +87 128 165 194 214 233 264 285      away, monotonically
+        #
+        # Solving with an unweighted orientation was no better: it let the IK choose
+        # whatever wrist angle was convenient for each target, so the pitch still moved,
+        # just unpredictably. `_ik_hold_pitch` pins it.
+        pitch_hold = float(sum(q_start[i] for i in ms.ARM.pitch_chain))
+        tsay(f"        holding the wrist at {pitch_hold:+.1f}deg "
+             f"(as found — parallel to the table, not tipped over for the grasp)")
+
+        q_grasp, err = ms._ik_hold_pitch(q_start, np.array([xy[0], xy[1], GRASP_Z]),
+                                         pitch_hold, j5, ret_err=True)
+        q_grasp = ms._clamp_joints(np.asarray(q_grasp, float))
+        if err > 0.02:
+            raise RuntimeError(
+                f"no grasp pose for ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm at "
+                f"z={GRASP_Z*100:.1f}cm holding {pitch_hold:.0f}deg — "
+                f"IK residual {err*100:.1f}cm")
+        pitch_end = float(sum(q_grasp[i] for i in ms.ARM.pitch_chain))
+        tsay(f"        grasp pose {np.round(q_grasp,1).tolist()}, "
+             f"wrist ends at {pitch_end:+.1f}deg ({err*100:.1f}cm residual)")
+
+        # ---- PROBE the BASE JOINT, which is what the correction moves --------------
+        # pick.py's own comment records why this has to be measured hard: "A 3-unit probe
+        # moved the cap less than the +-8px noise floor, so the sign stayed a guess -- and
+        # then the flip-on-worse rule toggled it at random every step, leaving dx pinned
+        # at +100 for an entire descent while 'correcting'." So the threshold is 18px, not
+        # 8, and the sign folds in the error direction the way pick.py computes it:
+        #
+        #     gain = moved / probe          sign = +1 if ex * gain > 0 else -1
+        #
+        # and the step then uses ABS(ex) times that sign.
         tphase("PROBE", "measuring which way the base moves the cap")
         sign_base = 0.0
-        q0 = ms.observe(False)[0].astype(float)
-        u0 = cap["x"]
-        for nudge in (4.0, -7.0, 10.0):
+        for probe_q in (7.0, -10.0, 14.0):
             ms.checkpoint()
-            q = q0.copy()
-            q[ms.ARM.pan_joint] = float(np.clip(q0[ms.ARM.pan_joint] + nudge,
-                                                ms.J_LO[ms.ARM.pan_joint],
-                                                ms.J_HI[ms.ARM.pan_joint]))
-            ms.goto_smooth(ms._clamp_joints(q), settle=0.25, step=2.0)
-            c = _cap_now(last_uv[0], colour)
-            if c is not None and abs(c["x"] - u0) >= 8.0:
-                moved = c["x"] - u0
-                sign_base = 1.0 if (moved / nudge) > 0 else -1.0
-                tsay(f"        base {nudge:+.0f}deg moved the cap {moved:+.0f}px "
-                     f"-> sign {sign_base:+.0f}")
-                break
-            tsay(f"        base {nudge:+.0f}deg moved the cap under the noise floor")
-        ms.goto_smooth(ms._clamp_joints(q0), settle=0.25, step=2.0)
+            before_x = cap["x"]
+            q_from = ms.observe(False)[0].astype(float)
+            q_try = q_from.copy()
+            q_try[ms.ARM.pan_joint] = float(np.clip(
+                q_from[ms.ARM.pan_joint] + probe_q,
+                ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
+            ms.goto_smooth(ms._clamp_joints(q_try), settle=0.20, step=2.6)
+            after = _cap_now(last_uv[0], colour)
+            ms.goto_smooth(ms._clamp_joints(q_from), settle=0.20, step=2.6)
+            if after is None:
+                tsay(f"        base {probe_q:+.0f}: lost the cap during the probe")
+                continue
+            moved = after["x"] - before_x
+            if abs(moved) < 18.0:
+                tsay(f"        base {probe_q:+.0f} moved the cap only {moved:+.0f}px "
+                     f"— under the noise floor, probing harder")
+                continue
+            gain = moved / probe_q
+            ex0 = AIM[0] - before_x
+            sign_base = 1.0 if (ex0 * gain) > 0 else -1.0
+            tsay(f"        base gain {gain:+.2f}px/deg, error {ex0:+.0f}px "
+                 f"-> correcting with sign {sign_base:+.0f}")
+            break
         if sign_base == 0.0:
-            raise RuntimeError("could not measure which way the base moves the cap")
+            tsay("        could not measure the base direction — descending without "
+                 "a horizontal correction")
+        cap = _cap_now(last_uv[0], colour) or cap
 
-        # ---- AIM: base only, until the cap is near the jaws horizontally ----------
-        tphase("AIM", "turning the base to bring the cap across")
-        for n in range(AIM_STEPS):
-            ms.checkpoint()
-            c = _cap_now(last_uv[0], colour)
-            if c is None:
-                tsay(f"        aim {n+1}: cap not in view — holding")
-                time.sleep(0.25)
-                continue
-            last_uv[0] = (c["x"], c["y"])
-            ex = AIM[0] - c["x"]
-            tsay(f"        aim {n+1}: cap x={c['x']:.0f} vs jaws x={AIM[0]:.0f} "
-                 f"-> dx {ex:+.0f}px")
-            if abs(ex) < AIM_TOL_PX:
-                tsay(f"        aimed, {abs(ex):.0f}px < {AIM_TOL_PX:.0f}px")
-                break
-            q = ms.observe(False)[0].astype(float)
-            d_pan = math.copysign(min(abs(ex) / 14.0, 6.0), ex * sign_base)
-            q[ms.ARM.pan_joint] = float(np.clip(q[ms.ARM.pan_joint] + d_pan,
-                                                ms.J_LO[ms.ARM.pan_joint],
-                                                ms.J_HI[ms.ARM.pan_joint]))
-            ms.goto_smooth(ms._clamp_joints(q), settle=0.20, step=2.0)
-
-        # Re-fix now that the tube is in front of the camera rather than off to one side.
-        c = _cap_now(last_uv[0], colour)
-        if c is not None:
-            xy2 = _table_xy((c["x"], c["y"]))
-            if xy2 is not None:
-                tsay(f"        re-fixed after aiming: ({xy2[0]*100:+.1f},"
-                     f"{xy2[1]*100:+.1f})cm, r={math.hypot(*xy2)*100:.1f}cm")
-                xy, cap = xy2, c
-                last_uv[0] = (c["x"], c["y"])
-
-        # ---- SQUARE: a nudge, only on a confident axis ----------------------------
-        if TUBE_YAW_ALIGN and cap.get("confident") and \
-                (cap.get("elong") or 0.0) >= TUBE_ROLL_MIN_ELONGATION:
-            jg = ms.jaw_frame()
-            err = _fold(cap["angle"] - (jg.axis_deg + 90.0))
-            gain = float(getattr(jg, "roll_gain", 1.0)) or 1.0
-            if abs(err) >= float(ms.CFG.yaw_deadband_deg):
-                tphase("SQUARE", "turning the jaws across the tube")
-                step = float(np.clip(err / gain, -TUBE_MAX_ROLL_DEG, TUBE_MAX_ROLL_DEG))
-                lo, hi = ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]
-                j5 = float(np.clip(j5 + step, lo, hi))
-                tsay(f"        tube {cap['angle']:+.0f}deg, jaws {jg.axis_deg:+.0f}deg "
-                     f"-> rolling {step:+.0f}deg")
-                q = ms.observe(False)[0].astype(float)
-                q[ms.ARM.roll_joint] = j5
-                ms.goto_smooth(ms._clamp_joints(q), settle=0.30, step=2.0)
-
-        # ---- APPROACH: move toward it, looking before every step ------------------
-        tphase("APPROACH", "moving toward the tube, box into the jaw cells")
-        tip0 = ms._tip(ms.observe(False)[0])
-        r0, z0 = float(math.hypot(tip0[0], tip0[1])), float(tip0[2])
-        r_goal = float(math.hypot(xy[0], xy[1]))
-        bearing = math.degrees(math.atan2(xy[1], xy[0]))
-        tsay(f"        r {r0*100:.1f} -> {r_goal*100:.1f}cm, "
-             f"z {z0*100:.1f} -> {GRASP_Z*100:.1f}cm in {N_APPROACH} steps")
-
-        misses, last_dist, reached = 0, None, False
-        for step in range(N_APPROACH):
-            ms.checkpoint()
-            a = (step + 1) / N_APPROACH
-            # LOOK FIRST. The other order advances an increment and only then checks, so
-            # a lost detection keeps reaching: pick.py records an arm that carried on
-            # through five "not in view" steps and finished forward of the tube.
-            c = _cap_now(last_uv[0], colour)
-            z_is = float(ms._tip(ms.observe(False)[0])[2])
-            if c is None:
-                misses += 1
-                if last_dist is not None and last_dist < 170 and z_is <= GRASP_Z + 0.03:
-                    tsay(f"        the cap passed under the jaws at {last_dist:.0f}px, "
-                         f"z={z_is*100:.1f}cm — finishing")
-                    reached = True
-                    break
-                tsay(f"        {step+1:2d}: cap not in view — HOLDING ({misses}/4)")
-                if misses >= 4:
-                    break
-                time.sleep(0.25)
-                continue
-            misses = 0
-            last_uv[0] = (c["x"], c["y"])
-            ex, ey = AIM[0] - c["x"], AIM[1] - c["y"]
-            dist = float(math.hypot(ex, ey))
-            last_dist = dist
-            jg = ms.jaw_frame()
-            # THE BOX, not just the centroid: the cap is 40px across and the question is
-            # whether it is BETWEEN the fingers, which a box can answer and a point
-            # cannot when it sits on a cell boundary.
-            corners = [(c["bbox"][0], c["bbox"][1]), (c["bbox"][2], c["bbox"][1]),
-                       (c["bbox"][0], c["bbox"][3]), (c["bbox"][2], c["bbox"][3])]
-            in_grip = (ms.GRID.in_grip((c["x"], c["y"]), jg)
-                       or any(ms.GRID.in_grip(k, jg) for k in corners))
-            tsay(f"        {step+1:2d}/{N_APPROACH}: box "
-                 f"{ms.GRID.cell_of((c['x'], c['y']))} -> jaws {ms.GRID.cell_of(AIM)}  "
-                 f"dx {ex:+.0f} dy {ey:+.0f} d {dist:.0f}px  z {z_is*100:.1f}cm"
-                 f"{'  IN GRIP' if in_grip else ''}")
-
-            if in_grip and z_is <= GRASP_Z + 0.02:
-                tsay(f"        box is in the jaw cells and the hand is down at "
-                     f"{z_is*100:.1f}cm — closing")
-                reached = True
-                break
-
-            # bearing only, on pick.py's shrinking gain
-            scale = 1.0 + 1.1 * a
-            if abs(ex) > 30:
-                mag = float(np.clip(abs(ex) / (14.0 * scale), 0.4, 3.2 / scale))
-                bearing += math.copysign(mag, ex * sign_base)
-
-            r = min(r0 + (r_goal - r0) * a, r_goal)
-            z = z0 + (GRASP_Z - z0) * a
-            tgt = np.array([r * math.cos(math.radians(bearing)),
-                            r * math.sin(math.radians(bearing)), z])
-            if ms._move_tip(tgt, GRASP_PITCH, j5, settle=0.14, step=1.0) is None:
-                tsay(f"        r={r*100:.0f}cm z={z*100:.1f}cm unreachable — "
-                     f"closing from here")
-                break
+        reached, last_dist = _vision_approach(
+            lambda: _cap_now(last_uv[0], colour), q_grasp, sign_base,
+            f"the {colour} cap", last_uv)
 
         # ---- GRASP ----------------------------------------------------------------
         tphase("GRASP", "closing across the tube")
-        held, idle = ms.close_with_current(step=4.0, delay=0.08)
-        tsay(f"        {'CONTACT' if held else 'NO CONTACT'} (idle current {idle:.0f})")
+        held_i, idle = ms.close_with_current(step=4.0, delay=0.08)
 
-        # DO NOT CLAIM A TUBE THE EVIDENCE DOES NOT SUPPORT. A previous run reported
-        # SUCCESS with the cap 218px from the jaws: the idle current had read 0, so the
-        # contact test compared against nothing and any draw at all tripped it. Two
-        # guards, and each catches what the other misses.
-        if idle <= 0.5:
-            raise RuntimeError(
-                f"the gripper's idle current read {idle:.1f}, so the contact test had "
-                f"nothing to compare against — refusing to call this a grasp")
-        if not held:
-            raise RuntimeError("closed on nothing")
+        # WHERE THE JAWS COME TO REST, because the current says nothing on this arm.
+        # gripper_current() reads 0 here run after run -- the servo either does not
+        # report it or reports it too small to use against an 8-count threshold -- which
+        # makes the contact test compare against nothing and call any draw a grasp. That
+        # is how a run reported SUCCESS with the cap 218px away.
+        #
+        # The position is the signal the X250 uses for exactly this reason, and it is
+        # available here: jaws closed on air settle at the closed stop, and jaws closed
+        # on a 16mm tube cannot. `settled` waits for motion to stop first, because
+        # mid-close the jaws pass THROUGH the holding band on their way shut.
+        pos = settled(lambda: float(ms.state.get("gripper") or 0.0),
+                      tol=0.4, timeout=1.5, dt=0.06)
+        held = pos > GRIP_HOLDING_PCT
+        tsay(f"        gripper settled at {pos:.1f} "
+             f"(air closes to {GRIP_AIR_PCT:.1f}, holding is above "
+             f"{GRIP_HOLDING_PCT:.1f}) -> {'HOLDING' if held else 'EMPTY'}"
+             f"   [current said {'contact' if held_i else 'nothing'}, "
+             f"idle {idle:.1f}]")
+
         if last_dist is not None and last_dist > 2.0 * GRASP_RADIUS_PX:
             raise RuntimeError(
                 f"the jaws closed, but the cap was last seen {last_dist:.0f}px away — "
                 f"further than {2.0*GRASP_RADIUS_PX:.0f}px, so whatever is between them "
                 f"is not this tube")
-
+        if not held:
+            raise RuntimeError(
+                f"closed on nothing — the jaws settled at {pos:.1f}, at the air stop "
+                f"({GRIP_AIR_PCT:.1f})")
         ms._set_carry(True, label=f"{colour} tube", h_m=TUBE_D_M)
         tphase("LIFT", "lifting clear")
         tip = ms._tip(ms.observe(False)[0])
-        ms._move_tip(np.array([tip[0], tip[1], z0]), GRASP_PITCH, j5,
-                     settle=0.22, step=1.2)
+        ms._move_tip(np.array([tip[0], tip[1], tip[2] + 0.09]), pitch_hold, j5,
+                     settle=0.20, step=1.6)
         return f"holding the {colour} tube ({last_dist:.0f}px at the close)"
 
     def _fold(deg, period=180.0):
@@ -806,6 +1037,89 @@ def start(ms, port: int = 8486) -> None:
         threading.Thread(target=run, args=(label, hole, colour, uv_hint),
                          daemon=True).start()
         return jsonify(ok=True, label=label, colour=colour, hole=hole)
+
+    @app.route("/pickall", methods=["POST"])
+    def r_pickall():
+        """Pick every tube on the map and put them down in the drop row on the right.
+
+        WORKS OFF THE MAP, NOT OFF THE VIEW, which is the whole reason the map exists.
+        Approaching the first tube points the camera at it and away from the others; a
+        list rebuilt from the current frame would lose them exactly when it needed them.
+        The map remembers roughly where each one was, the arm goes back up to the look
+        pose between tubes, and the remembered position is good enough to start the next
+        approach -- which then re-measures anyway.
+        """
+        if not ms.claim_arm():
+            return jsonify(ok=False, error="the arm is busy"), 409
+        ms.stop_flag.clear()
+        with lock:
+            tstate["running"] = True
+
+        def go():
+            done, failed = 0, 0
+            try:
+                # One scan first, from the look pose, so the map has everything before
+                # the arm starts moving and changing what it can see.
+                tphase("SCAN", "looking over the bench before starting")
+                ms.goto_smooth(ms._clamp_joints(np.array(ms.HOME, np.float64)),
+                               settle=0.25, step=2.8)
+                for _ in range(6):
+                    ms.checkpoint()
+                    _cap_now(None, None)
+                    time.sleep(0.12)
+                todo = [t for t in tubes()]
+                names = ", ".join("#%d %s" % (t["id"], t["colour"]) for t in todo)
+                tsay(f"        {len(todo)} tube(s) on the map: {names}")
+                for slot, t in enumerate(todo):
+                    ms.checkpoint()
+                    if slot >= DROP_SLOTS:
+                        tsay(f"        the drop row holds {DROP_SLOTS}; stopping there")
+                        break
+                    tphase("PICK", f"tube #{t['id']} ({t['colour']}), "
+                                   f"{slot+1} of {len(todo)}")
+                    ep = episodes.start("tube_pick", f"{t['colour']} tube",
+                                        arm=ms.ARM.name, simulated=False, slot=slot)
+                    try:
+                        detail = cap_pick(t["colour"], tuple(t.get("uv") or ()) or None)
+                        detail = place_right(t["colour"], slot)
+                        with lock:
+                            if t["id"] in tube_map:
+                                tube_map[t["id"]]["picked"] = True
+                        done += 1
+                        episodes.end(ep, True, detail)
+                    except Exception as e:
+                        failed += 1
+                        tsay(f"        tube #{t['id']}: {type(e).__name__}: {e}")
+                        episodes.end(ep, False, f"{type(e).__name__}: {e}")
+                        try:
+                            ms.send_joints(ms.observe(False)[0],
+                                           gripper=float(ms.ARM.gripper.open_pct))
+                        except Exception:
+                            pass
+                    # back up to the look pose before the next one, so the map's
+                    # remembered position is approached from the same vantage it was
+                    # measured from.
+                    ms.goto_smooth(ms._clamp_joints(np.array(ms.HOME, np.float64)),
+                                   settle=0.20, step=2.8)
+                tphase("DONE" if failed == 0 else "PARTIAL",
+                       f"{done} placed, {failed} failed")
+            except Exception as e:
+                tphase("FAILED", f"{type(e).__name__}: {e}")
+            finally:
+                ms.release_arm()
+                with lock:
+                    tstate["running"] = False
+
+        threading.Thread(target=go, daemon=True).start()
+        return jsonify(ok=True)
+
+    @app.route("/clearmap", methods=["POST"])
+    def r_clearmap():
+        with lock:
+            tube_map.clear()
+            next_id[0] = 1
+        tsay("map cleared")
+        return jsonify(ok=True)
 
     @app.route("/rack", methods=["POST"])
     def r_rack():

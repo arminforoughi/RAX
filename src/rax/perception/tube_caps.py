@@ -93,10 +93,25 @@ MIN_VAL = 85
 #: bleeding into the cap, so the limit is generous, but a 198x96 smear of bench is not a
 #: cap in any orientation.
 MAX_ASPECT = 3.2
-#: Area bounds in px at this camera's 640x480. The smallest real cap measured ~320 px;
-#: the gripper's tape blob measured 3872.
+
+#: Smallest blob worth calling a cap, px. The smallest real one measured ~320.
 MIN_AREA = 150.0
-MAX_AREA = 3200.0
+
+#: Largest. AND IT HAS TO BE BIG, because a cap's apparent area is a function of RANGE
+#: and the whole point of an approach is to reduce the range.
+#:
+#: This was 3200, measured when the cap read 40x48 px from 25 cm away. That number is a
+#: measurement of one viewing distance, not of a cap, and using it as a gate meant the
+#: detector threw the cap away exactly as the arm got close enough to grasp it: measured
+#: mid-approach at 55x66 = 2679 px and still growing, so one more increment crossed the
+#: limit and the box vanished. The arm then held, lost track, and closed over the tube's
+#: BODY instead of its cap — which is what an operator sees as "it grabbed the tail".
+#:
+#: Nothing needs this bound to be tight. The gripper is rejected on VALUE (it sits at
+#: V ~ 44 against a gate of 85), the bench on SATURATION (12-40 against 160), and a
+#: smear on aspect. This only has to stop a whole frame of something saturated from
+#: reading as one cap, so it is set at a fifth of the frame.
+MAX_AREA = 60000.0
 
 
 def find_caps(bgr, *, exclude: tuple = (), exclude_r: float = 0.0,
