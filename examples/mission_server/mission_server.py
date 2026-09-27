@@ -5634,30 +5634,10 @@ def status():
     return jsonify(s)
 
 
-def _decimate(V, F, voxel):
-    """Voxel-cluster a dense STL down to something a browser can draw. Snaps verts
-    to a `voxel`-sized grid, drops the triangles that collapse, dedupes. Keeps the
-    true silhouette (and the gap between the jaws) — unlike a convex hull."""
-    key = np.floor(V / voxel).astype(np.int64)
-    _uniq, inv = np.unique(key, axis=0, return_inverse=True)
-    n = len(_uniq)
-    Vn = np.zeros((n, 3), np.float64)
-    cnt = np.zeros(n, np.float64)
-    np.add.at(Vn, inv, V)
-    np.add.at(cnt, inv, 1.0)
-    Vn /= np.maximum(cnt, 1.0)[:, None]
-    Fn = inv[F]
-    ok = (Fn[:, 0] != Fn[:, 1]) & (Fn[:, 1] != Fn[:, 2]) & (Fn[:, 0] != Fn[:, 2])
-    Fn = Fn[ok]
-    # Dedupe WITHOUT destroying winding. Sorting the 3 indices inside a face (the
-    # obvious way to dedupe) scrambles its orientation, so half the normals end up
-    # pointing inward and the shading goes random light/dark — that is what made
-    # the robot look like transparent shattered glass. Rotate each face so its
-    # smallest index leads: that is canonical for dedupe AND preserves cyclic order.
-    roll = np.argmin(Fn, axis=1)
-    idx = (np.arange(3)[None, :] + roll[:, None]) % 3
-    Fn = np.unique(np.take_along_axis(Fn, idx, axis=1), axis=0)
-    return Vn, Fn
+# _decimate lived here and now lives in rax.robots.urdf_visuals.decimate, which
+# the /urdf route calls through link_visuals. Moved rather than copied: the
+# winding-preserving dedupe in it is subtle enough that two copies would drift,
+# and the tube server needs the identical behaviour for the identical reason.
 
 
 # The moving jaw is NOT part of the FK chain to gripper_frame_link, so its pose
@@ -5674,25 +5654,30 @@ _urdf_payload = [None]
 
 @app.route("/urdf")
 def urdf_route():
-    """The ACTUAL lerobot URDF visual meshes (SO101/so101_new_calib.urdf ->
-    assets/*.stl), decimated once and sent to the browser in LINK-LOCAL coords.
+    """This arm's URDF visual geometry, decimated once, in LINK-LOCAL coords.
     /geom then streams a 4x4 per link, so the page draws the real robot instead
-    of the stick figure it used to draw from bare link origins."""
+    of the stick figure it used to draw from bare link origins.
+
+    NOW VIA rax.robots.urdf_visuals, which is the same loader the tube server uses.
+    It was a private mesh-only path here, and the X250 is what showed that to be a
+    limitation rather than a detail: that arm has no meshes and describes itself in
+    <box> and <cylinder>, so a mesh-only loader returns nothing for it and the viewer
+    drops to the stick figure the meshes were added to replace. The shared version
+    tessellates primitives AND loads STLs, so one route draws either arm.
+    """
     if _urdf_payload[0] is None:
         try:
-            from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-            meshes = load_link_visual_meshes_cached(ARM.mesh_path) or {}
-            out = []
-            for name, (V, F) in meshes.items():
-                Vd, Fd = _decimate(np.asarray(V, np.float64), np.asarray(F, np.int64), 0.006)
-                out.append({"name": name,
-                            "v": [round(float(x), 4) for x in Vd.ravel()],
-                            "f": [int(i) for i in Fd.ravel()]})
+            from rax.robots.urdf_visuals import link_visuals
+            out = [{"name": name,
+                    "v": [round(float(x), 4) for x in V.ravel()],
+                    "f": [int(i) for i in F.ravel()]}
+                   for name, (V, F) in link_visuals(ARM.urdf_path,
+                                                    mesh_dir=ARM.mesh_path).items()]
             _urdf_payload[0] = out
-            say(f"URDF viewer meshes: {sum(len(l['f']) // 3 for l in out)} tris "
+            say(f"URDF viewer geometry: {sum(len(l['f']) // 3 for l in out)} tris "
                 f"across {len(out)} links")
         except Exception as e:
-            say(f"URDF viewer meshes failed: {type(e).__name__}: {e}")
+            say(f"URDF viewer geometry failed: {type(e).__name__}: {e}")
             _urdf_payload[0] = []
     return jsonify(links=_urdf_payload[0])
 
