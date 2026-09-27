@@ -333,15 +333,17 @@ def start(ms, port: int = 8486) -> None:
 
 
     # ---- the pick: look, go over, square up, put the cap in the grid --------------
-    #: Fingertip height while travelling over the table, metres.
-    HOVER_Z = 0.13
     #: Fingertip height at the grasp. A tube lying down puts its centre one radius up,
     #: and the jaws close AROUND it, so the tip wants to arrive level with that centre
     #: rather than on the table. 8mm is the tube's own radius.
     GRASP_Z = 0.010
     #: How many increments the creep takes. Twelve at ~1cm each is a walk, not a dive,
     #: and every one of them re-measures the cap first.
-    N_CREEP = 12
+    #: pick.py aims to 150px before approaching. Same here: the point is only to get the
+    #: tube off the edge of the picture, not to line it up -- the approach does that.
+    AIM_TOL_PX, AIM_STEPS = 150.0, 8
+    #: Increments in the approach. Each one looks first.
+    N_APPROACH = 10
     #: pick.py's, and this rig's own [grip] log agrees with it: across 13 trials the
     #: target read <=67px from the grip centre on every pick that worked.
     GRASP_RADIUS_PX = 70.0
@@ -394,10 +396,6 @@ def start(ms, port: int = 8486) -> None:
             time.sleep(0.15)
         return None
 
-    def z_now(ms):
-        """Current fingertip height, metres."""
-        return float(ms._tip(ms.observe(False)[0])[2])
-
     def _table_xy(uv):
         """Cast a pixel onto the table plane -> base-frame (x, y), or None."""
         try:
@@ -408,48 +406,58 @@ def start(ms, port: int = 8486) -> None:
         return None if pt is None else (float(pt[0]), float(pt[1]))
 
     def cap_pick(colour, uv_hint):
-        """Pick a tube by its cap. Four stages, and no detector network anywhere.
+        """Pick a tube by its cap, in pick.py's order: LOOK, AIM, PROBE, APPROACH, GRASP.
 
-        LOOK -> OVER -> SQUARE -> GRID, which is the sequence the operator asked for and
-        also the one pick.py uses on the X250. What it replaces is a base sweep that
-        searched for a YOLO label: on this bench that mapped ten objects and no tubes
-        with the broad vocabulary, found one of two with a targeted query, and spent a
-        minute of arm motion doing it. The cap detector sees both tubes in the frame the
-        arm is already looking at.
+        THE ORDER IS THE ALGORITHM, and getting it wrong is what every failed run here
+        had in common. Written out, with what each stage is protecting against:
 
-        EVERY CORRECTION IS METRIC, VIA THE TABLE PLANE, and that is what makes the grid
-        stage exact rather than a tuned gain. The cap's pixel and the grip centre's pixel
-        are both cast onto the table through the calibrated hand-eye transform, and the
-        difference between those two points IS the distance the tip must move. No pixels
-        per centimetre to measure, no gain to drift: the same transform that reprojects
-        this rig's fingertip to 0px does the whole job.
+          LOOK     go UP first, retracted, not reached out. From the look pose the whole
+                   bench is in frame; from wherever the arm happened to stop, it is not.
+          AIM      turn the BASE ONLY until the cap is near the jaws horizontally. Skip
+                   this and the approach starts with the tube at the edge of the picture,
+                   where the first small move pushes it out of view entirely -- observed,
+                   with the cap 183px off at x=623 in a 640-wide frame, lost on step two
+                   and held for the remaining four.
+          PROBE    measure which way the base moves the cap. A wrong sign hides under
+                   detector noise while steering the arm steadily the wrong way.
+          APPROACH move toward the tube in small increments, LOOKING BEFORE EACH ONE, and
+                   correcting the bearing as it goes. Stop when the cap's box is in the
+                   jaw cells and the hand is low enough.
+          GRASP    close, and only claim a tube if the evidence supports one.
+
+        WHAT THE IMAGE IS ALLOWED TO MOVE: the bearing, and nothing else. Turning the
+        base swings the hand ACROSS the target; correcting the tip in x and y reaches the
+        arm OUT, and told to close a few centimetres of image error that drives the arm
+        forward past the tube. The radius comes from the fix and the height from the
+        profile.
         """
-        q0 = ms.observe(False)[0].astype(float)
-        j5 = float(q0[ms.ARM.roll_joint])
+        # ---- LOOK: go up, and see the whole bench ---------------------------------
+        tphase("LOOK", "going up to the look pose")
+        ms.goto_smooth(ms._clamp_joints(np.array(ms.HOME, np.float64)),
+                       settle=0.30, step=2.0)
+        j5 = float(ms.observe(False)[0][ms.ARM.roll_joint])
 
-        # ---- LOOK -----------------------------------------------------------------
-        tphase("LOOK", f"finding the {colour} cap")
-        cap = _cap_now(uv_hint, colour)
+        cap = _cap_now(uv_hint or None, colour)
         if cap is None:
-            raise RuntimeError(f"no {colour} cap in view")
+            raise RuntimeError(f"no {colour} cap in view from the look pose")
+        last_uv = [(cap["x"], cap["y"])]
         xy = _table_xy((cap["x"], cap["y"]))
         if xy is None:
             raise RuntimeError("could not cast the cap onto the table plane")
-        tsay(f"        cap at ({cap['x']:.0f},{cap['y']:.0f})px -> "
+        tsay(f"        {colour} cap at ({cap['x']:.0f},{cap['y']:.0f})px -> "
              f"({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm, r={math.hypot(*xy)*100:.1f}cm")
 
+        AIM = ms.jaw_frame().centre_uv
+
         # ---- PROBE: which way does the base move the cap? -------------------------
-        # MEASURED, NOT ASSUMED. Which way the cap slides when the base turns depends on
-        # how the camera is mounted, and a wrong sign hides under detector noise while
-        # steering the arm steadily the wrong way. pick.py probes for it; so does this.
         tphase("PROBE", "measuring which way the base moves the cap")
         sign_base = 0.0
-        q_probe = ms.observe(False)[0].astype(float)
+        q0 = ms.observe(False)[0].astype(float)
         u0 = cap["x"]
-        for nudge in (3.0, -5.0, 7.0):
+        for nudge in (4.0, -7.0, 10.0):
             ms.checkpoint()
-            q = q_probe.copy()
-            q[ms.ARM.pan_joint] = float(np.clip(q_probe[ms.ARM.pan_joint] + nudge,
+            q = q0.copy()
+            q[ms.ARM.pan_joint] = float(np.clip(q0[ms.ARM.pan_joint] + nudge,
                                                 ms.J_LO[ms.ARM.pan_joint],
                                                 ms.J_HI[ms.ARM.pan_joint]))
             ms.goto_smooth(ms._clamp_joints(q), settle=0.25, step=2.0)
@@ -461,85 +469,86 @@ def start(ms, port: int = 8486) -> None:
                      f"-> sign {sign_base:+.0f}")
                 break
             tsay(f"        base {nudge:+.0f}deg moved the cap under the noise floor")
-        ms.goto_smooth(ms._clamp_joints(q_probe), settle=0.25, step=2.0)
-        cap = _cap_now(last_uv[0], colour) or cap
+        ms.goto_smooth(ms._clamp_joints(q0), settle=0.25, step=2.0)
         if sign_base == 0.0:
-            tsay("        could not measure the base direction — creeping without "
-                 "a bearing correction")
+            raise RuntimeError("could not measure which way the base moves the cap")
 
-        # ---- SQUARE, a nudge only -------------------------------------------------
-        tphase("SQUARE", "turning the jaws across the tube")
-        if not TUBE_YAW_ALIGN:
-            tsay("        tube yaw alignment is off — holding the wrist where it is")
-        elif cap.get("angle") is None or not cap.get("confident"):
-            tsay("        the tube's angle is not confidently measured — "
-                 "holding the wrist rather than guessing")
-        elif (cap["elong"] or 0.0) < TUBE_ROLL_MIN_ELONGATION:
-            tsay(f"        elongation {cap['elong']:.1f} is under "
-                 f"{TUBE_ROLL_MIN_ELONGATION:.1f} — not worth rolling on")
-        else:
+        # ---- AIM: base only, until the cap is near the jaws horizontally ----------
+        tphase("AIM", "turning the base to bring the cap across")
+        for n in range(AIM_STEPS):
+            ms.checkpoint()
+            c = _cap_now(last_uv[0], colour)
+            if c is None:
+                tsay(f"        aim {n+1}: cap not in view — holding")
+                time.sleep(0.25)
+                continue
+            last_uv[0] = (c["x"], c["y"])
+            ex = AIM[0] - c["x"]
+            tsay(f"        aim {n+1}: cap x={c['x']:.0f} vs jaws x={AIM[0]:.0f} "
+                 f"-> dx {ex:+.0f}px")
+            if abs(ex) < AIM_TOL_PX:
+                tsay(f"        aimed, {abs(ex):.0f}px < {AIM_TOL_PX:.0f}px")
+                break
+            q = ms.observe(False)[0].astype(float)
+            d_pan = math.copysign(min(abs(ex) / 14.0, 6.0), ex * sign_base)
+            q[ms.ARM.pan_joint] = float(np.clip(q[ms.ARM.pan_joint] + d_pan,
+                                                ms.J_LO[ms.ARM.pan_joint],
+                                                ms.J_HI[ms.ARM.pan_joint]))
+            ms.goto_smooth(ms._clamp_joints(q), settle=0.20, step=2.0)
+
+        # Re-fix now that the tube is in front of the camera rather than off to one side.
+        c = _cap_now(last_uv[0], colour)
+        if c is not None:
+            xy2 = _table_xy((c["x"], c["y"]))
+            if xy2 is not None:
+                tsay(f"        re-fixed after aiming: ({xy2[0]*100:+.1f},"
+                     f"{xy2[1]*100:+.1f})cm, r={math.hypot(*xy2)*100:.1f}cm")
+                xy, cap = xy2, c
+                last_uv[0] = (c["x"], c["y"])
+
+        # ---- SQUARE: a nudge, only on a confident axis ----------------------------
+        if TUBE_YAW_ALIGN and cap.get("confident") and \
+                (cap.get("elong") or 0.0) >= TUBE_ROLL_MIN_ELONGATION:
             jg = ms.jaw_frame()
             err = _fold(cap["angle"] - (jg.axis_deg + 90.0))
             gain = float(getattr(jg, "roll_gain", 1.0)) or 1.0
-            tsay(f"        axis {cap['angle']:+.0f}deg (elongation {cap['elong']:.1f}), "
-                 f"jaws {jg.axis_deg:+.0f}deg -> {err:+.0f}deg out of square")
-            if abs(err) < float(ms.CFG.yaw_deadband_deg):
-                tsay(f"        square within {err:+.1f}deg — leaving the wrist")
-            else:
+            if abs(err) >= float(ms.CFG.yaw_deadband_deg):
+                tphase("SQUARE", "turning the jaws across the tube")
                 step = float(np.clip(err / gain, -TUBE_MAX_ROLL_DEG, TUBE_MAX_ROLL_DEG))
                 lo, hi = ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]
-                j5_new = float(np.clip(j5 + step, lo, hi))
-                tsay(f"        rolling {step:+.0f}deg ({j5:+.0f} -> {j5_new:+.0f})")
+                j5 = float(np.clip(j5 + step, lo, hi))
+                tsay(f"        tube {cap['angle']:+.0f}deg, jaws {jg.axis_deg:+.0f}deg "
+                     f"-> rolling {step:+.0f}deg")
                 q = ms.observe(False)[0].astype(float)
-                q[ms.ARM.roll_joint] = j5_new
+                q[ms.ARM.roll_joint] = j5
                 ms.goto_smooth(ms._clamp_joints(q), settle=0.30, step=2.0)
-                j5 = j5_new
 
-        # ---- CREEP UP TO IT. Do not jump over it and drop. ------------------------
-        #
-        # THERE IS NO "MOVE ABOVE THE TUBE" STEP ANY MORE, and removing it is the fix.
-        # It used to reach the tip to the tube's computed position in ONE move and then
-        # descend from there, which is an extra extension made blind on a single
-        # table-plane cast -- taken down a shallow sightline, where that cast's error is
-        # largest. If the range read long, the arm was already past the tube before the
-        # first look of the descent, and no amount of correcting afterwards brings it
-        # back: the descent only ever went down.
-        #
-        # Instead the reach and the height close TOGETHER, in small steps, and the cap is
-        # re-measured before every one. The arm walks up to the tube rather than arriving
-        # over it, so the tube stays in the picture the whole way in.
-        #
-        # AND THE STOP CONDITION IS THE GRID, NOT THE ARITHMETIC. The interpolation says
-        # where the last step would land; the jaw cells say when to stop. Whichever comes
-        # first wins, so a range estimate that reads long costs an early stop rather than
-        # a drive past the target.
-        tphase("APPROACH", "creeping up to the tube, keeping it in view")
+        # ---- APPROACH: move toward it, looking before every step ------------------
+        tphase("APPROACH", "moving toward the tube, box into the jaw cells")
         tip0 = ms._tip(ms.observe(False)[0])
         r0, z0 = float(math.hypot(tip0[0], tip0[1])), float(tip0[2])
         r_goal = float(math.hypot(xy[0], xy[1]))
         bearing = math.degrees(math.atan2(xy[1], xy[0]))
-        tsay(f"        from r={r0*100:.1f}cm z={z0*100:.1f}cm "
-             f"to r={r_goal*100:.1f}cm z={GRASP_Z*100:.1f}cm, in {N_CREEP} steps")
+        tsay(f"        r {r0*100:.1f} -> {r_goal*100:.1f}cm, "
+             f"z {z0*100:.1f} -> {GRASP_Z*100:.1f}cm in {N_APPROACH} steps")
 
-        AIM = ms.jaw_frame().centre_uv
         misses, last_dist, reached = 0, None, False
-        for step in range(N_CREEP):
+        for step in range(N_APPROACH):
             ms.checkpoint()
-            # LOOK FIRST, THEN MOVE. The other order advances an increment and only then
-            # checks, so a lost detection keeps reaching -- pick.py records an arm that
-            # carried on through five "not in view" steps and finished forward of the
-            # tube with nothing in the jaws.
+            a = (step + 1) / N_APPROACH
+            # LOOK FIRST. The other order advances an increment and only then checks, so
+            # a lost detection keeps reaching: pick.py records an arm that carried on
+            # through five "not in view" steps and finished forward of the tube.
             c = _cap_now(last_uv[0], colour)
-            a = (step + 1) / N_CREEP
+            z_is = float(ms._tip(ms.observe(False)[0])[2])
             if c is None:
                 misses += 1
-                if last_dist is not None and last_dist < 170 and a >= 0.7:
+                if last_dist is not None and last_dist < 170 and z_is <= GRASP_Z + 0.03:
                     tsay(f"        the cap passed under the jaws at {last_dist:.0f}px, "
-                         f"{100*a:.0f}% in — finishing")
+                         f"z={z_is*100:.1f}cm — finishing")
                     reached = True
                     break
-                tsay(f"        {step+1:2d}: cap not in view — HOLDING, not advancing "
-                     f"({misses}/4)")
+                tsay(f"        {step+1:2d}: cap not in view — HOLDING ({misses}/4)")
                 if misses >= 4:
                     break
                 time.sleep(0.25)
@@ -549,28 +558,31 @@ def start(ms, port: int = 8486) -> None:
             ex, ey = AIM[0] - c["x"], AIM[1] - c["y"]
             dist = float(math.hypot(ex, ey))
             last_dist = dist
-            in_grip = ms.GRID.in_grip((c["x"], c["y"]), jg_now := ms.jaw_frame())
-            tsay(f"        {step+1:2d}/{N_CREEP}: cap {ms.GRID.cell_of((c['x'], c['y']))}"
-                 f" -> jaws {ms.GRID.cell_of(AIM)}  dx {ex:+.0f} dy {ey:+.0f} "
-                 f"dist {dist:.0f}px{'  IN GRIP' if in_grip else ''}")
+            jg = ms.jaw_frame()
+            # THE BOX, not just the centroid: the cap is 40px across and the question is
+            # whether it is BETWEEN the fingers, which a box can answer and a point
+            # cannot when it sits on a cell boundary.
+            corners = [(c["bbox"][0], c["bbox"][1]), (c["bbox"][2], c["bbox"][1]),
+                       (c["bbox"][0], c["bbox"][3]), (c["bbox"][2], c["bbox"][3])]
+            in_grip = (ms.GRID.in_grip((c["x"], c["y"]), jg)
+                       or any(ms.GRID.in_grip(k, jg) for k in corners))
+            tsay(f"        {step+1:2d}/{N_APPROACH}: box "
+                 f"{ms.GRID.cell_of((c['x'], c['y']))} -> jaws {ms.GRID.cell_of(AIM)}  "
+                 f"dx {ex:+.0f} dy {ey:+.0f} d {dist:.0f}px  z {z_is*100:.1f}cm"
+                 f"{'  IN GRIP' if in_grip else ''}")
 
-            # STOP WHEN IT IS IN THE GRIP AND LOW ENOUGH. Both, because image alignment
-            # fixes the bearing and says nothing about height: pick.py logged a run that
-            # converged to 7px at 41% and closed on air above the tube.
-            low_enough = z_now(ms) <= GRASP_Z + 0.02
-            if (in_grip or dist < GRASP_RADIUS_PX) and low_enough:
-                tsay(f"        in the jaws ({dist:.0f}px) and down at "
-                     f"{z_now(ms)*100:.1f}cm — closing")
+            if in_grip and z_is <= GRASP_Z + 0.02:
+                tsay(f"        box is in the jaw cells and the hand is down at "
+                     f"{z_is*100:.1f}cm — closing")
                 reached = True
                 break
 
-            # bearing only, pick.py's gain, shrinking as it closes in
+            # bearing only, on pick.py's shrinking gain
             scale = 1.0 + 1.1 * a
-            if abs(ex) > 30 and sign_base != 0.0:
+            if abs(ex) > 30:
                 mag = float(np.clip(abs(ex) / (14.0 * scale), 0.4, 3.2 / scale))
                 bearing += math.copysign(mag, ex * sign_base)
 
-            # reach and height together, and NEVER past the goal
             r = min(r0 + (r_goal - r0) * a, r_goal)
             z = z0 + (GRASP_Z - z0) * a
             tgt = np.array([r * math.cos(math.radians(bearing)),
@@ -580,23 +592,33 @@ def start(ms, port: int = 8486) -> None:
                      f"closing from here")
                 break
 
-        if not reached and last_dist is not None:
-            tsay(f"        finished the creep {last_dist:.0f}px from the jaws — closing "
-                 f"anyway; the episode records how far off it was")
-
-        # ---- CLOSE ----------------------------------------------------------------
+        # ---- GRASP ----------------------------------------------------------------
         tphase("GRASP", "closing across the tube")
         held, idle = ms.close_with_current(step=4.0, delay=0.08)
         tsay(f"        {'CONTACT' if held else 'NO CONTACT'} (idle current {idle:.0f})")
+
+        # DO NOT CLAIM A TUBE THE EVIDENCE DOES NOT SUPPORT. A previous run reported
+        # SUCCESS with the cap 218px from the jaws: the idle current had read 0, so the
+        # contact test compared against nothing and any draw at all tripped it. Two
+        # guards, and each catches what the other misses.
+        if idle <= 0.5:
+            raise RuntimeError(
+                f"the gripper's idle current read {idle:.1f}, so the contact test had "
+                f"nothing to compare against — refusing to call this a grasp")
         if not held:
-            return "closed on nothing"
+            raise RuntimeError("closed on nothing")
+        if last_dist is not None and last_dist > 2.0 * GRASP_RADIUS_PX:
+            raise RuntimeError(
+                f"the jaws closed, but the cap was last seen {last_dist:.0f}px away — "
+                f"further than {2.0*GRASP_RADIUS_PX:.0f}px, so whatever is between them "
+                f"is not this tube")
+
         ms._set_carry(True, label=f"{colour} tube", h_m=TUBE_D_M)
         tphase("LIFT", "lifting clear")
         tip = ms._tip(ms.observe(False)[0])
-        ms._move_tip(np.array([tip[0], tip[1], HOVER_Z]), GRASP_PITCH, j5,
+        ms._move_tip(np.array([tip[0], tip[1], z0]), GRASP_PITCH, j5,
                      settle=0.22, step=1.2)
-        return f"holding the {colour} tube"
-
+        return f"holding the {colour} tube ({last_dist:.0f}px at the close)"
 
     def _fold(deg, period=180.0):
         return ((float(deg) + period / 2.0) % period) - period / 2.0
