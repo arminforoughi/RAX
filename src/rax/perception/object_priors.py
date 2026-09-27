@@ -122,6 +122,16 @@ _CLASS_TABLE = {
     "toothbrush":    ("cuboid",   0.015, 0.19,  0.015),
     # --- handy extras that are not COCO but come up on this table ---
     "pen":           ("cuboid",   0.010, 0.14,  0.010),
+    # --- lab tubes, the X250 bench's objects ---
+    # A blood-collection tube: ~16mm across, ~100mm long, standing or lying. Without an
+    # entry here every one of them fell back to DEFAULT_EDGE_M (5.08cm, a cube), and
+    # apparent-size ranging divides by that number -- so a tube 16mm wide reported
+    # itself about three times further away than it is, which is the same failure that
+    # makes the pen unpickable. A prior is not a detail here, it is the scale.
+    "test tube":     ("cylinder", 0.016, 0.016, 0.100),
+    "tube":          ("cylinder", 0.016, 0.016, 0.100),
+    "vial":          ("cylinder", 0.016, 0.016, 0.100),
+    "sample tube":   ("cylinder", 0.016, 0.016, 0.100),
     "pencil":        ("cuboid",   0.008, 0.17,  0.008),
     "marker":        ("cylinder", 0.017, 0.017, 0.14),
     "eraser":        ("cuboid",   0.022, 0.055, 0.012),
