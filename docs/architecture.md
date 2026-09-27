@@ -4,7 +4,7 @@ The stack is **four seams and the algorithms between them**. This document is th
 current state — what the seams are, why each one is where it is, and what is still
 wrong. For the step-by-step "how do I run this on my robot", see
 [porting.md](porting.md). For the history of how the monolith was broken up, see
-[mission_server_modularization.md](mission_server_modularization.md).
+[examples/mission_server/modularization.md](../examples/mission_server/modularization.md).
 
 ---
 

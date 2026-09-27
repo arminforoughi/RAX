@@ -17,6 +17,8 @@ Contents:
 from rax.manipulation.approach.config import KNOBS, ApproachConfig, Knob
 from rax.manipulation.approach.derive import (
     align_tolerance_px,
+    grasp_aim_offset_px,
+    grasp_bias_m,
     grasp_height,
     hover_height,
     right_trim_for_visibility,
@@ -27,6 +29,7 @@ from rax.manipulation.approach.geometry import (
     push_out_radial,
     shift_right,
     stage_step,
+    stage_trim,
 )
 from rax.manipulation.approach.visual_center import (
     CenteringOps,
@@ -37,8 +40,8 @@ from rax.manipulation.approach.visual_center import (
 __all__ = [
     "ApproachConfig", "Knob", "KNOBS",
     "approach_target", "shift_right", "push_out_radial", "stage_step",
-    "cap_reach",
+    "cap_reach", "stage_trim",
     "center_on_object", "CenteringOps", "CenteringResult",
-    "grasp_height", "hover_height", "align_tolerance_px",
+    "grasp_height", "hover_height", "align_tolerance_px", "grasp_aim_offset_px", "grasp_bias_m",
     "right_trim_for_visibility",
 ]

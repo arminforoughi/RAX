@@ -191,3 +191,62 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- fitting from samples gathered during ordinary operation --------------------------
+# The operator-in-the-loop procedure is correct and nobody runs it. A successful grasp is
+# already the same measurement — FK says where the object was, the localizer said where
+# it looked to be — so every pick can be a calibration sample. But those samples are
+# taken THROUGH whatever corrections are dialled in at the time, so the fit must undo
+# them or it measures the residual error and then gets applied on top of the correction
+# that produced it, double-counting and oscillating.
+
+
+def test_unapply_is_the_exact_inverse_of_apply():
+    m = LocalizationModel(range_scale=1.06, push_out_m=0.02, bearing_offset_deg=-7.5)
+    for xy in ([0.30, 0.10], [-0.25, 0.35], [0.42, -0.05], [0.18, 0.0]):
+        back = m.unapply(m.apply(xy))
+        assert np.allclose(back, xy, atol=1e-9), (xy, back)
+
+
+def test_unapply_of_the_identity_changes_nothing():
+    m = LocalizationModel()
+    xy = np.array([0.31, -0.12])
+    assert np.allclose(m.unapply(xy), xy)
+
+
+def test_a_fit_from_corrected_samples_recovers_the_absolute_error():
+    """The scenario that makes an automatic loop safe to run twice.
+
+    Round 1 fits a correction and applies it. Round 2's samples are then observed
+    THROUGH that correction. Undoing it first must recover the same absolute model,
+    not a second correction stacked on the first.
+    """
+    truth = LocalizationModel(range_scale=1.10, push_out_m=0.03,
+                              bearing_offset_deg=6.0)
+    # Where things really are, and what an UNCORRECTED rig would report for them.
+    trues = [np.array([r * np.cos(np.radians(b)), r * np.sin(np.radians(b))])
+             for r in (0.22, 0.30, 0.38, 0.44) for b in (-30.0, 0.0, 25.0)]
+    raws = [truth.unapply(t) for t in trues]          # the rig's raw observation
+
+    # Round 1: nothing dialled in, so the observation IS the raw one.
+    r1 = fit_localization([LocalizationSample(t, o) for t, o in zip(trues, raws)])
+    assert r1.trustworthy, r1.warnings
+    assert abs(r1.model.range_scale - truth.range_scale) < 0.02
+    assert abs(r1.model.bearing_offset_deg - truth.bearing_offset_deg) < 1.0
+
+    # Round 2: the fit is live, so the localizer now reports the CORRECTED position.
+    live = r1.model
+    corrected = [live.apply(o) for o in raws]
+    # Undo it the way _selfcal_load_samples does before fitting.
+    undone = [live.unapply(c) for c in corrected]
+    r2 = fit_localization([LocalizationSample(t, o) for t, o in zip(trues, undone)])
+    assert abs(r2.model.range_scale - truth.range_scale) < 0.02, (
+        "round 2 must recover the SAME absolute model, not stack a second correction")
+    assert abs(r2.model.bearing_offset_deg - truth.bearing_offset_deg) < 1.0
+
+    # And the failure this prevents: fitting the corrected samples WITHOUT undoing.
+    naive = fit_localization([LocalizationSample(t, c)
+                              for t, c in zip(trues, corrected)])
+    assert abs(naive.model.range_scale - truth.range_scale) > 0.05, (
+        "the fixture no longer demonstrates the double-counting it guards against")

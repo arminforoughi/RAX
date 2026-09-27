@@ -72,14 +72,21 @@ def test_so101_named_poses_and_gripper():
     # the idle pose "look higher", but that was judged against a wrist frame still 45 deg
     # out of calibration; once the frame was corrected, 13.2 pointed the camera at the
     # room and left the idle 2D map empty. 33.2 (pitch 24.9) is the table-viewing pose.
-    assert p.home_deg == (-14.1, -99.1, 90.8, 33.2, -4.7)
+    # Trailing roll -4.7 -> 104.6 on 2026-09-09: a POSE change, measured off the joint
+    # with torque cut on id 5 alone, not a recalibration. The survey keeps its own -4.7
+    # (asserted below), which is the point of the two being separate constants.
+    assert p.home_deg == (-14.1, -99.1, 90.8, 33.2, 104.6)
     assert p.view_deg == (5.0, 37.1, 48.1, -40.4, 90.0)
-    # SURVEY_TILT is pinned to its own constant rather than derived from HOME[1:].
-    # It currently EQUALS home's tilt, and that is the correct value -- but the two are
-    # deliberately separate declarations, because deriving one from the other couples a
-    # cosmetic idle-pose preference to the sightline geometry every range estimate
-    # depends on. Changing home must not silently move where the survey localizes from.
-    assert p.survey_tilt_deg == (-99.1, 90.8, 33.2, -4.7)
+    # SURVEY_TILT is pinned to its own constant rather than derived from HOME[1:],
+    # because deriving one from the other couples a cosmetic idle-pose preference to the
+    # sightline geometry every range estimate depends on. On 2026-08-26 the two stopped
+    # being equal, which is the whole point of the separation: the survey wrist pitch
+    # went 33.2 -> 68.2 to put the camera 27 deg below horizontal instead of 3 deg
+    # above it, and HOME did not move. At 33.2 a full pan sweep saw 40% of the reachable
+    # table and nothing at all inside 30cm.
+    assert p.survey_tilt_deg == (-99.1, 90.8, 68.2, -4.7)
+    assert p.survey_tilt_deg[:2] == p.home_deg[1:3], "survey keeps home's arm shape"
+    assert p.survey_tilt_deg[2] != p.home_deg[3], "only the camera pitch differs"
     assert p.gripper.hand_uv == (440.0, 394.0)
     assert p.camera.eye_in_hand
     assert p.camera.use_depth is False, "the pick stack runs monocular"

@@ -45,7 +45,7 @@ KNOBS: tuple[Knob, ...] = (
     Knob("approach_steps", "steps", 1.0, 1.0, 12.0, integer=True,
          doc="how many staged hops close the distance"),
     Knob("aim_du", "aim_du_px", 1.0, -300.0, 300.0,
-         doc="lateral pixel trim on the fingertip aim point"),
+         doc="EXTRA lateral pixel trim, added to the derived grasp bias"),
     Knob("aim_dv", "aim_dv_px", 1.0, -300.0, 300.0,
          doc="vertical pixel trim on the fingertip aim point"),
     Knob("push_out_cm", "push_out_m", 0.01, -5.0, 30.0,
@@ -54,6 +54,46 @@ KNOBS: tuple[Knob, ...] = (
          doc="multiplier on every estimated range"),
     Knob("bearing_deg", "bearing_offset_deg", 1.0, -180.0, 180.0,
          doc="rotate the mapped bearing, correcting hand-eye heading error"),
+    Knob("survey_pitch_deg", "survey_pitch_deg", 1.0, 0.0, 94.0,
+         doc="wrist pitch the survey looks from; higher points the camera further down"),
+    # --- the FPV visual servo (manipulation/approach/visual_servo.py) --------------
+    # THERE ARE NO GAIN KNOBS HERE ANY MORE, and that is the point. How much each joint
+    # moves the picture is measured into an image Jacobian (approach/jacobian.py) by
+    # moving the joint and looking; it is a property of the robot, so it is not
+    # something to type into a config file. There WERE two such knobs, and the
+    # hand-written sign on one of them was wrong.
+    #
+    # What is left describes the GOAL, which is the operator's business:
+    Knob("servo_stop_px", "servo_stop_height_px", 1.0, 30.0, 460.0,
+         doc="hand off to the grasp once the object's box is this tall"),
+    Knob("servo_grasp_px", "servo_grasp_height_px", 1.0, 60.0, 460.0,
+         doc="close the jaws once the object's box is this tall (the visual descent)"),
+    Knob("servo_parallax_cm", "servo_parallax_cm", 1.0, 1.0, 8.0,
+         doc="how far to step the fingertip when measuring range by parallax"),
+    Knob("grasp_side", "grasp_bias_sign", 1.0, -1.0, 1.0,
+         doc="which side of the object the gripper approaches from (+1 derived, -1 flips)"),
+    Knob("servo_tol_px", "servo_tol_px", 1.0, 3.0, 80.0,
+         doc="how close to the aim pixel counts as lined up"),
+    Knob("grasp_right_cm", "grasp_right_m", 0.01, 0.0, 6.0,
+         doc="how far to the object's RIGHT the fingertip sits at the grasp; "
+             "0 = use the derived half-an-object-width"),
+    Knob("grasp_back_cm", "grasp_back_m", 0.01, -3.0, 5.0,
+         doc="pull every creep arrival back this far radially — the fingertip stops "
+             "slightly PAST the object, not over it"),
+    # --- squaring the jaws to the object (approach/grip_frame.py) ------------------
+    Knob("jaw_offset", "jaw_offset", 1.0, 0.0, 1.0,
+         doc="1 = offset the grasp along the JAWS (follows the wrist roll), 0 = along "
+             "the arm's lateral direction (only correct at a fixed roll)"),
+    Knob("yaw_align", "yaw_align", 1.0, 0.0, 1.0,
+         doc="1 = roll the wrist to square the jaws to the object's face, 0 = hold a "
+             "fixed roll (which loses every yaw whose diagonal exceeds the opening)"),
+    Knob("jaw_axis_deg", "jaw_axis_deg", 1.0, 0.0, 180.0,
+         doc="the jaws' closing direction in the image, degrees; 0 = use the measured "
+             "frame from /caljaw"),
+    Knob("yaw_deadband_deg", "yaw_deadband_deg", 1.0, 0.0, 20.0,
+         doc="leave the wrist alone when the object is this close to square"),
+    Knob("yaw_max_spread_deg", "yaw_max_spread_deg", 1.0, 1.0, 45.0,
+         doc="reject an orientation whose reads scatter by more than this"),
 )
 
 
@@ -65,12 +105,44 @@ class ApproachConfig:
     copying values out of it.
     """
 
+    # --- where the survey looks from ----------------------------------------------
+    # The wrist pitch (SO-101 id4) the survey pose holds. It is the ONE joint that
+    # aims the camera without changing the arm's shape, which is why it is the knob:
+    # everything the survey measures rides on how steeply the sightline meets the
+    # table, so this is the highest-leverage number on the rig and it wants to be
+    # dialled against a live map rather than edited and restarted.
+    #
+    # Measured on the SO-101 with the wrist camera, coverage of the reachable table
+    # (r 18-42cm) across a full pan sweep, counting only views that clear
+    # MIN_TABLE_INCIDENCE:
+    #
+    #     33.2 deg -> camera 3.0 deg ABOVE horizontal, 40% covered, blind inside 30cm
+    #     53.2     -> +14.4 deg down, 91%
+    #     63.2     -> +22.9 deg down, 100%
+    #     68.2     -> +27.1 deg down, 100%   <- centre of the plateau
+    #     78.2     -> +35.3 deg down, 100%
+    #     88.2     -> +43.0 deg down, 96%, and the far edge starts dropping out
+    #
+    # The server overwrites this from the arm profile at startup; the value here is
+    # the fallback for a rig that does not carry one.
+    survey_pitch_deg: float = 68.2
+
     # --- approach staging ---------------------------------------------------------
     # Shift the hover target to the object's RIGHT so it stays on the LEFT of the
     # camera view during the approach and does not disappear under the gripper.
     right_trim_m: float = 0.050
-    # Stop short of the object radially, so the arm does not drive past it.
-    back_m: float = 0.010
+    # Stop short of the object radially, so the arm does not drive past it -- and, more
+    # importantly, so the object is still IN FRAME at the hover.
+    #
+    # Was 0.010. At 1 cm short the object left the camera's view at every single
+    # approach on this rig: the centring servo reported "object not in view", fell back
+    # to the staged estimate, and the final visual correction never ran once. The saved
+    # miss frames show the table and a gripper finger with no object anywhere in them.
+    # That is what made the grasp land on the object's centre and shove it, and it is
+    # also why a badly wrong aim_du sat unnoticed for so long -- the servo it feeds was
+    # never reached. At 4 cm the object stays visible and the servo converges in about
+    # two iterations. Measured 2026-09-06 over repeated picks, both values.
+    back_m: float = 0.040
     # Step 1 closes ~90% of the gap, the rest are small corrections. Tried 2 with a
     # full-distance first move and it missed more: arriving with no margin left means
     # any residual localization error lands as a miss.
@@ -93,6 +165,136 @@ class ApproachConfig:
     # so it is set well outside the localizer's own error and the damping below —
     # not this gate — handles noise.
     max_refine_jump_m: float = 0.12
+
+    # --- the FPV visual servo -------------------------------------------------------
+    # The approach these belong to does not localize the object at all: it steers on
+    # the bounding box in the current frame and stops when there isn't one. The three
+    # fields ABOVE this block (max_refine_jump_m, refine_gain, first_refine_gain) are
+    # the map-first approach's damping, and are what the servo replaces — they remain
+    # only because `place_at` still runs the older staged path.
+    #
+    # HOW the joints move the picture is MEASURED, not configured — see
+    # approach/jacobian.py. What is left here is where the object should end up.
+    #
+    # MEASURED: the approach plateaus around 108px for a 5cm cube on this arm, so 150
+    # was unreachable and 100 fires with margin. The last centimetres are the grasp's
+    # job, from a live measurement taken at the handoff.
+    servo_stop_height_px: float = 100.0
+    # How tall the box is when the gripper is right on the object, i.e. when to close.
+    # Bigger than the handoff size by construction: the descent's whole job is to close
+    # that remaining gap by eye rather than by back-projecting a 3D point.
+    servo_grasp_height_px: float = 190.0
+    # The parallax baseline. Big enough that the box grows well clear of detector
+    # jitter, small enough to keep the object in frame and the local model honest:
+    # measured, 3.6cm took the box 81 -> 100px, a 21% change against ~2px of noise.
+    servo_parallax_cm: float = 3.0
+    # COARSE ON PURPOSE. The object does not need to sit on an exact pixel -- it needs
+    # to be somewhere between the middle of the jaws and their right-hand side, so the
+    # right finger passes around it rather than shoving it. Tight tolerances bought
+    # nothing and cost a long, twitchy approach with dozens of tiny corrections.
+    # WHICH SIDE THE GRIPPER COMES IN ON. derive.grasp_aim_offset_px works out the
+    # offset; this says which way round it goes, because this wrist camera is steeply
+    # rotated and left in the picture is not obviously left in the room.
+    #
+    # +1 (the derived direction) is MEASURED-CORRECT: with it the pick succeeds, and
+    # flipping it to -1 moved the aim column from ~375 to ~530 -- right of the fingertip
+    # instead of left -- and the jaws closed on air. Live-tunable as `grasp_side` if the
+    # camera is ever remounted.
+    grasp_bias_sign: float = 1.0
+    # HOW FAR TO THE OBJECT'S RIGHT THE FINGERTIP FINISHES, in metres. The jaws have to
+    # close AROUND the object, so arriving dead centre means the near finger meets its
+    # face and pushes it. derive.grasp_aim_offset_px works this out as half an object
+    # width (2.5cm for a 5cm cube) and converts it to pixels at the LIVE range, so it is
+    # the same physical distance near or far.
+    #
+    # This overrides that when non-zero, because "go 2-3cm to the right" is a thing an
+    # operator can see and say, and half-an-object-width is a guess about what they
+    # meant. Zero keeps the derived value.
+    # HALF THE JAW OPENING -- the distance from the MARKED FINGERTIP to the middle of
+    # the grip. HAND_UV marks one finger (photographed), so this is not a stylistic
+    # offset, it is the difference between aiming at the gripper and aiming at a part of
+    # the gripper that cannot hold anything. Default non-zero for that reason.
+    grasp_right_m: float = 0.020
+    servo_tol_px: float = 45.0
+    # HOW FAR PAST THE OBJECT THE CREEP STOPS.
+    #
+    # The arrival test is "the object has come down onto the fingertip's row", slackened
+    # by CREEP_TIP_ROW_MARGIN because the jaws hide the object just before it quite gets
+    # there. Both of those bias the same way: the creep keeps advancing a little after
+    # the gripper is over the object, so the fingertip finishes slightly BEYOND it. From
+    # the side that looks like the gripper closing in on the cube's far face, which is
+    # what the operator reported ("it goes too close, adjust like 1 cm back").
+    #
+    # Subtracted radially from EVERY arrival, so the grasp and the destination survey
+    # agree about where an object is -- one number with one meaning. It is not a grasp
+    # trick like the lateral bias, which is why it applies to surveys too.
+    # ZERO NOW, AND THE REASON MATTERS. This existed because the old arrival test fired
+    # when the object crossed the fingertip's image ROW, which happened AFTER the gripper
+    # had already gone past it -- so a centimetre had to be subtracted back off. The
+    # arrival is measured along the sightline now and deliberately stops CREEP_ARRIVE_M
+    # short, so subtracting again just lands the jaws two and a half centimetres behind
+    # the cube. Two corrections for one error, and the second one was invisible because
+    # the log for both looked perfect.
+    # NEGATIVE MEANS FORWARD. The arrival stops when the measured horizontal gap is
+    # inside CREEP_ARRIVE_M, so it deliberately finishes a centimetre or so short -- and
+    # at the shallow angle this arm approaches from, that short-fall lands the jaws on
+    # the near face of the cube rather than around it. The operator watched it and said
+    # so: "when approaching at that angle you need to go 1 cm more forward".
+    #
+    # Kept under the `grasp_back_cm` wire name rather than renamed, because the autotuner
+    # and the UI drive knobs by name; the sign carries the meaning.
+    # 2cm now: "go about 1 cm more forward to grab it", on top of the 1cm already
+    # asked for -- the operator watching the jaws close on the cube's near face.
+    grasp_back_m: float = -0.020
+
+    # --- squaring the jaws to the object -------------------------------------------
+    # WHY THE WRIST HAS TO MOVE AT ALL. A parallel gripper closing on a square presents
+    # a*(|cos t| + |sin t|) across the jaws: 5.1cm square-on for this cube, but 7.2cm
+    # at 45 degrees. Held at a fixed roll, as every pick here did, the yaw the cube
+    # happens to be lying at decides whether the grasp is geometrically possible --
+    # with a ~6.5cm opening, 57% of yaws are not. Those misses look like aiming errors
+    # and are not: the jaws meet two corners and shove the cube.
+    #
+    # The correction is one joint and needs no geometry, because the camera is mounted
+    # AFTER wrist_roll: the jaw line is fixed in the image and rolling spins the scene
+    # under it. Measured +1.00 deg of image rotation per degree of wrist.
+    # The grasp offset has to point along the JAWS, because what it is for is putting
+    # the object between the fingers. That direction is fixed in the gripper, so it
+    # turns with the wrist -- which only started mattering when the wrist started
+    # turning. 0 restores the old lateral direction.
+    # BOTH DEFAULT OFF. Measured on the rig, the wrist alignment made the pick WORSE:
+    # 0 of 6 against a 5-of-10 baseline, scored on the camera's verdict rather than the
+    # gripper current (which called three of those six a success and was overruled at
+    # 100% confidence every time). Two causes, and the second is the one that matters:
+    #
+    #   * the grasp offset did not rotate with the wrist, so squaring the jaws carried
+    #     the object out of the grip. Fixed by jaw_dir_base -- but fixed AFTER that
+    #     batch, so the fix is untested.
+    #   * ROLLING THE WRIST TILTS THE JAWS OUT OF HORIZONTAL. The roll axis is the
+    #     gripper's approach direction, which is pitched 65-75 deg down, not vertical.
+    #     Rolling therefore sweeps the jaw line around a cone up to ~20 deg out of
+    #     plane -- about 1.7cm of height difference across the jaw span, on a 5.1cm
+    #     cube. GRASP_ROLL was chosen because it puts the jaws square to a table cube;
+    #     rolling away from it buys yaw alignment and pays in jaw tilt.
+    #
+    # The geometry that motivated the feature is still real (a fixed wrist cannot close
+    # on 57% of yaws), so the code stays and is one knob away. It does not go back on by
+    # default until a measured A/B says it beats the baseline.
+    jaw_offset: float = 0.0
+    yaw_align: float = 0.0
+    # 0 means "use the frame measured by /caljaw". A number overrides the jaws' closing
+    # direction in the image -- the one quantity here an operator might reasonably want
+    # to trim by eye against the FPV overlay.
+    jaw_axis_deg: float = 0.0
+    # Don't chase the last few degrees. The silhouette angle is worth a couple of
+    # degrees at best, and a wrist that twitches beside a cube is a way to knock it
+    # over; 4 deg costs 0.35cm of extra width on a 5cm cube, which is nothing.
+    yaw_deadband_deg: float = 4.0
+    # An orientation whose reads disagree is not a measurement. Usually means the cube
+    # is seen obliquely enough that a side face is in the silhouette, which twists the
+    # rect toward the viewing direction -- better to keep the current roll than to act
+    # on it.
+    yaw_max_spread_deg: float = 12.0
     # How far to move toward a refined fix, rather than snapping onto it. Damped
     # because a single close-up read is better than the map but not authoritative;
     # over the staged hops this converges (0.3^3 = 3% of the initial error left)
@@ -122,13 +324,55 @@ class ApproachConfig:
     max_refine_out_m: float = 0.03
 
     # --- visual centering ---------------------------------------------------------
-    aim_du_px: float = -45.0
+    # Lateral pixel trim on the aim point. NEGATIVE shifts the aim LEFT in the image,
+    # which drives the arm RIGHT relative to the object.
+    #
+    # -45 -> -140 after the centring servo started converging. The trim is really
+    # compensating for what HAND_UV is: it was measured with /caltip against ONE black
+    # fingertip, not the midpoint between the jaws, so centring the object on it parks
+    # that finger on the object instead of straddling it — observed on hardware as the
+    # right finger sitting in the middle of the cube.
+    #
+    # 95 px is 2 cm at the grasp pose: fx=517, camera ~11 cm off the object, so
+    # fx * 0.02 / 0.11 = 94 px. Cross-checks against the same run's numbers — the
+    # servo accepted du=45px, so its tolerance was the 60px cap, which means the cube's
+    # apparent width was >180px, i.e. >35px/cm for a 5.08cm cube.
+    #
+    # THE PRINCIPLED FIX is to re-measure HAND_UV at the midpoint between the jaws
+    # rather than on one fingertip; this knob would then sit near zero. Until then it
+    # is a per-rig constant and it belongs on the dial.
+    # An ADDITIVE trim on top of the derived grasp bias (derive.grasp_aim_offset_px),
+    # not the bias itself. It was -140.0, a hand-dialled pixel count that is 9.5 cm at
+    # 35 cm range and 4.8 cm at 18 cm — enough to put a 5 cm cube wholly outside the
+    # jaws. It went unnoticed because the centring servo it feeds never converged (the
+    # object left frame at the hover), so the value was never applied. With the servo
+    # running it closed on air every time. 0.0 = take the derived bias as-is.
+    aim_du_px: float = 0.0
     aim_dv_px: float = 0.0
     # Object this close to the aim pixel counts as centred. Deliberately loose: the
     # staged approach already gets close, and chasing a tight pixel tolerance with
     # coarse radial reach moves costs iterations without improving the grasp.
     align_tol_px: float = 40.0
-    align_iters: int = 3
+    # Was 3, and 3 could not finish the job it was given. The servo inherits whatever
+    # lateral offset the approach parked at — right_trim_m, ~250 px at grasp range —
+    # and each iteration is capped at 4.5 deg of pan when close. Measured on a real
+    # pick: 268 px of error at 12.8 px/deg needs 21 deg of pan, against a budget of
+    # 3 x 4.5 = 13.5 deg. The loop was structurally unable to converge and reported
+    # max_iters on every pick in the log, so the grasp always fell back to the
+    # uncorrected mapped position. Raised to give the loop more actuation than the
+    # error it is handed; the tolerance, not the counter, should be what ends it.
+    # (The trim now also decays across the approach — see trim_final_frac — so this
+    # budget is sized against a much smaller starting error than the one measured.)
+    align_iters: int = 8
+
+    # How much of right_trim_m is left at the LAST approach stage. The trim exists to
+    # keep the object off to one side so it stays in frame during transit, and that
+    # need is strongest early — far away, swinging — and weakest at the final hop,
+    # where it converts directly into pixel error the centring servo must undo. Decay
+    # it and the servo inherits an error it can actually close, without giving up the
+    # visibility the trim was there to buy. Full trim at stage 1, this fraction at the
+    # last stage. 1.0 restores the old fixed-trim behaviour.
+    trim_final_frac: float = 0.3
 
     # --- localization corrections -------------------------------------------------
     push_out_m: float = 0.0

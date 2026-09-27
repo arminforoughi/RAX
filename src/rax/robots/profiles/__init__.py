@@ -41,7 +41,7 @@ from rax.robots.profiles.urdf_limits import joint_limits_deg, read_urdf_limits
 
 __all__ = [
     "ArmProfile", "GripperProfile", "CameraProfile", "BusProfile", "CameraKind",
-    "load_profile", "available_profiles", "REPO_ROOT",
+    "load_profile", "available_profiles", "REPO_ROOT", "PACKAGE_ROOT",
 ]
 
 def _repo_root() -> pathlib.Path:
@@ -61,6 +61,12 @@ def _repo_root() -> pathlib.Path:
 
 
 REPO_ROOT = _repo_root()
+
+# Assets that ship *with* the library (the SO-101 URDF) resolve against the package,
+# not the repo. Those two are the same directory in a clone and different ones after
+# ``pip install``, which is exactly the case that used to break: the profile resolved
+# fine for the author and could not find its own URDF for anybody who installed it.
+PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 CameraMount = Literal["eye_in_hand", "fixed"]
 CameraKind = Literal["stereo", "rgbd", "mono"]
@@ -192,6 +198,16 @@ class ArmProfile:
     reach_min_m: float = 0.08
     reach_max_m: float = 0.55
 
+    #: How far the FINGERTIP can actually be driven, metres. Distinct from
+    #: ``reach_max_m``, which is a plausibility bound on a localization ("a cube at
+    #: 92 cm is a broken solve"). This one is a kinematic fact: past it there is no
+    #: IK solution, so a target beyond it can be seen and mapped but never picked.
+    #:
+    #: Derive it, do not guess it -- ``workspace.analyze_workspace(ik, profile)`` then
+    #: ``ws.max_reach(pitch_deg, z_m)``. It is strongly pitch-dependent, and the value
+    #: here is the best case (a flat wrist); a steep grasp reaches far less.
+    reach_grasp_max_m: float = 0.47
+
     gripper: GripperProfile = field(default_factory=GripperProfile)
     camera: CameraProfile = field(default_factory=CameraProfile)
     bus: BusProfile | None = None
@@ -215,8 +231,11 @@ class ArmProfile:
         p = pathlib.Path(self.urdf).expanduser()
         if p.is_absolute():
             return str(p)
-        rooted = REPO_ROOT / p
-        return str(rooted if rooted.exists() else p.resolve())
+        for root in (PACKAGE_ROOT, REPO_ROOT):
+            rooted = root / p
+            if rooted.exists():
+                return str(rooted)
+        return str(p.resolve())
 
     @property
     def mesh_path(self) -> str:
@@ -226,8 +245,11 @@ class ArmProfile:
         p = pathlib.Path(self.mesh_dir).expanduser()
         if p.is_absolute():
             return str(p)
-        rooted = REPO_ROOT / p
-        return str(rooted if rooted.exists() else p.resolve())
+        for root in (PACKAGE_ROOT, REPO_ROOT):
+            rooted = root / p
+            if rooted.exists():
+                return str(rooted)
+        return str(p.resolve())
 
     @property
     def slaved_joint(self) -> int | None:

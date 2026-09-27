@@ -62,7 +62,7 @@ class So101Arm:
         self,
         *,
         port: str,
-        urdf: str = "SO101/so101_new_calib.urdf",
+        urdf: str = "robots/arms/lerobot_so101/SO101/so101_new_calib.urdf",
         ee_frame: str = "gripper_frame_link",
         camera_key: str = "front",
         gripper_camera_tf: str = "0.04,0,0.02,0,-0.35,0",

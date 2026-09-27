@@ -216,3 +216,87 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- the lateral grasp bias, derived instead of dialled -----------------------------
+# It was aim_du = -140 px. That is not a fixed offset: at the rig's fx=517 it is 9.5 cm
+# at 35 cm range and 4.8 cm at 18 cm, and 9.5 cm puts a 5 cm cube entirely outside the
+# jaws. It went unnoticed for as long as the centring servo never converged — the
+# object left frame at the hover, so the number was never applied to anything. The
+# moment the servo started running, every grasp closed on air.
+
+class _Geom:
+    fx = 517.0
+
+    class intr:
+        width = 640
+        height = 480
+
+
+CUBE_M = 0.0508
+
+
+def _bias_cm(rng_m, **kw):
+    """The derived bias, converted back to centimetres at that range."""
+    from rax.manipulation.approach.derive import grasp_aim_offset_px
+    px = grasp_aim_offset_px(_Geom, CUBE_M, rng_m, **kw)
+    return -px * rng_m / _Geom.fx * 100.0
+
+
+def test_the_bias_is_the_same_physical_distance_at_every_range():
+    """The whole point: a pixel count cannot do this, a fraction of apparent size can."""
+    got = [_bias_cm(r) for r in (0.18, 0.25, 0.35, 0.45)]
+    assert max(got) - min(got) < 0.05, f"bias drifts with range: {got}"
+
+
+def test_the_bias_is_a_fraction_of_the_object_not_a_constant():
+    from rax.manipulation.approach.derive import grasp_aim_offset_px
+    small = grasp_aim_offset_px(_Geom, 0.03, 0.30)
+    large = grasp_aim_offset_px(_Geom, 0.09, 0.30)
+    assert abs(large) > abs(small), "a wider object needs a wider bias"
+
+
+def test_the_bias_matches_what_was_asked_for_on_the_rig():
+    """Pins the spec directly: "like 2-3 on right of object when approaching".
+
+    For the reference 5.08cm cube that is half a width, putting the fingertip at the
+    cube's right face — offset enough that the near finger passes it, not so far that
+    the jaws no longer span it.
+    """
+    for rng in (0.15, 0.25, 0.40):
+        assert 2.0 <= _bias_cm(rng) <= 3.0, f"{_bias_cm(rng):.2f}cm at {rng}m"
+
+
+def test_the_old_dialled_value_would_have_missed_the_cube():
+    """Pins the defect: -140px at 35cm is 9.5cm, nearly two cube widths off-centre."""
+    old_cm = 140 * 0.35 / _Geom.fx * 100
+    assert old_cm > CUBE_M * 100, f"{old_cm:.1f}cm should exceed a whole cube width"
+    assert old_cm > 3 * _bias_cm(0.35), "the derived bias must be far smaller"
+
+
+def test_the_bias_never_aims_to_the_objects_left():
+    """Aiming left would walk the near finger further INTO the object."""
+    from rax.manipulation.approach.derive import grasp_aim_offset_px
+    for size in (0.01, 0.0508, 0.30):
+        for rng in (0.10, 0.30, 0.60):
+            assert grasp_aim_offset_px(_Geom, size, rng) <= 0.0
+
+
+def test_a_huge_object_is_clamped_in_metres_not_pixels():
+    """The clamp bounds the physical offset. A pixel clamp cut the bias to a third of
+    what was asked for at close range, which is exactly where it matters most."""
+    from rax.manipulation.approach.derive import GRASP_BIAS_BOUNDS_M, grasp_bias_m
+    assert grasp_bias_m(0.40) == GRASP_BIAS_BOUNDS_M[1]          # a box, clamped
+    assert grasp_bias_m(CUBE_M) < GRASP_BIAS_BOUNDS_M[1]         # a cube, not clamped
+
+
+def test_the_close_range_bias_is_not_silently_cut_down():
+    """The regression the metres clamp fixes: at 12cm a pixel clamp of 45px allowed
+    only ~1.0cm, well under the 2-3cm the grasp needs."""
+    assert _bias_cm(0.12) >= 2.0, _bias_cm(0.12)
+
+
+def test_the_shipped_default_no_longer_carries_the_dialled_offset():
+    from rax.manipulation.approach import ApproachConfig
+    assert ApproachConfig().aim_du_px == 0.0, (
+        "aim_du_px is now an additive operator trim; the bias is derived")

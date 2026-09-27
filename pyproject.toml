@@ -54,7 +54,11 @@ Issues = "https://github.com/arminforoughi/RAX/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"rax" = ["py.typed"]
+# The URDF ships: without it `--arm so101` resolves a profile whose kinematics file
+# does not exist in an installed copy. The STL meshes deliberately do NOT ship — they
+# are 17 MB and only the optional Rerun viewer reads them, so an installed rax falls
+# back to a mesh-less view rather than tripling the wheel.
+"rax" = ["py.typed", "robots/arms/lerobot_so101/SO101/*.urdf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

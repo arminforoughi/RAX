@@ -173,3 +173,132 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- trim decay across the stages ----------------------------------------------------
+# The trim parks the hover to the object's side so it does not vanish under the gripper
+# in transit. Held fixed, it is also a lateral offset the centring servo must undo at the
+# end — ~250 px at grasp range, handed to a loop capped at 4.5 deg of pan per iteration.
+# The approach converging perfectly still left that error standing by construction.
+
+from rax.manipulation.approach import stage_trim  # noqa: E402
+
+
+def test_trim_is_full_on_the_first_stage():
+    """The operator's number is what the first hop uses — the decay only takes away
+    later, where the offset has stopped buying visibility."""
+    assert stage_trim(0.05, stage=0, total=3) == 0.05
+
+
+def test_trim_decays_to_the_configured_fraction_by_the_last_stage():
+    got = stage_trim(0.05, stage=2, total=3, final_frac=0.3)
+    assert abs(got - 0.015) < 1e-12
+
+
+def test_trim_decays_monotonically():
+    vals = [stage_trim(0.05, stage=i, total=5) for i in range(5)]
+    assert all(a >= b for a, b in zip(vals, vals[1:])), vals
+
+
+def test_a_single_stage_approach_keeps_the_full_trim():
+    """With no later hop to decay toward, the visibility offset is all there is."""
+    assert stage_trim(0.05, stage=0, total=1) == 0.05
+
+
+def test_final_frac_of_one_restores_the_old_fixed_behaviour():
+    assert all(stage_trim(0.05, stage=i, total=3, final_frac=1.0) == 0.05
+               for i in range(3))
+
+
+def test_the_decayed_trim_shrinks_what_the_servo_must_undo():
+    """The point of the whole change, stated as the number that matters.
+
+    The centring servo inherits the trim as pixel error. Whatever the camera's scale,
+    the last stage must hand it strictly less than the first.
+    """
+    first = stage_trim(CFG.right_trim_m, stage=0, total=CFG.steps,
+                       final_frac=CFG.trim_final_frac)
+    last = stage_trim(CFG.right_trim_m, stage=CFG.steps - 1, total=CFG.steps,
+                      final_frac=CFG.trim_final_frac)
+    assert last < first
+    # And it must not go to zero: the object still has to stay out from under the jaws.
+    assert last > 0.0
+
+
+def test_stages_still_reach_the_hover_when_the_trim_moves_under_them():
+    """The hover target shifts every stage as the trim decays, so the staging has to
+    converge on a MOVING point. It does, because each stage recomputes from the current
+    tip — pinned so a future change to stage_step cannot quietly break it."""
+    cube = np.array([0.40, 0.10])
+    tip = np.array([0.20, 0.0])
+    for i in range(CFG.steps):
+        trim = stage_trim(CFG.right_trim_m, stage=i, total=CFG.steps,
+                          final_frac=CFG.trim_final_frac)
+        target = approach_target(cube, back_m=CFG.back_m, right_trim_m=trim)
+        waypoint, remaining = stage_step(tip, target, stage=i, total=CFG.steps,
+                                         first_frac=CFG.first_step_frac,
+                                         max_first_m=CFG.max_first_step_m, commit=True)
+        if waypoint is None or remaining < CFG.arrived_m:
+            break
+        tip = waypoint
+    final_target = approach_target(cube, back_m=CFG.back_m,
+                                   right_trim_m=stage_trim(
+                                       CFG.right_trim_m, stage=CFG.steps - 1,
+                                       total=CFG.steps,
+                                       final_frac=CFG.trim_final_frac))
+    assert np.linalg.norm(tip - final_target) < CFG.arrived_m * 2
+
+
+# --- the lateral offset must be held, not re-applied at the hover -------------------
+# Reported from the rig: "it still goes from middle, then goes to right, which makes it
+# push the object away most of the time". The trim decayed to ~30% of itself, walking
+# the gripper onto the object's centre line, and the centring servo then pushed it back
+# out sideways at the hover — with the jaws already beside the object, which is the
+# worst moment for a lateral move. The approach and the servo must agree on ONE offset.
+
+from rax.manipulation.approach.derive import grasp_bias_m  # noqa: E402
+from rax.manipulation.approach.geometry import stage_trim  # noqa: E402
+
+REF_CUBE_M = 0.0508
+
+
+def _trims(total=3, right_trim_m=0.05, final_m=None):
+    return [stage_trim(right_trim_m, stage=i, total=total, final_m=final_m)
+            for i in range(total)]
+
+
+def test_the_trim_never_falls_below_the_grasp_offset():
+    bias = grasp_bias_m(REF_CUBE_M)
+    for total in (2, 3, 4, 6):
+        for t in _trims(total, final_m=bias):
+            assert t >= bias - 1e-9, f"trim {t:.4f} dipped under the grasp bias {bias:.4f}"
+
+
+def test_the_last_stage_lands_exactly_on_the_grasp_offset():
+    """So the centring servo has no sideways correction left to make."""
+    bias = grasp_bias_m(REF_CUBE_M)
+    assert abs(_trims(3, final_m=bias)[-1] - bias) < 1e-9
+
+
+def test_the_first_stage_still_gets_the_full_visibility_trim():
+    """The wide offset early is what keeps the object in frame; only the floor moved."""
+    assert abs(_trims(3, final_m=grasp_bias_m(REF_CUBE_M))[0] - 0.05) < 1e-9
+
+
+def test_the_trim_decreases_monotonically_toward_the_grasp():
+    ts = _trims(4, final_m=grasp_bias_m(REF_CUBE_M))
+    for a, b in zip(ts, ts[1:]):
+        assert b <= a + 1e-9, f"trim rose mid-approach: {ts}"
+
+
+def test_the_old_fraction_decay_dipped_below_the_grasp_offset():
+    """Pins the defect: without a floor the last stage sat well inside the bias, which
+    is the sideways move the servo then had to make next to the object."""
+    bias = grasp_bias_m(REF_CUBE_M)
+    old_last = stage_trim(0.05, stage=2, total=3, final_frac=0.3)
+    assert old_last < bias, f"old last-stage trim {old_last:.4f} vs bias {bias:.4f}"
+
+
+def test_a_single_stage_approach_is_the_grasp_and_takes_the_bias():
+    bias = grasp_bias_m(REF_CUBE_M)
+    assert abs(stage_trim(0.05, stage=0, total=1, final_m=bias) - bias) < 1e-9

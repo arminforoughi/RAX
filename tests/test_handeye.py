@@ -48,12 +48,12 @@ HOME = np.array([-14.1, -99.1, 90.8, 33.2, -4.7])
 
 
 def _kin():
-    from lerobot.model.kinematics import RobotKinematics
+    from rax.manipulation.arms.kinematics import make_kinematics
 
     from rax.robots.profiles import load_profile
 
     p = load_profile("so101")
-    return RobotKinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
+    return make_kinematics(p.urdf_path, p.ee_frame, list(p.joint_names))
 
 
 def _rig():
@@ -223,3 +223,77 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --- the consistency objective must not be all-or-nothing --------------------------
+# On the real rig this fitter reported `spread 99900.0cm -> 99900.0cm, did not
+# converge` on TEN good views of a clearly-visible cube, twice, and left the mount
+# untouched. 99900 is a sentinel, not a measurement.
+#
+# The cause was in the objective, not the data. `table_pts` returned None for the whole
+# batch if ANY single view's ray came out pointing away from the table, and `resid`
+# then answered with a CONSTANT vector — so least_squares saw zero gradient everywhere
+# and could not take a step. From a mildly wrong seed every view resolved and the fit
+# worked; from a badly wrong seed some did not and the fit did nothing at all. That is
+# backwards: a badly wrong seed is exactly what you are calibrating away from.
+
+def _seeds_by_rotation_error():
+    """Seeds spanning mild to severe rotation error, with how wrong each one is."""
+    for rot in [(0.2, 0.25, -0.3), (0.4, 0.4, -0.4), (0.8, 0.8, -0.6),
+                (1.0, 0.9, -0.7), (1.2, 1.0, -0.9)]:
+        seed = _bad_seed(rot_err=rot)
+        yield seed, _error(seed)[1]
+
+
+def test_a_badly_rotated_seed_no_longer_freezes_the_fit():
+    """Every one of these used to return the 999 sentinel unchanged."""
+    kin, geom = _rig()
+    s = _samples(kin, geom)
+    tip = _tip_uv(geom, s[0])
+    recovered = []
+    for seed, seed_deg in _seeds_by_rotation_error():
+        fit = fit_consistency(s, geom, tip_uv=tip, T_seed=seed, z_plane=0.02)
+        if fit.converged:
+            recovered.append(seed_deg)
+            assert fit.spread_m < 0.02, f"{seed_deg:.0f}deg seed -> {fit.spread_m*100:.1f}cm"
+    assert len(recovered) >= 4, (
+        f"only recovered from {len(recovered)} of 5 seeds: {recovered}")
+    assert max(recovered) > 60.0, (
+        f"still failing on severe rotation error; best recovered {max(recovered):.0f}deg")
+
+
+def test_a_view_that_cannot_hit_the_table_is_dropped_not_fatal():
+    """One unusable view must not take the other thirteen down with it."""
+    kin, geom = _rig()
+    s = _samples(kin, geom)
+    tip = _tip_uv(geom, s[0])
+    poisoned = list(s)
+    poisoned[3] = HandEyeSample(poisoned[3].T_base_ee, np.array([5.0, 2.0]))  # sky ray
+    fit = fit_consistency(poisoned, geom, tip_uv=tip, T_seed=_bad_seed(), z_plane=0.02)
+    assert fit.converged, f"one bad view killed the fit: {fit.reason}"
+    assert fit.spread_m < 0.05
+
+
+def test_a_refusal_says_how_many_views_resolved():
+    """When it genuinely cannot fit, the message must not be a bare 999 sentinel.
+
+    Forced by putting the table plane 5 m ABOVE the camera: every sightline points
+    down, so none of them can ever reach it and no view resolves. (Aiming the pixels
+    at a corner does not do it — views sharing one pixel can still be made to agree,
+    and the fit legitimately converges.)
+    """
+    kin, geom = _rig()
+    s = _samples(kin, geom)
+    fit = fit_consistency(s, geom, tip_uv=_tip_uv(geom, s[0]),
+                          T_seed=_bad_seed(), z_plane=5.0)
+    assert not fit.converged
+    assert "views produced a table intersection" in fit.reason, fit.reason
+    assert "99900" not in fit.reason
+
+
+def test_it_still_refuses_rather_than_writing_a_bad_transform():
+    """Robustness must not become credulity — a fit it cannot make must stay refused."""
+    kin, geom = _rig()
+    s = _samples(kin, geom)
+    fit = fit_consistency(s[:2], geom, tip_uv=_tip_uv(geom, s[0]), T_seed=_bad_seed())
+    assert not fit.converged

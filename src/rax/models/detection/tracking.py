@@ -32,7 +32,42 @@ import numpy as np
 from rax.perception.measure import silhouette_mask
 
 __all__ = ["Track", "AnchorTracker", "PixelTracker", "HSV_BANDS", "HSV_BANDS_SOFT",
-           "PIXEL_TRACK_MAX_AGE_S", "PIXEL_TRACK_MIN_RESPONSE"]
+           "PIXEL_TRACK_MAX_AGE_S", "PIXEL_TRACK_MIN_RESPONSE",
+           "clipped_edges", "table_ray_is_usable"]
+
+
+def clipped_edges(bbox, shape, margin: int = 2) -> tuple[str, ...]:
+    """Which frame edges this box runs into, as any of ``left/top/right/bottom``.
+
+    ``Track.clipped`` collapses this to one bool, which is the right summary for
+    "should I trust the width" and the wrong one for everything else — callers that
+    acted on it threw away boxes they could still have used. The names come back in
+    reading order so a log line can say which.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    h, w = (int(shape[0]), int(shape[1]))
+    return tuple(n for n, hit in (("left", x1 <= margin - 1),
+                                  ("top", y1 <= margin - 1),
+                                  ("right", x2 >= w - margin),
+                                  ("bottom", y2 >= h - margin)) if hit)
+
+
+def table_ray_is_usable(edges) -> bool:
+    """Can this box still be ranged from where its bottom edge meets the table?
+
+    Apparent-size ranging needs the whole object, because it reads distance from the
+    box's WIDTH — clip any edge and the object reads further away than it is. The table
+    ray needs much less: only that the bottom edge is real, and that the horizontal
+    centre is really the object's centre.
+
+    So a box cut off at the TOP — the usual way a close object goes, with the gripper
+    looming into the top of the frame — is still perfectly rangeable, while the same box
+    cut at the bottom is not (the contact point is off-picture) and one cut at a side is
+    not (the visible centroid is not the centre, so the bearing is biased inward by up
+    to half the hidden width).
+    """
+    e = set(edges)
+    return "bottom" not in e and "left" not in e and "right" not in e
 
 
 HSV_BANDS = {

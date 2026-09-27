@@ -49,7 +49,9 @@ that run with no hardware:
 
 Read [docs/porting.md](docs/porting.md) — the actual contract, and it is short.
 [docs/architecture.md](docs/architecture.md) explains how the seams work and lists
-what is still wrong with them.
+what is still wrong with them. Once your robot is described,
+[docs/calibration.md](docs/calibration.md) covers the three things that must be
+*measured* on your hardware rather than declared.
 
 ---
 
@@ -172,8 +174,9 @@ The suite is the evidence for the claims above, not a formality:
 - `test_grasp_cli.py` runs the published entry point end to end on every advertised rig
   and checks the reported position against ground truth — because a pipeline can
   "succeed" while reaching to the wrong place.
-- `test_extraction_parity.py` pins ~450 golden values against the original monolith
-  (`examples/legacy/stack_mission2.py`), so the extraction is provably faithful.
+- `test_extraction_parity.py` pins ~450 golden values taken from the original 5,885-line
+  monolith before it was broken up, so the extraction is provably faithful. The monolith
+  itself is not in the tree — it lives in git history, and the goldens are what survive it.
 
 ---
 
@@ -189,7 +192,6 @@ supported surface:
 | `examples/exchange/` | WebSocket remote-control hub |
 | `examples/humanoid_k1/` | Booster K1 humanoid control |
 | `examples/fpv/`, `examples/teleop/`, `examples/self_learn/` | first-person approach, SLAM, keyboard teleop, self-learning experiments |
-| `examples/legacy/` | the original 5,885-line monolith, kept unchanged as the hardware reference |
 
 Several of these still point at a local `lerobot` checkout by absolute path. They are
 demos; the library above them does not.

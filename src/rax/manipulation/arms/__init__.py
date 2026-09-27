@@ -15,7 +15,7 @@ Public surface:
     MockArm                        synthetic stereo arm for the dev harness
 
 Which IK strategy an arm uses is declared by its profile, not chosen here — see
-robots/profiles/ and docs/adding_an_arm.md.
+robots/profiles/ and docs/porting.md.
 """
 
 from __future__ import annotations
