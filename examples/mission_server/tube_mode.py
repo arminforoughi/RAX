@@ -35,6 +35,7 @@ bench. `RACK_XY` is a CONFIGURED position, not a surveyed one, and the UI labels
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -109,10 +110,22 @@ def start(ms, port: int = 8486) -> None:
     # detection is what the grid aim steers on. Registered as a hook so mission_server
     # never imports this module -- the dependency points one way.
     def cap_overlay(img):
-        caps = find_caps(img, exclude=[ms.HAND_UV], exclude_r=70)
+        # DETECT ON THE CLEAN FRAME, DRAW ON THE ANNOTATED ONE. The hooks run at the end
+        # of publish(), by which point the grid, the jaw cells and the hand-eye marker
+        # have all been drawn into `img` -- dark lines straight across the tube bodies.
+        # The cap survives that (it is found by colour) but the AXIS does not: tube_axis
+        # segments by contrast, and a grid line through the body splits it into pieces
+        # that are no longer elongated. Both tubes reported "orientation unknown" from a
+        # view where both bodies were plainly visible, and this was why.
+        src = ms.latest_rgb[0]
+        clean = img if src is None else cv2.cvtColor(np.asarray(src), cv2.COLOR_RGB2BGR)
+        caps = find_caps(clean, exclude=[ms.HAND_UV], exclude_r=70)
         found = []
         for c in caps:
-            ax = tube_axis(img, (c.x, c.y))
+            # The window scales with the cap: a tube is about six cap-diameters
+            # long, so a fixed radius that fits at 25cm crops the body at 15cm.
+            ax = tube_axis(clean, (c.x, c.y),
+                           r=int(max(90, min(220, 3.2 * max(c.w, c.h)))))
             found.append({"colour": c.colour, "x": c.x, "y": c.y, "area": c.area,
                           "bbox": list(c.bbox),
                           "angle": None if ax is None else ax.angle_deg,
