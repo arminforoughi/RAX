@@ -29,20 +29,37 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path.home() / "Documents/lab-robot"))
-sys.path.insert(0, str(Path.home() / "Documents/lab-robot/perception"))
+# THE DRIVER AND THE PERCEPTION LIVE NEXT TO THIS FILE NOW. They used to be imported
+# from ~/Documents/lab-robot, which is the machine the 113 demonstrations were recorded
+# on -- so on any other rig this script could only ever --dry-run. x250_driver.py,
+# caps2.py, orient.py, holes.py, jaws.py, cameras.py and ui.py are ports of those
+# modules; the home checkout still wins if it is present, so nothing is taken away from
+# the machine that has it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+for _extra in (Path.home() / "Documents/lab-robot",
+               Path.home() / "Documents/lab-robot/perception"):
+    if _extra.exists():
+        sys.path.insert(0, str(_extra))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pick")
 
 MOTORS = ["base", "shoulder_2", "elbow", "wrist", "tool", "gripper"]
-RUNS = Path.home() / "smolvla_runs"
+# Calibration and photo directory. RAX_PICK_RUNS overrides it; otherwise ~/smolvla_runs
+# if it exists (the original location), else the config/ snapshot shipped beside this
+# file -- so a fresh checkout runs without anyone first copying JSONs into their home.
+RUNS = Path(os.environ.get("RAX_PICK_RUNS") or "")
+if not RUNS.name:
+    _home_runs = Path.home() / "smolvla_runs"
+    RUNS = _home_runs if (_home_runs / "poses.json").exists() else Path(__file__).resolve().parent / "config"
+RUNS.mkdir(parents=True, exist_ok=True)
 POSES = json.loads((RUNS / "poses.json").read_text())
 ENVELOPE = json.loads((RUNS / "safe_envelope.json").read_text())
 LOOK, GRASP = POSES["look"], POSES["grasp"]
@@ -429,7 +446,12 @@ def place(robot, colour: str, ui, steps: int = 16) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--colour", required=True, choices=["gold", "blue", "green"])
-    ap.add_argument("--port", default="/dev/tty.usbserial-FTA9DQBQ")
+    # The arm is the same FTDI adapter (serial FTA9DQBQ) wherever it is plugged in; only
+    # the NAME is the operating system's. RAX_X250_PORT overrides, then a Windows COM
+    # port if this is Windows, else the /dev name the demonstrations used.
+    ap.add_argument("--port", default=os.environ.get(
+        "RAX_X250_PORT",
+        "COM5" if sys.platform.startswith("win") else "/dev/tty.usbserial-FTA9DQBQ"))
     # -1 means "work it out from what the cameras see". macOS reshuffles OpenCV indices
     # between runs and the built-in FaceTime camera landed on index 1 three times in this
     # project, each time producing a full silent run against a picture of the room.
