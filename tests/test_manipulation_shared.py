@@ -193,6 +193,25 @@ class TestRetries:
         out = with_retries(boom, lambda: (False, ""), tries=2)
         assert not out.ok and "target not in view" in out.detail
 
+    def test_A_VERIFY_DETAIL_DOES_NOT_BURY_WHY_THE_ACTION_FAILED(self):
+        """The reporting bug that cost a debugging round.
+
+        The descent was dying of a TypeError mid-way and the recorded detail read
+        "gripper current 0.0 vs idle 0.8" — true, and entirely beside the point. When the
+        action RAISED, its message is the only thing that explains the attempt.
+        """
+        def boom(n):
+            raise TypeError("'NoneType' object is not subscriptable")
+        out = with_retries(boom, lambda: (False, "gripper reads empty"), tries=1)
+        assert "NoneType" in out.detail, "the crash must survive into the record"
+        assert "gripper reads empty" in out.detail, "the reading is still worth keeping"
+
+    def test_a_clean_miss_still_reports_the_reading_alone(self):
+        # When nothing raised, the verify detail IS the explanation and should not be
+        # cluttered with the action's ordinary return value.
+        out = with_retries(lambda n: "closed", lambda: (False, "jaws empty"), tries=1)
+        assert out.detail == "jaws empty"
+
     def test_between_runs_before_retries_only(self):
         got = []
         verdicts = iter([(False, ""), (True, "")])

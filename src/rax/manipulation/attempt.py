@@ -80,14 +80,22 @@ def with_retries(
         if n > 1 and between is not None:
             between(n)
 
+        failed = False
         try:
             last = str(action(n))
         except Exception as e:
-            last = f"{type(e).__name__}: {e}" if not str(e) else str(e)
+            failed = True
+            last = f"{type(e).__name__}: {e}"
 
         held, vdetail = verify()
+        # DO NOT LET A VERIFY DETAIL BURY WHY THE ACTION FAILED. When the action raised,
+        # its message is the only thing that explains the attempt, and overwriting it
+        # with "gripper current 0.0 vs idle 0.8" hides a TypeError behind a reading that
+        # looks like an ordinary miss. That cost a debugging round: the real fault was a
+        # crash mid-descent and the log said the jaws were empty, which was true and
+        # entirely beside the point.
         if vdetail:
-            last = vdetail
+            last = f"{last}; {vdetail}" if (failed and last) else vdetail
 
         # Let a slow verdict land before believing a success.
         if held and settle_s > 0:
