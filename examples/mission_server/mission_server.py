@@ -581,6 +581,13 @@ def find_label(rgb, label, T_base_cam=None):
 
 
 # ---------------- robot I/O ----------------
+#: Extra passes over the FPV overlay, appended by a mode that wants to draw on it.
+#: A hook takes the BGR image and draws in place; it must not raise and must not be slow.
+#: This exists so the tube mode can box its caps without mission_server importing it --
+#: the dependency only ever points one way, from the mode to the server.
+OVERLAY_HOOKS = []
+
+
 def publish(rgb, joints=None):
     img = np.ascontiguousarray(rgb[:, :, ::-1])
     now = time.time()
@@ -749,6 +756,13 @@ def publish(rgb, joints=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
     with lock:
         cv2.putText(img, state["phase"], (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80, 255, 120), 2)
+    for _hook in OVERLAY_HOOKS:
+        try:
+            _hook(img)
+        except Exception:
+            # An overlay is a diagnostic. It must never take the frame loop down, and a
+            # hook that throws every frame would otherwise do exactly that.
+            pass
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
     if ok:
         with lock:
@@ -4535,6 +4549,115 @@ def _log_grasp_verdict(v, held_by_current):
                 f"place from here would put nothing down. Re-run the pick.")
 
 
+#: The last caps seen, for the overlay and for /geom. Written by the frame loop's hook
+#: so the pick does not pay for a second detection pass.
+LAST_CAPS = [[], 0.0]
+
+
+def _cap_target(jaw, max_age_s: float = 1.5):
+    """The cap nearest the grip centre, in pixels, or None.
+
+    Nearest rather than biggest: by the time this is asked the arm is most of the way
+    down on ONE tube, and the biggest cap in the frame may be a different tube entirely.
+    """
+    caps, t = LAST_CAPS[0], LAST_CAPS[1]
+    if not caps or time.time() - t > max_age_s:
+        return None
+    cu, cv = jaw.centre_uv
+    best = min(caps, key=lambda c: (c["x"] - cu) ** 2 + (c["y"] - cv) ** 2)
+    return (float(best["x"]), float(best["y"]))
+
+
+def grid_center(finder, label, gp, j5):
+    """Steer the target INTO THE JAW CELLS before the jaws move.
+
+    THE GRID STOPS BEING A WITNESS HERE. The cell check has been running as an advisory
+    log since it was added -- it says IN or OUTSIDE just before every close and then lets
+    the close happen either way. That was the right way to start, because nobody had seen
+    how the number reads on a grasp that SUCCEEDS, and a gate written before that would
+    have begun by rejecting an unknown number of good picks.
+
+    The log has now answered it. Across 13 trials the target sat <=67px from the grip
+    centre on every pick that worked, and >=96px on every one that missed, with nothing in
+    between. That is a clean enough separation to steer on.
+
+    WHAT IT AIMS AT, AND WHY THAT IS NOT THE FINGERTIP. Every other centring on this rig
+    aims the FINGERTIP at the object, biased a little to the object's right so the near
+    finger passes it instead of shoving it. This aims the OBJECT at the measured grip
+    centre -- the midpoint between the two fingertips -- which is a different question and
+    the one the grid asks: not "is the hand near the thing" but "is the thing between the
+    jaws". They differ by the whole grasp offset, which is exactly the quantity a pick
+    gets wrong when it misses by two centimetres at the very end.
+
+    WHERE IT RUNS. Three quarters of the way down the descent, not at the bottom. The
+    descent is kinematic and blind, so by the bottom the gripper occludes the target often
+    enough that the existing check regularly reports "not visible at the close". At 75%
+    the object is still in view and the remaining correction is small.
+
+    Returns ``(tip_xy or None, detail)``. The caller re-aims the rest of the descent at
+    that tip position -- NOT at the object's -- because after a successful centring the
+    tip is by construction where it needs to be, and re-deriving a grasp point from the
+    object would put the offset back in.
+    """
+    try:
+        jg = jaw_frame()
+    except Exception as e:
+        return None, f"jaw frame unavailable ({type(e).__name__}: {e})"
+
+    ops = _CenteringOps(finder, gp, j5)
+
+    # THE CAP IS A BETTER TARGET THAN THE BOX, for this one job. The grid aim is a pure
+    # image-space question -- put THIS pixel between THOSE pixels -- so it needs no range,
+    # no plane and no transform, which is exactly the regime a colour blob is strongest
+    # in. Measured on a live frame from this camera: the cap detector found both tubes
+    # with a tight box and no false positives, while YOLO-World found one of the two and
+    # drew nothing on the other. The detector still owns everything metric; this only
+    # replaces the pixel the final correction steers on, and falls back when no cap is
+    # visible (an uncapped object, or a cap under the gripper's shadow).
+    cap_uv = _cap_target(jg)
+    tr = ops.track(tries=3)
+    if cap_uv is not None:
+        uv = cap_uv
+        src = "cap"
+    elif tr is not None:
+        uv = tr.uv
+        src = "box"
+    else:
+        return None, "target not visible — descending on the staged estimate"
+
+    off0 = math.hypot(uv[0] - jg.centre_uv[0], uv[1] - jg.centre_uv[1])
+    if GRID.in_grip(uv, jg):
+        return None, (f"already in the jaw cells ({src}), {off0:.0f}px from the grip "
+                      f"centre — nothing to correct")
+
+    # Tolerance from the JAWS, not a fixed pixel count: what counts as centred is "inside
+    # the opening", and the opening's apparent size changes with range like everything
+    # else here. A third of the fingertip separation sits comfortably inside the cells.
+    span = math.hypot(jg.fixed_uv[0] - jg.moving_uv[0], jg.fixed_uv[1] - jg.moving_uv[1])
+    tol = max(12.0, 0.33 * span)
+    say(f"        [grid] '{label}' ({src}) {off0:.0f}px outside the jaw cells "
+        f"(cell {GRID.cell_of(uv)} vs {sorted(GRID.grip_cells(jg))}) — "
+        f"steering onto the grip centre, tolerance {tol:.0f}px")
+
+    res = center_on_object(ops, jg.centre_uv, CFG, tolerance_px=tol)
+    uv2 = _cap_target(jg)
+    if uv2 is None:
+        tr2 = ops.track(tries=3)
+        uv2 = None if tr2 is None else tr2.uv
+    if uv2 is None:
+        return None, "lost sight of the target while centring — descending as staged"
+    off1 = math.hypot(uv2[0] - jg.centre_uv[0], uv2[1] - jg.centre_uv[1])
+    inside = GRID.in_grip(uv2, jg)
+    if not res.centered or not inside:
+        return None, (f"grid aim did not converge ({res.reason or 'no reason given'}); "
+                      f"{off0:.0f}px -> {off1:.0f}px, "
+                      f"{'in' if inside else 'still outside'} the cells — "
+                      f"descending on the staged estimate")
+    tip = _tip(observe(overlay=False)[0])
+    return (float(tip[0]), float(tip[1])), (
+        f"in the jaw cells, {off0:.0f}px -> {off1:.0f}px from the grip centre")
+
+
 def run_mission(target_label=None, reraise=False):
     """Close on the mapped cube in smooth stages, re-checking the map at every
     stage, then descend gradually and grip.
@@ -4793,6 +4916,16 @@ def run_mission(target_label=None, reraise=False):
                 break
             say(f"  [5/7] descend   {int(f*100):3d}%  z={z*100:5.1f}cm  pitch={used:.0f}deg "
                 f"tip={np.round(_tip(observe(overlay=False)[0])*100,1).tolist()}cm")
+            # THE GRID AIM, three quarters down: still in view, correction still small.
+            # See grid_center for why it aims the OBJECT at the grip centre rather than
+            # the fingertip at the object, and why the descent re-aims at the TIP.
+            if f == 0.75 and float(CFG.grid_aim) > 0.5:
+                set_phase("PICK", "steering the target into the jaw cells")
+                _newxy, _why = grid_center(finder, label, gp, j5)
+                say(f"  [5/7] grid aim   {_why}")
+                if _newxy is not None:
+                    gx, gy = _newxy
+                    set_obj3d([gx, gy, grasp_z], label)
 
         set_phase("PICK", "last look before closing")
         say(f"  [6/7] last look  {vlm_last_look(finder, label, j5)}")

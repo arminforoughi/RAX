@@ -94,6 +94,11 @@ KNOBS: tuple[Knob, ...] = (
          doc="leave the wrist alone when the object is this close to square"),
     Knob("yaw_max_spread_deg", "yaw_max_spread_deg", 1.0, 1.0, 45.0,
          doc="reject an orientation whose reads scatter by more than this"),
+    Knob("grid_aim", "grid_aim", 1.0, 0.0, 1.0,
+         doc="1 = steer the target INTO the jaw cells before closing (the grid as an "
+             "aim); 0 = only log whether it was in them (the grid as a witness)"),
+    Knob("grid_aim_steps", "grid_aim_steps", 1.0, 0.0, 4.0,
+         doc="how many grid-aim corrections to attempt before closing anyway"),
 )
 
 
@@ -289,6 +294,20 @@ class ApproachConfig:
     # Don't chase the last few degrees. The silhouette angle is worth a couple of
     # degrees at best, and a wrist that twitches beside a cube is a way to knock it
     # over; 4 deg costs 0.35cm of extra width on a 5cm cube, which is nothing.
+    # THE GRID AS AN AIM, NOT A WITNESS. The jaw-cell check has been running as an
+    # advisory log for a while, and the log is what earned this its default: across 13
+    # trials the target read <=67px from the grip centre on every pick that worked and
+    # >=96px on every one that missed. A signal that clean is worth steering on rather
+    # than only reporting, which is what this turns on -- a final correction that puts
+    # the object in the jaw cells before the jaws move.
+    #
+    # It is still a knob, and deliberately so. The last thing added off this same
+    # geometry (yaw_align, rolling the wrist to square the jaws) was measured at 0/6
+    # against 6/6 and is off by default. This one gets the same treatment if it does not
+    # earn its place: the episodes record the grip offset either way, so the question is
+    # countable rather than a matter of impression.
+    grid_aim: float = 1.0
+    grid_aim_steps: float = 2.0
     yaw_deadband_deg: float = 4.0
     # An orientation whose reads disagree is not a measurement. Usually means the cube
     # is seen obliquely enough that a side face is in the silhouette, which twists the

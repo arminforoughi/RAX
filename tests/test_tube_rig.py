@@ -197,6 +197,68 @@ class TestTheTwoArmsUseDifferentSensorsForOneVerdict:
 
 
 # ---------------------------------------------------------------------------------
+class TestTubeOrientationHasThreeAnswers:
+    """Which way a tube is lying, including "we cannot tell" — which is a real answer.
+
+    The obvious test is the measured height: a 100 mm tube standing reads ~100 mm tall,
+    lying it reads ~16 mm. That was tried on the rig and it QUIETLY LIED. The first tube
+    the SO-101 mapped measured w/d/h = 9/13/41 mm, which the height test called "standing"
+    while the wrist camera plainly showed it lying on the turntable.
+
+    9/13/41 is not a tube in any pose — standing is ~16x16x100, lying ~100x16x16 — so the
+    silhouette solve had measured a fragment, most likely just the cap. A two-way test fed
+    a number of that shape does not fail honestly, it answers confidently. So the test has
+    to positively match one hypothesis or return None.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def tm(cls):
+        import importlib.util
+        from pathlib import Path
+        pytest.importorskip("flask")
+        path = (Path(__file__).resolve().parents[1] / "examples" / "mission_server"
+                / "tube_mode.py")
+        spec = importlib.util.spec_from_file_location("tube_mode_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_THE_MEASUREMENT_THAT_FOOLED_THE_HEIGHT_TEST_IS_UNKNOWN(self, tm):
+        # The actual numbers off the rig. This is the regression.
+        assert tm._orientation(0.009, 0.013, 0.041) is None
+
+    def test_a_tube_that_really_is_upright(self, tm):
+        assert tm._orientation(0.016, 0.016, 0.100) is True
+
+    def test_a_tube_that_really_is_lying(self, tm):
+        assert tm._orientation(0.100, 0.016, 0.016) is False
+        assert tm._orientation(0.016, 0.100, 0.016) is False, "w/d order must not matter"
+
+    def test_lying_survives_a_height_that_reads_low(self, tm):
+        # This rig's height measurement is known to read low; the test must tolerate that
+        # without becoming so loose it accepts a fragment.
+        assert tm._orientation(0.092, 0.015, 0.011) is False
+
+    def test_nothing_measured_is_unknown_not_a_guess(self, tm):
+        assert tm._orientation(0.0, 0.0, 0.0) is None
+
+    def test_an_object_that_is_not_tube_shaped_is_unknown(self, tm):
+        assert tm._orientation(0.051, 0.051, 0.051) is None      # a cube
+        assert tm._orientation(0.33, 0.24, 0.02) is None         # the "laptop" it saw
+
+    def test_an_unclassifiable_orientation_also_clears_yaw_known(self, tm):
+        # A yaw measured off a fragment is not a yaw worth drawing, however sure the
+        # silhouette solve was about the angle of the fragment.
+        src = (pathlib_Path(tm.__file__)).read_text(encoding="utf-8")
+        assert "standing is not None" in src, (
+            "yaw_known must be gated on the orientation being classifiable")
+
+
+from pathlib import Path as pathlib_Path  # noqa: E402  (used by the test above)
+
+
+# ---------------------------------------------------------------------------------
 class TestIkReSeeding:
     """The X250 has an elbow-flip dead band too, and walking into it is silent.
 

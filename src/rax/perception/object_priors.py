@@ -215,4 +215,17 @@ TABLE_CLASSES = [
     "apple", "orange", "book", "clock", "vase", "scissors", "teddy bear",
     "cell phone", "mouse", "remote", "keyboard", "laptop", "toothbrush",
     "pen", "pencil", "marker", "tape", "can", "box", "red cube", "green cube",
+    # LAB TUBES. Added because their absence was not a naming inconvenience, it was a
+    # RANGE ERROR. A broad scan detects with this vocabulary and nothing else, so a tube
+    # on the bench was assigned the nearest word available -- measured on this rig, three
+    # of them came back "toothbrush" and three "pen". The label then chooses the size
+    # prior, and apparent-size ranging divides by it:
+    #
+    #     test tube   0.016 m   (correct)
+    #     toothbrush  0.053 m   -> the tube reports itself ~3.3x further away than it is
+    #     pen         0.037 m   -> ~2.3x
+    #
+    # So the arm would reach for a place the tube was not. Having a prior for "test tube"
+    # is no use while nothing is ever CALLED a test tube.
+    "test tube", "vial",
 ]

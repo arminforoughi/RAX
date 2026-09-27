@@ -74,11 +74,24 @@ class Tube:
     #: because a map that does not distinguish them invites trusting a stale fix.
     source: str = "assumed"
 
+    #: Whether the tube is UPRIGHT. Not cosmetic, and it must not default to True: a rack
+    #: hole holds a tube up and nothing else on this bench does, so a loose tube lies down
+    #: and rolls. Drawing every tube standing -- which the first version did -- asserts an
+    #: orientation nobody measured. The object map already refuses to do that with its
+    #: `yaw_known` flag: "drawing that as a definite orientation is a lie".
+    standing: bool = False
+    #: Long-axis bearing in the base frame, degrees. Meaningless unless `yaw_known`.
+    yaw_deg: float = 0.0
+    #: True only when something actually measured the orientation.
+    yaw_known: bool = False
+
     def as_json(self) -> dict:
         return {"id": self.id, "colour": self.colour,
                 "x": round(self.x, 4), "y": round(self.y, 4), "z": round(self.z, 4),
                 "held": self.held, "rack": self.rack, "hole": self.hole,
-                "source": self.source, "d": TUBE_D_M, "l": TUBE_L_M}
+                "source": self.source, "d": TUBE_D_M, "l": TUBE_L_M,
+                "standing": bool(self.standing), "yaw": round(float(self.yaw_deg), 1),
+                "yaw_known": bool(self.yaw_known)}
 
 
 @dataclass
@@ -164,11 +177,15 @@ class SimRig:
             Rack("black", 0.20, -0.16, 0.0, _grid(3, 2, 0.022), "#2d323b"),
             Rack("grey", 0.20, 0.16, 0.0, _grid(3, 2, 0.022), "#8a93a0"),
         ]
-        # Three tubes on the bench, in front of the arm, at plausible reach.
+        # Three tubes LYING on the bench, at plausible reach. Lying, not standing:
+        # nothing here holds a tube upright except a rack hole.
         self._tubes = [
-            Tube(1, "green", 0.26, 0.02, 0.0, source="assumed"),
-            Tube(2, "blue", 0.29, -0.05, 0.0, source="assumed"),
-            Tube(3, "gold", 0.24, 0.07, 0.0, source="assumed"),
+            Tube(1, "green", 0.26, 0.02, 0.0, source="assumed",
+                 yaw_deg=15.0, yaw_known=True),
+            Tube(2, "blue", 0.29, -0.05, 0.0, source="assumed",
+                 yaw_deg=-40.0, yaw_known=True),
+            Tube(3, "gold", 0.24, 0.07, 0.0, source="assumed",
+                 yaw_deg=80.0, yaw_known=True),
         ]
 
     # ---- the TubeRig interface ---------------------------------------------------
@@ -218,6 +235,9 @@ class SimRig:
             return False
         self._holding = tid
         t.held, t.rack, t.hole = True, None, None
+        # Upright in the jaws: this gripper closes across the tube and lifts it, which is
+        # the one moment the orientation is known without anything having measured it.
+        t.standing, t.yaw_known = True, True
         self._grip = self.profile.gripper.closed_pct + 3.5   # clearly holding
         return True
 
@@ -230,6 +250,7 @@ class SimRig:
             return False
         t.x, t.y = r.hole_xy(hole)
         t.z, t.held, t.rack, t.hole = 0.0, False, rack, hole
+        t.standing, t.yaw_known = True, True          # the hole holds it up
         self._holding = None
         self._grip = self.profile.gripper.place_open_pct
         return True
@@ -327,7 +348,10 @@ class X250Rig:
             return []
         out = []
         for i, c in enumerate(find_caps(frame, restrict_to_mat=True), start=1):
-            out.append(Tube(i, c.colour, 0.0, 0.0, 0.0, source="seen"))
+            # No position and no orientation. This arm has no hand-eye transform, so a
+            # base-frame pose for a detected cap would be invented; yaw_known stays False.
+            out.append(Tube(i, c.colour, 0.0, 0.0, 0.0, source="seen",
+                            yaw_known=False))
         return out
 
     def racks(self) -> list[Rack]:
@@ -383,8 +407,8 @@ class So101Rig:
         #
         # It needs no `open_above` guard, and the asymmetry is instructive: current only
         # rises when the motor is WORKING, so an open gripper reads idle and scores as
-        # empty all by itself. The position sensor has no such luck — open and holding
-        # both read "not shut" — which is why only that one can be asked at the wrong
+        # empty all by itself. The position sensor has no such luck â€” open and holding
+        # both read "not shut" â€” which is why only that one can be asked at the wrong
         # moment and answer confidently wrong.
         return CurrentRise(idle=self._idle,
                            delta=self.profile.gripper.contact_current_delta)

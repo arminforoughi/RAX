@@ -68,11 +68,45 @@ def _hole_grid(x, y):
             for j in range(RACK_NY) for i in range(RACK_NX)]
 
 
+#: A lab tube's nominal shape, from `rax.perception.object_priors`: 16 mm across,
+#: 100 mm long. The orientation test compares a measurement against these.
+TUBE_D_M, TUBE_L_M = 0.016, 0.100
+
+#: How far a measured dimension may be from the nominal one and still count as a match.
+#: Generous, because this rig's height measurement is known to read low (see
+#: _dest_geometry in mission_server) -- the test is meant to reject measurements that
+#: match NEITHER pose, not to grade the ones that do.
+_FIT = 0.45
+
+
+def _orientation(w_m: float, d_m: float, h_m: float):
+    """True = upright, False = lying, None = the measurement says neither.
+
+    See the caller for why "neither" is a necessary third answer and not a cop-out.
+    """
+    if max(w_m, d_m, h_m) <= 0.0:
+        return None
+
+    def near(value, want):
+        return abs(value - want) <= _FIT * want
+
+    foot_long, foot_short = max(w_m, d_m), min(w_m, d_m)
+    # Upright: tall as the tube is long, on a small roughly-round footprint.
+    if near(h_m, TUBE_L_M) and near(foot_long, TUBE_D_M):
+        return True
+    # Lying: as long as the tube across the table, only a diameter high.
+    if near(foot_long, TUBE_L_M) and near(h_m, TUBE_D_M):
+        return False
+    return None
+
+
 def start(ms, port: int = 8486) -> None:
     """Serve the tube UI on ``port``, backed by mission-server module ``ms``."""
     from rax.manipulation.attempt import with_retries
     from rax.manipulation.episodes import EpisodeLog
     from rax.manipulation.grip import CurrentRise, reconcile
+    from rax.perception.tube_caps import draw as draw_caps
+    from rax.perception.tube_caps import find_caps
     from rax.robots.urdf_visuals import link_visuals
 
     app = Flask("tube_mode", static_folder=None)
@@ -83,6 +117,18 @@ def start(ms, port: int = 8486) -> None:
         os.path.join(HERE, "tube_episodes.jsonl"),
         probe=lambda: {"joints": [round(float(v), 1) for v in ms.observe(False)[0]]},
         note=lambda m: tsay(m))
+
+    # ---- caps, found every frame and drawn on the FPV overlay -------------------
+    # THE BOXES THE OPERATOR ASKED FOR, and they are not only decoration: the same
+    # detection is what the grid aim steers on. Registered as a hook so mission_server
+    # never imports this module -- the dependency points one way.
+    def cap_overlay(img):
+        caps = find_caps(img, exclude=[ms.HAND_UV], exclude_r=70)
+        ms.LAST_CAPS[0] = [{"colour": c.colour, "x": c.x, "y": c.y, "area": c.area,
+                            "bbox": list(c.bbox)} for c in caps]
+        ms.LAST_CAPS[1] = time.time()
+        if caps:
+            img[:, :] = draw_caps(img, caps)
 
     def tsay(msg):
         ms.say(msg)
@@ -134,17 +180,62 @@ def start(ms, port: int = 8486) -> None:
             label = str(o.get("label", ""))
             if not any(w in label.lower() for w in TUBE_WORDS):
                 continue
+            # WHICH WAY IS IT LYING? THREE ANSWERS, AND ONE OF THEM IS "DON'T KNOW".
+            #
+            # The obvious test is the measured height: a 100 mm tube standing reads
+            # ~100 mm tall, one on its side reads ~16 mm, its diameter. That test was
+            # tried here and it QUIETLY LIED. The first tube this rig mapped measured
+            # w/d/h = 9/13/41 mm, which the height test called "standing" -- while the
+            # wrist camera plainly showed it lying on the turntable.
+            #
+            # The reason is that 9/13/41 is not the measurement of a tube in ANY pose.
+            # Standing, a tube is about 16x16x100; lying, about 100x16x16. This is
+            # neither, so the silhouette solve had measured a fragment -- most likely
+            # just the cap. Feeding a number that shape into a two-way test does not
+            # produce a wrong answer honestly labelled, it produces a confident one.
+            #
+            # So the test is run against BOTH hypotheses and has to positively match one:
+            # standing means the height is near the tube's length; lying means the
+            # footprint's long side is. Matching neither returns None -- orientation
+            # unknown -- and the viewer then draws a dashed footprint ring instead of a
+            # tube pointing somewhere. That is the same discipline the object map applies
+            # with `yaw_known`, which it sets only when the solve really produced an
+            # angle: "drawing that as a definite orientation is a lie".
+            w_m, d_m, h_m = (float(o.get("w_m", 0.0)), float(o.get("d_m", 0.0)),
+                             float(o.get("h_m", 0.0)))
+            standing = _orientation(w_m, d_m, h_m)
             out.append({"id": o.get("tag"), "colour": _colour_of(label),
                         "x": round(float(o["x"]), 4), "y": round(float(o["y"]), 4),
                         "z": 0.0, "held": False, "rack": None, "hole": None,
-                        "source": "seen", "d": 0.016, "l": float(o.get("h_m", 0.1)),
+                        "source": "seen" if o.get("age", 99) < 8 else "mapped",
+                        # WHICH DIMENSIONS TO DRAW. When the orientation classified, the
+                        # measurement matched a tube and can be drawn as measured. When it
+                        # did not, the measurement is a fragment (the 9/13/41 mm case is a
+                        # cap, not a tube) and drawing it would render a stub that is
+                        # neither the object nor honestly vague -- so fall back to the
+                        # nominal tube and let the dashed footprint carry the uncertainty.
+                        "d": round(min(w_m, d_m, h_m), 4) if standing is not None
+                             else TUBE_D_M,
+                        "l": round(max(w_m, d_m, h_m), 4) if standing is not None
+                             else TUBE_L_M,
+                        # None -> the viewer draws an uncertainty footprint, not a pose
+                        "standing": standing,
+                        "yaw": float(o.get("yaw", 0.0)),
+                        # An orientation we could not classify is not a known yaw either,
+                        # however confident the map's own silhouette solve was about the
+                        # angle of whatever fragment it measured.
+                        "yaw_known": bool(o.get("yaw_known", False)) and standing is not None,
+                        "measured": bool(o.get("measured", False)),
+                        "w": w_m, "h_m": h_m, "age": o.get("age"),
                         "label": label})
         with ms.lock:
             held_label = ms.carry["label"] if ms.carry["held"] else None
         if held_label:
             for t in out:
                 if t["label"] == held_label:
-                    t["held"] = True
+                    # Upright in the jaws: the gripper closes across the tube and lifts
+                    # it, so for once the orientation is known without measuring.
+                    t.update(held=True, standing=True, yaw_known=True)
         return out
 
     def _colour_of(label):
@@ -209,6 +300,9 @@ def start(ms, port: int = 8486) -> None:
             episodes.end(ep, False, f"{type(e).__name__}: {e}")
             tphase("FAILED", f"{type(e).__name__}: {e}")
         finally:
+            # attempt_pick re-arms state["running"] on its way out, so the latch is ours
+            # to drop. Leaving it set makes the whole server look busy forever.
+            ms.release_arm()
             with lock:
                 tstate["running"] = False
 
@@ -255,8 +349,9 @@ def start(ms, port: int = 8486) -> None:
             grip_pct = float(ms.state.get("gripper") or g.open_pct)
         opening = float(np.clip((grip_pct - g.closed_pct) /
                                 max(g.open_pct - g.closed_pct, 1e-6), 0.0, 1.0))
+        caps = list(ms.LAST_CAPS[0]) if time.time() - ms.LAST_CAPS[1] < 2.0 else []
         return jsonify(arm=ms.ARM.name, simulated=False, tip=tip, xf=xf,
-                       opening=opening, tubes=tubes(), racks=racks(),
+                       opening=opening, tubes=tubes(), racks=racks(), caps=caps,
                        phase=ph, note=note,
                        joints=[round(float(v), 2) for v in ms.observe(False)[0]],
                        joint_names=list(ms.ARM.joint_names))
@@ -284,17 +379,26 @@ def start(ms, port: int = 8486) -> None:
             tphase("SCAN", f"looking for tubes — query '{TUBE_QUERY}'")
             try:
                 ms._apply_query_now(TUBE_QUERY)
-                ms.scan_2d(broad=True)
+                # broad=False IS THE POINT. A broad scan replaces the query with the
+                # whole tabletop vocabulary, which is how the first tube scan here mapped
+                # ten objects and not one tube: it found them, then had to name them out
+                # of a 29-word list that contained no tube, so three came back
+                # "toothbrush" and three "pen". The label picks the size prior, and
+                # toothbrush's is 3.3x a tube's, so every one of them would have been
+                # ranged far past where it actually was. A tube run scans for tubes.
+                ms.scan_2d(broad=False)
                 n = len(tubes())
                 tphase("IDLE", f"{n} tube{'' if n == 1 else 's'} on the map")
             except Exception as e:
                 tphase("FAILED", f"scan: {type(e).__name__}: {e}")
             finally:
+                ms.release_arm()
                 with lock:
                     tstate["running"] = False
+        if not ms.claim_arm():
+            return jsonify(ok=False, error="the arm is busy"), 409
+        ms.stop_flag.clear()
         with lock:
-            if tstate["running"]:
-                return jsonify(ok=False, error="busy"), 409
             tstate["running"] = True
         threading.Thread(target=go, daemon=True).start()
         return jsonify(ok=True)
@@ -309,9 +413,19 @@ def start(ms, port: int = 8486) -> None:
         if not found:
             return jsonify(ok=False, error=f"tube {tag} is not on the map"), 404
         label = found[0]["label"]
+        # CLAIM THE ARM THE WAY /start DOES, and clear the stop flag the way run_mission
+        # does. Neither was done in the first version and both bit:
+        #
+        #  * without the claim, `state["running"]` was left latched True after the run --
+        #    the server then looked permanently busy to every other route.
+        #  * without clearing the stop flag, a pick inherits whatever set it last. The
+        #    first real tube pick died with "Abort: stopped by user" seconds in, because
+        #    _guest_cleanup sets the flag for 0.4s when a guest session expires and the
+        #    guest tunnel is live on this rig.
+        if not ms.claim_arm():
+            return jsonify(ok=False, error="the arm is busy"), 409
+        ms.stop_flag.clear()
         with lock:
-            if tstate["running"]:
-                return jsonify(ok=False, error="already running"), 409
             tstate["running"] = True
         sample_idle()
         threading.Thread(target=run, args=(label, hole), daemon=True).start()
@@ -344,7 +458,13 @@ def start(ms, port: int = 8486) -> None:
 
     @app.route("/")
     def index():
-        return send_from_directory(TUBE_UI, "tube.html")
+        # NO-CACHE, because a stale page is indistinguishable from a broken one. A fix to
+        # the camera panel was made and the browser kept showing "this rig has no camera"
+        # over a working stream, which reads as the fix not working.
+        resp = send_from_directory(TUBE_UI, "tube.html")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
 
     @app.route("/ui/<path:name>")
     def ui_asset(name):
@@ -359,6 +479,8 @@ def start(ms, port: int = 8486) -> None:
         sample_idle()
     except Exception as e:
         logger.debug("tube: could not sample idle current: %s", e)
+
+    ms.OVERLAY_HOOKS.append(cap_overlay)
 
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=port, threaded=True,

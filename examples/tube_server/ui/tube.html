@@ -33,6 +33,16 @@
   .wrap{display:grid;grid-template-columns:1fr 320px;gap:12px;
         padding:12px;min-height:100dvh;align-items:start}
   @media (max-width:860px){ .wrap{grid-template-columns:1fr} }
+  /* The camera and the 3D scene are PEERS. The camera is what the arm actually SEES -
+     grid overlay, detections, the grasp point - and the 3D is what it BELIEVES. Showing
+     one without the other hides exactly the disagreement worth looking at. */
+  .views{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:1180px){ .views{grid-template-columns:1fr} }
+  .viewlabel{position:absolute;bottom:8px;right:10px;font-size:10px;color:#5d6b7e;
+             letter-spacing:.4px;text-transform:uppercase;pointer-events:none}
+  #cam{display:block;width:100%;height:100%;object-fit:contain;background:#07090d}
+  .nocam{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+         color:#5d6b7e;font-size:12px;text-align:center;padding:20px;line-height:1.6}
 
   /* ---- the stage ---- */
   .stage{position:relative;background:#0a0d12;border:1px solid var(--line);
@@ -96,8 +106,17 @@
 <div class="wrap">
   <div>
     <div id="simbar" class="warnbar" hidden></div>
+    <div class="views">
+      <div class="stage" id="camstage">
+        <img id="cam" alt="wrist camera">
+        <div class="nocam" id="nocam" hidden>
+          This rig has no camera.<br>The simulator renders the 3D view only.
+        </div>
+        <div class="viewlabel">wrist camera</div>
+      </div>
     <div class="stage">
       <canvas id="scene"></canvas>
+      <div class="viewlabel">what it believes</div>
       <div class="badge">
         <span class="chip">arm <b id="c-arm">—</b></span>
         <span class="chip">grip <b id="c-grip">—</b></span>
@@ -110,6 +129,7 @@
         <span class="n" id="c-note"></span>
         <span class="chip" id="c-tally">—</span>
       </div>
+    </div>
     </div>
   </div>
 
@@ -236,31 +256,66 @@ function armTris(out){
   }
 }
 
-// A tube: a capped cylinder standing on the table (or held, wherever the hand is).
-function tubeTris(out, t){
-  const N=10, r=(t.d||0.016)/2, h=(t.l||0.1);
+// A tube, drawn IN THE POSE THAT WAS MEASURED - not standing up by default.
+//
+// `standing` comes from the object map's measured HEIGHT: a 100mm tube standing reads
+// ~100mm tall, one lying on its side reads ~16mm, which is its diameter. A loose tube on
+// this bench lies down and rolls; only a rack hole holds one upright. The first version
+// of this drew every tube vertical, asserting an orientation nobody had measured.
+//
+// `yaw_known` is honoured the way the object map honours it. When the silhouette solve
+// never produced an orientation, the tube is greyed and a dashed ring is drawn on the
+// table instead - "lying somewhere in this footprint" - rather than pointing confidently
+// along a bearing that is really just an unset zero.
+function tubeTris(out, t, unsure){
+  const N=10, r=(t.d||0.016)/2, L=(t.l||0.1);
   const col = CAPCOL[t.colour] || '#9aa7b8';
-  const body = t.held ? 0.95 : 0.78;
+  const known = t.yaw_known !== false;
+  const standing = !!t.standing;
+  let ax, base;
+  if(standing){
+    ax=[0,0,1]; base=[t.x, t.y, t.z||0];
+  } else {
+    const yw = known ? Math.PI/180*(t.yaw||0) : Math.atan2(t.y, t.x);
+    ax=[Math.cos(yw), Math.sin(yw), 0];
+    base=[t.x - ax[0]*L/2, t.y - ax[1]*L/2, r];   // lying: resting ON the table
+  }
+  const up = Math.abs(ax[2])>0.9 ? [1,0,0] : [0,0,1];
+  const e1 = norm(cross(ax, up)), e2 = norm(cross(ax, e1));
+  const alpha = known ? 1.0 : 0.55;
+  const ring = (a)=>[ (e1[0]*Math.cos(a)+e2[0]*Math.sin(a))*r,
+                      (e1[1]*Math.cos(a)+e2[1]*Math.sin(a))*r,
+                      (e1[2]*Math.cos(a)+e2[2]*Math.sin(a))*r ];
   for(let i=0;i<N;i++){
     const a0=2*Math.PI*i/N, a1=2*Math.PI*(i+1)/N;
-    const p=[ [t.x+r*Math.cos(a0), t.y+r*Math.sin(a0), t.z],
-              [t.x+r*Math.cos(a1), t.y+r*Math.sin(a1), t.z],
-              [t.x+r*Math.cos(a1), t.y+r*Math.sin(a1), t.z+h],
-              [t.x+r*Math.cos(a0), t.y+r*Math.sin(a0), t.z+h] ];
-    const s=p.map(proj);
-    const lam = body*(0.55+0.45*Math.cos(a0+az));
-    const rgb = hexrgb(col).map(v=>Math.min(255, v*lam)|0);
-    const d=(s[0][2]+s[2][2])/2;
-    out.push([d, s[0][0],s[0][1], s[1][0],s[1][1], s[2][0],s[2][1], `rgb(${rgb})`]);
-    out.push([d, s[0][0],s[0][1], s[2][0],s[2][1], s[3][0],s[3][1], `rgb(${rgb})`]);
+    const c0=ring(a0), c1=ring(a1);
+    const q=[ [base[0]+c0[0], base[1]+c0[1], base[2]+c0[2]],
+              [base[0]+c1[0], base[1]+c1[1], base[2]+c1[2]],
+              [base[0]+c1[0]+ax[0]*L, base[1]+c1[1]+ax[1]*L, base[2]+c1[2]+ax[2]*L],
+              [base[0]+c0[0]+ax[0]*L, base[1]+c0[1]+ax[1]*L, base[2]+c0[2]+ax[2]*L] ];
+    const sp=q.map(proj);
+    const lam=(t.held?0.98:0.80)*(0.55+0.45*Math.cos(a0+az))*alpha;
+    const rgb=hexrgb(col).map(v=>Math.min(255, v*lam)|0);
+    const dd=(sp[0][2]+sp[2][2])/2;
+    out.push([dd, sp[0][0],sp[0][1], sp[1][0],sp[1][1], sp[2][0],sp[2][1], `rgb(${rgb})`]);
+    out.push([dd, sp[0][0],sp[0][1], sp[2][0],sp[2][1], sp[3][0],sp[3][1], `rgb(${rgb})`]);
   }
-  // the cap, brighter, so colour is readable from any angle
-  const top=[]; for(let i=0;i<N;i++){const a=2*Math.PI*i/N;
-    top.push(proj([t.x+r*1.15*Math.cos(a), t.y+r*1.15*Math.sin(a), t.z+h+0.004]));}
+  // the cap end, brighter, so the colour reads from any angle
+  const cc=[base[0]+ax[0]*L, base[1]+ax[1]*L, base[2]+ax[2]*L];
+  const top=[];
+  for(let i=0;i<N;i++){
+    const c=ring(2*Math.PI*i/N);
+    top.push(proj([cc[0]+c[0]*1.15+ax[0]*0.004,
+                   cc[1]+c[1]*1.15+ax[1]*0.004,
+                   cc[2]+c[2]*1.15+ax[2]*0.004]));
+  }
   for(let i=1;i+1<N;i++)
     out.push([top[0][2], top[0][0],top[0][1], top[i][0],top[i][1],
               top[i+1][0],top[i+1][1], col]);
+  if(!known && unsure) unsure.push(t);
 }
+function cross(a,b){return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];}
+function norm(v){const n=Math.hypot(v[0],v[1],v[2])||1; return [v[0]/n,v[1]/n,v[2]/n];}
 function hexrgb(h){ return [1,3,5].map(i=>parseInt(h.slice(i,i+2),16)); }
 
 function draw(){
@@ -295,8 +350,8 @@ function draw(){
   }
 
   // one painter's-sorted pass over arm + tubes, so a tube in the jaws occludes right
-  const tris=[]; armTris(tris);
-  for(const t of (G.tubes||[])) tubeTris(tris, t);
+  const tris=[], unsure=[]; armTris(tris);
+  for(const t of (G.tubes||[])) tubeTris(tris, t, unsure);
   tris.sort((a,b)=>b[0]-a[0]);
   for(const t of tris){
     ctx.fillStyle=t[7]; ctx.strokeStyle=t[7]; ctx.lineWidth=1;
@@ -304,9 +359,19 @@ function draw(){
     ctx.closePath(); ctx.fill(); ctx.stroke();   // stroke seals sub-pixel seams
   }
 
+  // Orientation we do NOT know, drawn as a footprint rather than a direction.
+  ctx.setLineDash([3,3]);
+  for(const t of unsure){
+    const L=(t.l||0.1), pts=[];
+    for(let k=0;k<20;k++){ const a=2*Math.PI*k/20;
+      pts.push(proj([t.x+L/2*Math.cos(a), t.y+L/2*Math.sin(a), 0.001])); }
+    ctx.beginPath(); pts.forEach((q,k)=>k?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));
+    ctx.closePath(); ctx.strokeStyle='#6d7b8e'; ctx.lineWidth=1; ctx.stroke();
+  }
+  ctx.setLineDash([]);
   // labels last, always legible
   for(const t of (G.tubes||[])){
-    const s=proj([t.x,t.y,t.z+(t.l||0.1)+0.03]);
+    const s=proj([t.x, t.y, (t.standing ? (t.l||0.1) : (t.d||0.016)) + 0.045]);
     ctx.fillStyle = (sel===t.id) ? '#fff' : '#8fa0b4';
     ctx.font = (sel===t.id ? '600 ' : '') + '10px ui-monospace,Consolas';
     ctx.fillText(`#${t.id} ${t.colour}`, s[0]+6, s[1]);
@@ -347,7 +412,9 @@ function renderTubes(){
                 : `${(Math.hypot(t.x,t.y)*100).toFixed(0)} cm out`;
     tr.innerHTML =
       `<td><span class="dot" style="background:${CAPCOL[t.colour]||'#8a93a0'}"></span>`
-      + `#${t.id} ${t.colour}</td><td>${where}</td>`
+      + `#${t.id} ${t.colour}</td>`
+      + `<td>${where}<br><span class="src">${t.standing ? 'upright' : 'lying'}`
+      + `${t.yaw_known === false ? ', angle unknown' : ''}</span></td>`
       + `<td><span class="src ${t.source}">${t.source}</span></td>`;
     tr.onclick = ()=>{ sel=t.id; renderTubes(); draw(); };
     tb.appendChild(tr);
@@ -419,6 +486,32 @@ $('b-pick').onclick = ()=>{ if(sel===null) return;
   post('/pick', {tube: sel, rack: $('rack').value || null}); };
 $('b-stop').onclick  = ()=> post('/stop');
 $('b-reset').onclick = ()=> post('/reset');
+
+// The wrist stream, carrying the server's own overlay: the grip grid, the detections
+// and the grasp point.
+//
+// WHETHER THERE IS A CAMERA IS DECIDED BY A PROBE, NOT BY AN IMG ERROR, and the
+// difference is not academic - the first version got it wrong on screen. An MJPEG
+// multipart response never finishes, so <img> never fires `load`; and it fires `error`
+// for an ordinary mid-stream hiccup as readily as for a missing camera. Keying off that
+// put "this rig has no camera" on top of a stream that was plainly working and showing
+// tubes. So: ask the endpoint once, look at the status code, and only then decide. A
+// later hiccup is a hiccup, and the message never comes back.
+(function(){
+  const img = $('cam');
+  function noCamera(){
+    img.hidden = true;
+    $('nocam').hidden = false;
+    document.querySelector('.views').style.gridTemplateColumns = '1fr';
+  }
+  const ctrl = new AbortController();
+  fetch('/stream', {signal: ctrl.signal})
+    .then(r => {
+      ctrl.abort();                 // headers are enough; do not hold a second stream open
+      if (r.ok) { img.src = '/stream'; } else { noCamera(); }
+    })
+    .catch(e => { if (e.name !== 'AbortError') noCamera(); });
+})();
 
 resize(); pollGeom(); pollState();
 setInterval(pollGeom, 120);
