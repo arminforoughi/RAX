@@ -82,7 +82,7 @@
     { t: 1.7, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 1, s: "rest" },
     { t: 2.6, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 1, s: "rest", tw: 1 },
     { t: 3.5, p: [tubeAt.x, tubeAt.y, 2.2], a: P, g: 1, s: "rest" },
-    { t: 4.0, p: [tubeAt.x, tubeAt.y, 2.2], a: P, g: 0.2, s: "rest" },
+    { t: 4.0, p: [tubeAt.x, tubeAt.y, 2.2], a: P, g: 0.2, s: "held" },
     { t: 4.9, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 0.2, s: "held" },
     { t: 6.0, p: [16, -2, 18], a: 0, g: 0.2, s: "up" },
     { t: 7.4, p: [hole.x - 6, hole.y, 22], a: 0, g: 0.2, s: "up" },
@@ -121,7 +121,8 @@
       if (t >= A.t && t <= B.t) {
         const u = ease((t - A.t) / (B.t - A.t));
         return { p: A.p.map((v, k) => lerp(v, B.p[k], u)), a: lerp(A.a, B.a, u), g: lerp(A.g, B.g, u),
-                 s: B.s === "drop" ? "drop" : A.s, u, roll: B.tw ? u * 0.6 : (A.tw ? 0.6 : 0),
+                 s: B.s === "drop" ? "drop" : (A.s === "held" && B.s === "up" ? "tilt" : A.s), u,
+                 roll: B.tw ? u * 0.6 : (A.tw ? 0.6 : 0),
                  held: B.held === -1 && A.held !== -1 ? A.held : (A.held ?? -1),
                  n: Math.min(A.n ?? 0, B.n ?? 0) };
       }
@@ -209,6 +210,14 @@
     } else {
       if (s.s === "rest") lying([tubeAt.x, tubeAt.y, 0]);
       else if (s.s === "held") lying(add(tip, [0, 0, -1.6]));
+      else if (s.s === "tilt") {                         // swings upright with the hand
+        const th = s.u * Math.PI / 2, o = tip;
+        const at = (v) => { const r = rotP(v, th); return add(o, [r[0], r[1], r[2] - 1.6 * (1 - s.u) + 1.5 * s.u]); };
+        // slide the grip point along the tube so the last frame IS the standing pose
+        const tOff = -5 - 5 * s.u, cOff = 5 - 4.7 * s.u;
+        TUBEP.forEach((v) => push(at([v[0] + tOff, v[1], v[2]]), 0.9, 1.5));
+        CAPP.forEach((v) => push(at([v[0] + cOff, v[1], v[2]]), 1, 1.9));
+      }
       else if (s.s === "up") standing(add(tip, [0, 0, 1.5]));
       else if (s.s === "drop") standing(add(tip, [0, 0, 1.5 - s.u * 6]));
       else standing([hole.x, hole.y, RACK.h + 7.5]);
