@@ -44,6 +44,12 @@ h1 em{font-style:normal; color:var(--cyan)}
 .band h2{font:700 clamp(28px,4vw,44px)/1.02 var(--cond); text-transform:uppercase; margin:0;
          letter-spacing:.01em; max-width:20ch; text-wrap:balance}
 .band > p{max-width:60ch; color:var(--soft); margin:0}
+.band p b{color:var(--ink); font-weight:500}
+.video{margin:0; border:1px solid var(--line-2); background:#000; position:relative}
+.video::before{content:""; position:absolute; inset:-1px auto auto -1px; width:14px; height:14px; z-index:1;
+      border-top:2px solid var(--cyan); border-left:2px solid var(--cyan)}
+.video video{display:block; width:100%; height:auto; max-width:100%}
+.stats.results{max-width:520px}
 .label{font:500 12px/1 var(--mono); letter-spacing:.18em; text-transform:uppercase; color:var(--amber)}
 
 .cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px}

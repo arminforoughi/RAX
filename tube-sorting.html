@@ -37,6 +37,22 @@
     <div class="stat"><span class="v">672</span><span class="k">Self-labelled episodes recorded</span></div>
   </section>
 
+  <section class="band" id="demo">
+    <span class="label">Demo · on the bench</span>
+    <h2>It picks four in five.</h2>
+    <p>An unedited run of the scripted pipeline: map the bench, pick each tube square to the table, stand it up and drop it into its rack. With this method the arm gets <b>80% success on the pick-up</b> and <b>50% on the drop</b> into the rack hole.</p>
+    <figure class="video">
+      <video controls muted playsinline preload="metadata" poster="media/tube-demo.jpg">
+        <source src="media/tube-demo.mp4" type="video/mp4">
+      </video>
+    </figure>
+    <div class="stats results" aria-label="Success rates">
+      <div class="stat"><span class="v">80%</span><span class="k">Pick-up success</span></div>
+      <div class="stat"><span class="v">50%</span><span class="k">Drop into the hole</span></div>
+    </div>
+    <p>The pick has a tolerance of about 5 mm and the camera clears it easily. The drop is the hard half: a 13 mm tube in a ~15 mm hole leaves about 1 mm of clearance, below what an open-loop move can hit. Closing that gap takes a contact search at the rim, not better pixels.</p>
+  </section>
+
   <section class="band" id="how">
     <span class="label">What's new</span>
     <h2>Six ideas that make it work</h2>
@@ -80,6 +96,39 @@
     </div>
   </section>
 
+  <section class="band" id="vla">
+    <span class="label">What we tried first</span>
+    <h2>Why an end-to-end VLA didn't work.</h2>
+    <p>Before the scripted pipeline we trained SmolVLA end to end on teleoperated demonstrations of the same task, recorded on an X250 arm: two cameras and six joints in, joint actions out. It didn't sort tubes reliably, and the reasons were in the data and the task, not the model size.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="n">01</span>
+        <div><h3>Too few examples of the rule</h3>
+        <p>Blue and green go to the black rack, red to the silver one. The policy had to infer that rule from pixels, from about 43 episodes per colour. Green really had 22: 21 of its 43 were exact duplicates. A rule that fits in a three-row lookup table was being learned from a few dozen examples.</p></div>
+        <span class="spec">43 / 22 / 43 distinct episodes per colour</span>
+      </div>
+      <div class="step">
+        <span class="n">02</span>
+        <div><h3>The instruction said nothing</h3>
+        <p>Every frame of every episode carried the same sentence, "Pick up the blood tube and place it in the rack". The text told the policy nothing about which phase it was in, which tube to take or which rack to use, so the language half of the vision-language-action model had nothing to do.</p></div>
+        <span class="spec">1 instruction for ~69k frames</span>
+      </div>
+      <div class="step">
+        <span class="n">03</span>
+        <div><h3>Noisy, fixed-length demonstrations</h3>
+        <p>Episodes were cut at a fixed ~20 s, not when the task ended, so on average 18% of each one is the arm idling after the release. One in eleven taught the wrong thing: recording stopped while still holding the tube, the grasp was missing, or nothing was picked. And the training stack only loads one recording session at a time, so early runs saw 18–20 episodes, not 117.</p></div>
+        <span class="spec">11 of 117 bad · 18% dead time · 1 session per run</span>
+      </div>
+      <div class="step">
+        <span class="n">04</span>
+        <div><h3>It can't see what it needs</h3>
+        <p>Nothing in the policy's input says which holes in the rack are free, so it can't choose one. And the drop has about 1 mm of clearance. Imitation reproduces the average of the demonstrations, and averaging moves that differ by a few millimetres misses a 1 mm hole. That is a contact problem, not a pattern-matching one.</p></div>
+        <span class="spec">no occupancy input · ~1 mm clearance</span>
+      </div>
+    </div>
+    <p>So the pipeline splits the work: geometry, the arm's own kinematics and sensing do what they can do exactly, and learning goes where it pays off, in seeing the tubes. The VLA stays as a baseline to beat.</p>
+  </section>
+
   <section class="band">
     <span class="label">Next · in progress</span>
     <h2>Teleop data becomes a detector.</h2>
@@ -118,8 +167,8 @@
     <h2>The same loop picks anything it can see.</h2>
     <p>Nothing in detect → locate → orient → solve → verify is specific to tubes. Swap the detector and the pipeline picks vials, cubes or parts, and places into trays or bins. Bringing a cap between the jaws and bringing a held tube over a hole are the same visual servo, used twice.</p>
     <div class="status">
-      <span class="chip ok">Picking · working on the bench</span>
-      <span class="chip wip">Drop into hole · calibrating</span>
+      <span class="chip ok">Picking · 80% success</span>
+      <span class="chip wip">Drop into hole · 50% success</span>
     </div>
   </section>
 
