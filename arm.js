@@ -1,184 +1,194 @@
-/* A blueprint robot arm that picks a lying tube, stands it up and drops it into a rack.
-   Drawn on a full-screen canvas behind the page. Pure 2D: two links, a wrist, a gripper,
-   solved with the same two-link inverse kinematics the real arm's planner uses. */
+/* RAX background: a robot arm drawn as a cloud of blue points, in 3D, picking a lying
+   tube, standing it up and dropping it into a rack. The joint angles come from the same
+   kind of solution the real arm uses: base yaw toward the target, then two-link IK in
+   the arm's vertical plane with the wrist pitch held. */
 (function () {
   const cv = document.getElementById("arm");
   if (!cv) return;
   const ctx = cv.getContext("2d");
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let W = 0, H = 0, dpr = 1, S = 1, base = { x: 0, y: 0 };
+  let W = 0, H = 0, dpr = 1;
 
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = cv.clientWidth; H = cv.clientHeight;
     cv.width = W * dpr; cv.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    // keep the drawing on the right, clear of the headline on wide screens
-    S = W > 760 ? Math.min(W * 0.5, H * 1.05) / 900 : Math.min(W * 0.95, H) / 900;
-    base = { x: W * (W > 760 ? 0.8 : 0.55), y: H * 0.8 };
   }
   window.addEventListener("resize", resize);
   resize();
 
-  // world units: base at origin, +x right, +y up. Table is y = 0.
-  const L1 = 260, L2 = 230, HAND = 95;
-  const TUBE = 120;                                    // tube length
-  const tubeStart = { x: -330, y: 8 };                 // lying on the table, left of base
-  const rack = { x: 250, y: 0, w: 150, h: 90, holes: [ -45, 0, 45 ] };
+  // ---- geometry, in centimetres; z is up -----------------------------------------
+  const L0 = 7, L1 = 17, L2 = 15, L3 = 8;             // base height, links, hand
+  const rnd = (() => { let s = 7; return () => ((s = (s * 16807) % 2147483647) / 2147483647); })();
 
-  // keyframes: fingertip position (x, y), hand angle (rad, -pi/2 = pointing down),
-  // grip (0 closed .. 1 open), and what the tube is doing
-  const P = -Math.PI / 2;
-  const keys = [
-    { t: 0.0, x: -40, y: 360, a: -0.6, g: 1, tube: "rest", say: "LOOK · MAP" },
-    { t: 1.6, x: -330, y: 200, a: P, g: 1, tube: "rest", say: "LOCATE · PIXEL → TABLE" },
-    { t: 2.4, x: -330, y: 200, a: P, g: 1, tube: "rest", say: "ORIENT · TWIST TO SQUARE" },
-    { t: 3.4, x: -330, y: 30, a: P, g: 1, tube: "rest", say: "STRAIGHT DOWN · 90°" },
-    { t: 3.9, x: -330, y: 30, a: P, g: 0.25, tube: "rest", say: "GRASP · JAWS STOP SHORT = HELD" },
-    { t: 4.8, x: -330, y: 230, a: P, g: 0.25, tube: "held", say: "LIFT" },
-    { t: 5.9, x: -120, y: 330, a: 0, g: 0.25, tube: "up", say: "HAND LEVEL · TUBE STANDS" },
-    { t: 7.4, x: 250, y: 290, a: 0, g: 0.25, tube: "up", say: "CARRY HIGH" },
-    { t: 8.2, x: 250, y: 205, a: 0, g: 0.25, tube: "up", say: "OVER THE HOLE" },
-    { t: 8.7, x: 250, y: 205, a: 0, g: 1, tube: "drop", say: "RELEASE" },
-    { t: 9.6, x: 120, y: 360, a: -0.6, g: 1, tube: "in", say: "VERIFY · CAP IN HOLE" },
-    { t: 11.2, x: -40, y: 360, a: -0.6, g: 1, tube: "in", say: "NEXT TUBE" },
-  ];
-  const T = keys[keys.length - 1].t;
-
-  const ease = (u) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
-  function sample(t) {
-    for (let i = 0; i < keys.length - 1; i++) {
-      const a = keys[i], b = keys[i + 1];
-      if (t >= a.t && t <= b.t) {
-        const u = ease((t - a.t) / (b.t - a.t || 1));
-        return { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u,
-                 a: a.a + (b.a - a.a) * u, g: a.g + (b.g - a.g) * u,
-                 tube: b.tube === "drop" ? "drop" : a.tube, u, say: b.say };
+  // WIREFRAME, NOT NOISE: dots spaced evenly along edges and rings, like a scan
+  function line(a, b, step, out) {
+    const n = Math.max(1, Math.round(Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / step));
+    for (let i = 0; i <= n; i++) out.push([a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n, a[2] + (b[2] - a[2]) * i / n]);
+  }
+  function boxPts(len, w, d, step = 0.55, rings = 4) {   // a box along x
+    const p = [], y = w / 2, z = d / 2;
+    const c = [[y, z], [-y, z], [-y, -z], [y, -z]];
+    c.forEach(([cy, cz]) => line([0, cy, cz], [len, cy, cz], step, p));
+    for (let r = 0; r <= rings; r++) {
+      const u = (r / rings) * len;
+      for (let k = 0; k < 4; k++) line([u, ...c[k]], [u, ...c[(k + 1) % 4]], step, p);
+    }
+    return p;
+  }
+  function cylPts(r, h, n, axis, rings = 4, spokes = 12) {
+    const p = [];
+    for (let q = 0; q <= rings; q++) {
+      const hh = (q / rings) * h;
+      for (let k = 0; k < n; k++) {
+        const a = (k / n) * Math.PI * 2;
+        p.push(axis === "x" ? [hh, r * Math.cos(a), r * Math.sin(a)] : [r * Math.cos(a), r * Math.sin(a), hh]);
       }
     }
-    return { ...keys[0], u: 0 };
+    for (let k = 0; k < spokes; k++) {
+      const a = (k / spokes) * Math.PI * 2, ca = r * Math.cos(a), sa = r * Math.sin(a);
+      line(axis === "x" ? [0, ca, sa] : [ca, sa, 0], axis === "x" ? [h, ca, sa] : [ca, sa, h], 0.6, p);
+    }
+    return p;
+  }
+  const BASE = cylPts(4.5, L0, 40, "z", 4, 14);
+  const LINK1 = boxPts(L1, 3.6, 3.6, 0.55, 5);
+  const LINK2 = boxPts(L2, 3.0, 3.0, 0.55, 5);
+  const HANDP = boxPts(L3 * 0.55, 3.4, 5.0, 0.5, 3);
+  const JAW = boxPts(L3 * 0.5, 0.8, 2.2, 0.45, 2);
+  const TUBEP = cylPts(0.8, 10, 12, "x", 6, 6);
+  const CAPP = cylPts(0.95, 1.6, 14, "x", 3, 8);
+  const RACK = { x: 17, y: -16, w: 7, d: 11, h: 5 };
+  const RACKP = (() => {
+    const p = boxPts(RACK.d, RACK.w, RACK.h, 0.6, 4).map(([u, y, z]) => [y, u - RACK.d / 2, z + RACK.h / 2]);
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 2; c++)
+      for (let k = 0; k < 18; k++) {
+        const a = (k / 18) * Math.PI * 2;
+        p.push([(c - 0.5) * 3.2 + 0.9 * Math.cos(a), (r - 1.5) * 2.5 + 0.9 * Math.sin(a), RACK.h]);
+      }
+    return p;
+  })();
+  const FLOOR = [];
+  for (let x = -26; x <= 30; x += 3) for (let y = -26; y <= 26; y += 3) FLOOR.push([x, y, 0]);
+
+  // ---- motion ------------------------------------------------------------------------
+  const tubeAt = { x: 20, y: 10 };                   // lying on the table
+  const hole = { x: RACK.x - 1.6, y: RACK.y - 1.25 };
+  const P = -Math.PI / 2;
+  const keys = [                                     // fingertip, hand pitch, grip, tube
+    { t: 0.0, p: [14, 2, 16], a: -0.5, g: 1, s: "rest" },
+    { t: 1.7, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 1, s: "rest" },
+    { t: 2.6, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 1, s: "rest", tw: 1 },
+    { t: 3.5, p: [tubeAt.x, tubeAt.y, 2.2], a: P, g: 1, s: "rest" },
+    { t: 4.0, p: [tubeAt.x, tubeAt.y, 2.2], a: P, g: 0.2, s: "rest" },
+    { t: 4.9, p: [tubeAt.x, tubeAt.y, 12], a: P, g: 0.2, s: "held" },
+    { t: 6.0, p: [16, -2, 18], a: 0, g: 0.2, s: "up" },
+    { t: 7.4, p: [hole.x - 6, hole.y, 22], a: 0, g: 0.2, s: "up" },
+    { t: 8.2, p: [hole.x - 6, hole.y, 15.5], a: 0, g: 0.2, s: "up" },
+    { t: 8.7, p: [hole.x - 6, hole.y, 15.5], a: 0, g: 1, s: "drop" },
+    { t: 9.8, p: [12, -4, 18], a: -0.5, g: 1, s: "in" },
+    { t: 11.4, p: [14, 2, 16], a: -0.5, g: 1, s: "in" },
+  ];
+  const T = keys[keys.length - 1].t;
+  const ease = (u) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
+  const lerp = (a, b, u) => a + (b - a) * u;
+  function sample(t) {
+    for (let i = 0; i < keys.length - 1; i++) {
+      const A = keys[i], B = keys[i + 1];
+      if (t >= A.t && t <= B.t) {
+        const u = ease((t - A.t) / (B.t - A.t));
+        return { p: A.p.map((v, k) => lerp(v, B.p[k], u)), a: lerp(A.a, B.a, u), g: lerp(A.g, B.g, u),
+                 s: B.s === "drop" ? "drop" : A.s, u, roll: B.tw ? u * 0.6 : (A.tw ? 0.6 : 0) };
+      }
+    }
+    return { p: keys[0].p, a: keys[0].a, g: 1, s: "rest", u: 0, roll: 0 };
   }
 
-  function ik(tx, ty, ha) {
-    // wrist = fingertip minus the hand, then the classic two-link solution (elbow up)
-    const wx = tx - HAND * Math.cos(ha), wy = ty - HAND * Math.sin(ha) - 60;
-    let d = Math.hypot(wx, wy);
-    d = Math.min(d, L1 + L2 - 1);
+  function solve(p, a) {                              // base yaw + planar 2-link IK
+    const yaw = Math.atan2(p[1], p[0]);
+    const r = Math.hypot(p[0], p[1]), z = p[2];
+    const wr = r - L3 * Math.cos(a), wz = z - L3 * Math.sin(a) - L0;
+    const d = Math.min(Math.hypot(wr, wz), L1 + L2 - 0.01);
     const c2 = (d * d - L1 * L1 - L2 * L2) / (2 * L1 * L2);
-    // both elbow solutions; keep the one with the elbow HIGHER (elbow up, like the arm)
     let best = null;
-    for (const sg of [1, -1]) {
+    for (const sg of [1, -1]) {                        // keep the elbow up
       const q2 = sg * Math.acos(Math.max(-1, Math.min(1, c2)));
-      const q1 = Math.atan2(wy, wx) - Math.atan2(L2 * Math.sin(q2), L1 + L2 * Math.cos(q2));
-      const ey = L1 * Math.sin(q1);
-      if (!best || ey > best.ey) best = { q1, q2, ey };
+      const q1 = Math.atan2(wz, wr) - Math.atan2(L2 * Math.sin(q2), L1 + L2 * Math.cos(q2));
+      if (!best || Math.sin(q1) > Math.sin(best.q1)) best = { q1, q2 };
     }
-    return { q1: best.q1, q2: best.q2, q3: ha - best.q1 - best.q2 };
+    return { yaw, q1: best.q1, q2: best.q2, q3: a - best.q1 - best.q2 };
   }
 
-  const X = (x) => base.x + x * S, Y = (y) => base.y - y * S;
-  const COL = { line: "rgba(190,226,255,0.8)", faint: "rgba(190,226,255,0.25)",
-                glow: "rgba(127,212,255,0.9)", text: "rgba(190,226,255,0.75)", amber: "#ffd27a" };
+  // ---- 3D helpers --------------------------------------------------------------------
+  const rotZ = (v, t) => { const c = Math.cos(t), s = Math.sin(t); return [c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]]; };
+  const rotP = (v, t) => { const c = Math.cos(t), s = Math.sin(t); return [c * v[0] - s * v[2], v[1], s * v[0] + c * v[2]]; };
+  const rotX = (v, t) => { const c = Math.cos(t), s = Math.sin(t); return [v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]]; };
+  const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 
-  function link(x1, y1, x2, y2, w) {
-    const a = Math.atan2(y2 - y1, x2 - x1), nx = -Math.sin(a) * w / 2, ny = Math.cos(a) * w / 2;
-    ctx.beginPath();
-    ctx.moveTo(X(x1 + nx), Y(y1 + ny)); ctx.lineTo(X(x2 + nx), Y(y2 + ny));
-    ctx.lineTo(X(x2 - nx), Y(y2 - ny)); ctx.lineTo(X(x1 - nx), Y(y1 - ny)); ctx.closePath();
-    ctx.stroke();
-    ctx.save(); ctx.setLineDash([6 * S, 6 * S]); ctx.strokeStyle = COL.faint;
-    ctx.beginPath(); ctx.moveTo(X(x1), Y(y1)); ctx.lineTo(X(x2), Y(y2)); ctx.stroke(); ctx.restore();
-  }
-  function joint(x, y, r, label, ang) {
-    ctx.beginPath(); ctx.arc(X(x), Y(y), r * S, 0, Math.PI * 2); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(X(x - r * 1.6), Y(y)); ctx.lineTo(X(x + r * 1.6), Y(y));
-    ctx.moveTo(X(x), Y(y - r * 1.6)); ctx.lineTo(X(x), Y(y + r * 1.6)); ctx.stroke();
-    if (label) {
-      ctx.fillStyle = COL.text;
-      ctx.fillText(`${label} ${(ang * 180 / Math.PI).toFixed(1)}°`, X(x + r * 2.2), Y(y + r * 1.8));
-    }
-  }
-  function tubeShape(cx, cy, ang, capCol) {
-    const dx = Math.cos(ang) * TUBE / 2, dy = Math.sin(ang) * TUBE / 2;
-    ctx.save(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.2;
-    link(cx - dx, cy - dy, cx + dx * 0.72, cy + dy * 0.72, 18);
-    ctx.fillStyle = capCol; ctx.strokeStyle = capCol;
-    const cxp = cx + dx * 0.86, cyp = cy + dy * 0.86;
-    ctx.beginPath(); ctx.arc(X(cxp), Y(cyp), 11 * S, 0, Math.PI * 2); ctx.globalAlpha = 0.85; ctx.fill();
-    ctx.restore();
+  let camYaw = -1.05;
+  const camPitch = 0.32;
+  function project(v) {
+    const q = rotZ(v, camYaw);
+    const c = Math.cos(camPitch), s = Math.sin(camPitch);
+    const y = q[1] * c + q[2] * s, z = -q[1] * s + q[2] * c;
+    const depth = 95 + y;
+    const f = Math.min(W * 0.62, H * 0.95) * 1.35 / depth;
+    const cx = W > 900 ? W * 0.79 : W * 0.5, cy = H * (W > 900 ? 0.74 : 0.8);
+    return [cx + q[0] * f, cy - z * f, depth];
   }
 
   function frame(ms) {
-    const t = reduce ? 6.4 : (ms / 1000) % T;
+    const t = reduce ? 1.7 : (ms / 1000) % T;
+    if (!reduce) camYaw = -1.05 + Math.sin(ms / 9000) * 0.22;
     ctx.clearRect(0, 0, W, H);
-    ctx.lineWidth = 1.3; ctx.strokeStyle = COL.line;
-    ctx.font = `${Math.max(10, 12 * S * 1.1)}px "IBM Plex Mono", ui-monospace, monospace`;
-
-    // table + rack
-    ctx.strokeStyle = COL.faint; ctx.beginPath(); ctx.moveTo(0, Y(0)); ctx.lineTo(W, Y(0)); ctx.stroke();
-    ctx.strokeStyle = COL.line;
-    ctx.strokeRect(X(rack.x - rack.w / 2), Y(rack.h), rack.w * S, rack.h * S);
-    rack.holes.forEach((h) => { ctx.beginPath(); ctx.ellipse(X(rack.x + h), Y(rack.h), 13 * S, 4 * S, 0, 0, Math.PI * 2); ctx.stroke(); });
-    ctx.fillStyle = COL.text; ctx.fillText("RACK · HOLE 1", X(rack.x - rack.w / 2), Y(rack.h + 18));
-
     const s = sample(t);
-    const k = ik(s.x, s.y, s.a);
-    const j1 = { x: 0, y: 60 };
-    const j2 = { x: j1.x + L1 * Math.cos(k.q1), y: j1.y + L1 * Math.sin(k.q1) };
-    const j3 = { x: j2.x + L2 * Math.cos(k.q1 + k.q2), y: j2.y + L2 * Math.sin(k.q1 + k.q2) };
+    const k = solve(s.p, s.a);
+
+    const pts = [];
+    const push = (v, a, sz) => { const [x, y, d] = project(v); pts.push([x, y, d, a, sz]); };
+    FLOOR.forEach((v) => push(v, 0.14, 1.1));
+
+    const shoulder = [0, 0, L0];
+    const place = (local, origin, pitch, alpha = 0.85, sz = 1.5, roll = 0) => {
+      local.forEach((lp) => {
+        let v = roll ? rotX(lp, roll) : lp;
+        v = rotZ(rotP(v, pitch), k.yaw);
+        push(add(origin, v), alpha, sz);
+      });
+    };
+    BASE.forEach((v) => push(v, 0.7, 1.4));
+    place(LINK1, shoulder, k.q1);
+    const elbow = add(shoulder, rotZ(rotP([L1, 0, 0], k.q1), k.yaw));
+    place(LINK2, elbow, k.q1 + k.q2);
+    const wrist = add(elbow, rotZ(rotP([L2, 0, 0], k.q1 + k.q2), k.yaw));
     const ha = k.q1 + k.q2 + k.q3;
-    const tip = { x: j3.x + HAND * Math.cos(ha), y: j3.y + HAND * Math.sin(ha) };
-
-    // the tube
-    const caps = "#4da3ff";
-    if (s.tube === "rest") tubeShape(tubeStart.x + 20, tubeStart.y + 9, 0, caps);        // lying
-    else if (s.tube === "held") tubeShape(tip.x, tip.y - 6, 0, caps);                    // lifted, still lying
-    else if (s.tube === "up") tubeShape(tip.x, tip.y - TUBE * 0.35, Math.PI / 2, caps);   // standing in the jaws
-    else if (s.tube === "drop") tubeShape(tip.x, tip.y - TUBE * 0.35 - s.u * 60, Math.PI / 2, caps);
-    else tubeShape(rack.x, rack.h + 18, Math.PI / 2, caps);                             // in the hole
-
-    // the arm
-    ctx.strokeStyle = COL.line; ctx.lineWidth = 1.4;
-    ctx.strokeRect(X(-70), Y(60), 140 * S, 60 * S);                 // base
-    link(j1.x, j1.y, j2.x, j2.y, 44); link(j2.x, j2.y, j3.x, j3.y, 34);
-    link(j3.x, j3.y, tip.x, tip.y, 30);
-    joint(j1.x, j1.y, 16, "θ1", k.q1); joint(j2.x, j2.y, 13, "θ2", k.q2); joint(j3.x, j3.y, 11, "θ3", k.q3);
-    // jaws
-    const open = 10 + 26 * s.g, px = -Math.sin(ha), py = Math.cos(ha);
-    ctx.beginPath();
+    place(HANDP, wrist, ha, 0.9, 1.5, s.roll);
+    const tip = add(wrist, rotZ(rotP([L3, 0, 0], ha), k.yaw));
+    const open = 0.9 + 1.6 * s.g;
     [-1, 1].forEach((sg) => {
-      const bx = tip.x + px * open * sg, by = tip.y + py * open * sg;
-      ctx.moveTo(X(bx), Y(by)); ctx.lineTo(X(bx + Math.cos(ha) * 30), Y(by + Math.sin(ha) * 30));
+      const jawO = add(wrist, rotZ(rotP(rotX([L3 * 0.5, sg * open, 0], s.roll), ha), k.yaw));
+      place(JAW, jawO, ha, 0.95, 1.6, s.roll);
     });
-    ctx.stroke();
 
-    // the wrist camera's view cone and the target it has locked on
-    const cam = { x: j3.x + Math.cos(ha) * 40, y: j3.y + Math.sin(ha) * 40 };
-    ctx.save(); ctx.strokeStyle = "rgba(127,212,255,0.35)"; ctx.setLineDash([3 * S, 5 * S]);
-    const look = s.tube === "rest" ? { x: tubeStart.x + 65, y: 17 } : { x: rack.x, y: rack.h };
-    ctx.beginPath(); ctx.moveTo(X(cam.x), Y(cam.y)); ctx.lineTo(X(look.x - 40), Y(look.y));
-    ctx.moveTo(X(cam.x), Y(cam.y)); ctx.lineTo(X(look.x + 40), Y(look.y)); ctx.stroke(); ctx.restore();
-    ctx.save(); ctx.strokeStyle = COL.amber; ctx.lineWidth = 1.2;
-    const r = 18 * S + Math.sin(ms / 180) * 2;
-    ctx.beginPath(); ctx.arc(X(look.x), Y(look.y), r, 0, Math.PI * 2); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(X(look.x) - r - 6, Y(look.y)); ctx.lineTo(X(look.x) - r + 4, Y(look.y));
-    ctx.moveTo(X(look.x) + r - 4, Y(look.y)); ctx.lineTo(X(look.x) + r + 6, Y(look.y)); ctx.stroke();
-    ctx.restore();
+    const lying = (o) => { TUBEP.forEach((v) => push(add(o, [v[0] - 5, v[1], v[2] + 0.8]), 0.9, 1.5));
+                           CAPP.forEach((v) => push(add(o, [v[0] + 5, v[1], v[2] + 0.8]), 1, 1.9)); };
+    const standing = (o) => { TUBEP.forEach((v) => push(add(o, [v[1], v[2], v[0] - 10]), 0.9, 1.5));
+                              CAPP.forEach((v) => push(add(o, [v[1], v[2], v[0] + 0.3]), 1, 1.9)); };
+    if (s.s === "rest") lying([tubeAt.x, tubeAt.y, 0]);
+    else if (s.s === "held") lying(add(tip, [0, 0, -1.6]));
+    else if (s.s === "up") standing(add(tip, [0, 0, 1.5]));
+    else if (s.s === "drop") standing(add(tip, [0, 0, 1.5 - s.u * 6]));
+    else standing([hole.x, hole.y, RACK.h + 7.5]);
 
-    // a dimension line for the reach
-    ctx.save(); ctx.strokeStyle = COL.faint; ctx.fillStyle = COL.text;
-    const dy = -34;
-    ctx.beginPath(); ctx.moveTo(X(0), Y(dy)); ctx.lineTo(X(tip.x), Y(dy));
-    ctx.moveTo(X(0), Y(dy - 8)); ctx.lineTo(X(0), Y(dy + 8));
-    ctx.moveTo(X(tip.x), Y(dy - 8)); ctx.lineTo(X(tip.x), Y(dy + 8)); ctx.stroke();
-    ctx.fillText(`r = ${(Math.abs(tip.x) / 10).toFixed(1)} cm`, X(tip.x / 2) - 30, Y(dy - 16));
-    ctx.restore();
+    RACKP.forEach((v) => push([v[0] + RACK.x, v[1] + RACK.y, v[2]], 0.75, 1.3));
 
-    // the step caption, like a callout on a drawing
-    ctx.save(); ctx.fillStyle = COL.amber;
-    ctx.font = `600 ${Math.max(11, 13 * S * 1.1)}px "IBM Plex Mono", ui-monospace, monospace`;
-    ctx.fillText(`▸ ${s.say || ""}`, X(-360), Y(560)); ctx.restore();
-
+    pts.sort((a, b) => b[2] - a[2]);                  // far points first
+    for (const [x, y, d, a, sz] of pts) {
+      const fade = Math.max(0.35, Math.min(1, 1.35 - (d - 70) / 60));
+      ctx.fillStyle = `rgba(29,78,216,${Math.min(1, a * fade * 1.05).toFixed(3)})`;
+      ctx.fillRect(x - sz / 2, y - sz / 2, sz, sz);
+    }
     if (!reduce) requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
