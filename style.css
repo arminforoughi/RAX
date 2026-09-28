@@ -71,3 +71,8 @@ footer a{color:var(--muted)}
 .rates div{display:flex; flex-direction:column}
 .rates .v{font-size:clamp(2.4rem,1.8rem + 2vw,3.4rem); font-weight:700; letter-spacing:-.04em; color:var(--blue); line-height:1; font-variant-numeric:tabular-nums}
 .rates .k{font-size:.9rem; color:var(--muted); margin-top:.35rem}
+
+/* the highlighted way out to the other projects */
+nav.top .btn.projects{font-size:1rem; font-weight:600; padding:.75rem 1.35rem; background:var(--blue);
+  box-shadow:0 0 0 4px rgba(59,130,246,.18), 0 8px 22px rgba(29,78,216,.28)}
+nav.top .btn.projects:hover{background:#1e40af}
