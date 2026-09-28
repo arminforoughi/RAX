@@ -76,3 +76,9 @@ footer a{color:var(--muted)}
 nav.top .btn.projects{font-size:1rem; font-weight:600; padding:.75rem 1.35rem; background:var(--blue);
   box-shadow:0 0 0 4px rgba(59,130,246,.18), 0 8px 22px rgba(29,78,216,.28)}
 nav.top .btn.projects:hover{background:#1e40af}
+
+/* the loop figure */
+.explain{margin:2rem 0 1.8rem; background:rgba(255,255,255,.96); border:1px solid var(--line); border-radius:20px;
+         padding:clamp(10px,2vw,20px); overflow-x:auto}
+.explain svg{display:block; min-width:780px; width:100%; height:auto}
+.steps3 p b{color:var(--blue)}
