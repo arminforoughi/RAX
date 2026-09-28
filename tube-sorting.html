@@ -192,13 +192,15 @@
 
   <section class="band tint" id="next">
     <div class="wrap">
-      <h2>What's next: from 80% and 50% to near perfect</h2>
+      <h2>What's next: training it to near perfect</h2>
       <div class="prose">
         <p><b>Feel the last millimetre.</b> The drop fails on 1 mm of clearance, below what any camera-driven move can hit. The fix is contact, not pixels: lower the tube until it touches the rim, read the gripper current, and spiral outward in small steps until it falls in. That turns a 50% guess into a search that ends in the hole.</p>
         <p><b>Servo on the hole itself.</b> The drop still trusts a rough overhead calibration to find the rack. The same see, measure, solve loop that brings a cap between the jaws can bring the held tube over a free hole the wrist camera is looking at, so the rack's position never has to be calibrated at all.</p>
         <p><b>Help from the hardware.</b> Chamfered or funnel-topped rack holes and fingers with a V-notch that centres the tube in the jaws each buy millimetres for almost nothing, and millimetres are exactly what the drop is short of.</p>
         <p><b>A learned eye.</b> Colour thresholds are the most fragile part of the pipeline, and a change of lighting, bench or cap colour has meant re-measuring them. A small rotated-box detector trained on the 200 teleoperation episodes, auto-labelled by foundation models, gives each tube's position, direction and colour in one pass, and raises the 80% pick with it.</p>
         <p><b>Let it train its successor.</b> Every run is already a self-labelled episode. Successful drops are clean, consistent demonstrations of exactly the step a learned policy is best at, so a short-horizon insertion policy can be trained on them and put in the one place where contact matters most, with the geometric loop doing the rest.</p>
+        <p><b>More training, and better data to train on.</b> The robot can now run unattended and record every attempt, so data stops being the bottleneck: hundreds of consistent episodes a day instead of 117 teleoperated ones. Each failure it tags becomes a correction to learn from, and each round of training makes the next round of data better, the same loop as the servo, one level up.</p>
+        <p><b>Retrain the VLA the right way.</b> Every reason SmolVLA fell short has a direct fix in that data: an instruction per episode that names the tube and the rack ("put the red tube in the silver rack"), episodes cut when the task ends instead of at 20 seconds, duplicates and failed runs removed, every recording session loaded at once, and the rack's free holes given to the policy as input. Trained on that, the end-to-end model becomes a fair comparison, and a policy worth putting on the arm.</p>
       </div>
     </div>
   </section>
