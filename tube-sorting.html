@@ -81,6 +81,39 @@
   </section>
 
   <section class="band">
+    <span class="label">Next · in progress</span>
+    <h2>Teleop data becomes a detector.</h2>
+    <p>Today the caps are found by measured colour thresholds, and every change of light or bench means re-measuring. The next step replaces them with a small learned model, trained on data we already have: 200 teleoperation episodes, recorded for a policy, turned into a labelled detection set with almost no hand labelling.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="n">A</span>
+        <div><h3>Mine the episodes</h3>
+        <p>Every 10th frame from the wrist and overhead cameras: thousands of images from this exact bench, lighting and set of tubes.</p></div>
+        <span class="spec">200 episodes · ~2–4k frames</span>
+      </div>
+      <div class="step">
+        <span class="n">B</span>
+        <div><h3>Label with foundation models</h3>
+        <p>An open-vocabulary detector finds each tube, a segmentation model cuts out its exact outline, and the outline gives a rotated box: position and direction together. The cap colour inside it gives the class.</p></div>
+        <span class="spec">open-vocab detection · segmentation · rotated boxes</span>
+      </div>
+      <div class="step">
+        <span class="n">C</span>
+        <div><h3>Let the demos check the labels</h3>
+        <p>At the frame where the gripper closes, the tube is known to be between the jaws. That confirms labels at every grasp, and tracking carries them back through the approach.</p></div>
+        <span class="spec">grasp frames as free ground truth</span>
+      </div>
+      <div class="step">
+        <span class="n">D</span>
+        <div><h3>One small model, same pipeline</h3>
+        <p>A rotated-box detector outputs each tube's position, angle and cap colour in one pass, and drops into the pipeline where the colour thresholds sit today. The geometry, the IK and the checks stay as they are.</p></div>
+        <span class="spec">oriented-box detector · real-time on the robot PC</span>
+      </div>
+    </div>
+    <p>The same move turns failed learning into useful learning: demonstrations that were not enough to train a whole policy are plenty to train the part of it that sees.</p>
+  </section>
+
+  <section class="band">
     <span class="label">Beyond tubes</span>
     <h2>The same loop picks anything it can see.</h2>
     <p>Nothing in detect → locate → orient → solve → verify is specific to tubes. Swap the detector and the pipeline picks vials, cubes or parts, and places into trays or bins. Bringing a cap between the jaws and bringing a held tube over a hole are the same visual servo, used twice.</p>
