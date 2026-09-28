@@ -256,6 +256,13 @@ ARM_PORT = ARM.port                    # the arm's serial port (was "COM4", 3 pl
 PORT = int(os.environ.get("RAX_PORT", 8484))   # this server's HTTP port
 CAMSURV = (os.environ.get("RAX_CAMSURV_URL", "http://127.0.0.1:5000"),
            os.environ.get("RAX_CAMSURV_PASSWORD", ""))
+#: Which CamSurv camera is the one looking down at the table. It was camera 1 until the
+#: second webcam went away (2026-09-27); now the top view is the only one, camera 0.
+CAMSURV_STREAM = os.environ.get("RAX_CAMSURV_STREAM", "0")
+#: The top view's work area (x0,y0,x1,y1 in the 1280x720 frame), shown zoomed 1.5x on
+#: /stream2: the arm, the mat and both racks. RAX_TOP_ROI="" shows the whole frame.
+_roi = os.environ.get("RAX_TOP_ROI", "164,80,1017,560")
+TOP_ROI = tuple(int(v) for v in _roi.split(",")) if _roi.strip() else None
 
 JOINT_RATE_MAX = ARM.joint_rate_max_dps   # deg/s per joint hard clamp
 
@@ -5929,9 +5936,32 @@ def stream2():
         try:
             s = pyrequests.Session()
             s.post(CAMSURV[0] + "/", data={"password": CAMSURV[1]}, timeout=5)
-            r = s.get(CAMSURV[0] + "/stream/1", stream=True, timeout=10)
-            for chunk in r.iter_content(chunk_size=8192):
-                yield chunk
+            r = s.get(CAMSURV[0] + "/stream/" + CAMSURV_STREAM, stream=True, timeout=10)
+            if TOP_ROI is None:
+                for chunk in r.iter_content(chunk_size=8192):
+                    yield chunk
+                return
+            # ZOOMED: crop each frame to the work area and re-encode. The crop is for
+            # viewing only -- anything that measures in this picture reads the full
+            # frame through _overhead_frame(), so its pixels do not depend on the zoom.
+            x0, y0, x1, y1 = TOP_ROI
+            buf = b""
+            for chunk in r.iter_content(chunk_size=16384):
+                buf += chunk
+                a = buf.find(b"\xff\xd8")
+                b = buf.find(b"\xff\xd9", a + 2) if a != -1 else -1
+                if b == -1:
+                    continue
+                img = cv2.imdecode(np.frombuffer(buf[a:b + 2], np.uint8), cv2.IMREAD_COLOR)
+                buf = buf[b + 2:]
+                if img is None:
+                    continue
+                crop = cv2.resize(img[y0:y1, x0:x1], (1280, int(1280 * (y1 - y0) / (x1 - x0))),
+                                  interpolation=cv2.INTER_LINEAR)
+                ok, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                           + jpg.tobytes() + b"\r\n")
         except Exception:
             return
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -7453,7 +7483,7 @@ def _overhead_frame():
     try:
         sess = pyrequests.Session()
         sess.post(CAMSURV[0] + "/", data={"password": CAMSURV[1]}, timeout=4)
-        r = sess.get(CAMSURV[0] + "/stream/1", stream=True, timeout=8)
+        r = sess.get(CAMSURV[0] + "/stream/" + CAMSURV_STREAM, stream=True, timeout=8)
         buf = b""
         for chunk in r.iter_content(4096):
             buf += chunk
@@ -7706,7 +7736,7 @@ def _episode_frames(ep, when):
     try:
         s = pyrequests.Session()
         s.post(CAMSURV[0] + "/", data={"password": CAMSURV[1]}, timeout=4)
-        r = s.get(CAMSURV[0] + "/stream/1", stream=True, timeout=8)
+        r = s.get(CAMSURV[0] + "/stream/" + CAMSURV_STREAM, stream=True, timeout=8)
         buf = b""
         for chunk in r.iter_content(4096):
             buf += chunk

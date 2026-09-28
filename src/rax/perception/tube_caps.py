@@ -34,9 +34,9 @@ H=85 — with this green cap measuring a median of 86. The split sat inside the 
 It is moved to 92, in the gap that was actually observed, so a green cap cannot be read as
 blue by one unit of sensor noise.
 
-GOLD IS NOT OFFERED. The X250's rig has gold caps and this one does not, and pale wood
-under warm light lands squarely in gold's hue window with enough saturation to pass in
-places. A colour nobody here has a cap for is all false positives and no true ones.
+GOLD IS OFFERED NOW that this bench has gold caps, and it is the risky one: pale wood
+under warm light lands squarely in gold's hue window, so gold leans entirely on its
+saturation gate (see CAP_GATES).
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__all__ = ["Cap", "find_caps", "draw", "CAP_HSV", "MIN_SAT", "MIN_VAL",
+__all__ = ["Cap", "find_caps", "draw", "CAP_HSV", "CAP_GATES", "MIN_SAT", "MIN_VAL",
            "Axis", "tube_axis", "twist_error", "fold"]
 
 
@@ -78,7 +78,9 @@ class Cap:
 #: green cap (83-87) and a blue one (96-99), not on top of either.
 CAP_HSV: dict[str, tuple[int, int]] = {
     "green": (72, 92),
-    "blue": (93, 112),
+    # 93-102, not 93-112 (2026-09-28): the silver rack's shadowed metal reads H 104-106
+    # at S 117-131 and was boxed "blue cap". Every blue cap measured sits at H 94-100.
+    "blue": (93, 102),
     # GOLD/AMBER CAPS. Hue 16-34 in OpenCV's 0-179 scale is yellow through orange.
     # This is the one band that shares hue with the bench itself -- bare wood runs
     # roughly 10-25 -- so it leans entirely on the saturation gate below: the wood
@@ -86,6 +88,11 @@ CAP_HSV: dict[str, tuple[int, int]] = {
     # bench, measure it before widening the hue; dropping MIN_SAT would turn the whole
     # table into a cap.
     "gold": (16, 34),
+    # RED WRAPS: hue 172-179 and 0-6 (lo > hi means "outside", across the 180/0 seam).
+    # Gold was dropped from the default set on 2026-09-27 -- it saw wood, stains and a
+    # hand as caps -- and the tubes got red caps instead. Measured against the dark wood
+    # the arm keeps looking at (H 9-21, S median 64, p95 102): not one pixel passes red.
+    "red": (172, 6),
 }
 
 #: THE REAL GATE. Both measured caps sit above 190; the turntable is 12-40 and the
@@ -94,6 +101,29 @@ CAP_HSV: dict[str, tuple[int, int]] = {
 MIN_SAT = 160
 #: Rejects the gripper (V ~ 44) and shadow, without touching the green cap (V 119-148).
 MIN_VAL = 85
+
+#: PER-COLOUR (min S, min V), because one gate did not fit all three caps. Both
+#: numbers below were read off a live frame on 2026-09-27:
+#:
+#:   left jaw, blue-tinted   H 102-108  S 155-186  V  87-108   <- read as a "blue cap"
+#:   gold cap                H  16- 19  S 134-162  V 124-163   <- missed half the time
+#:
+#: The jaw passed S >= 160 and V >= 85, so a phantom blue cap sat on the gripper and
+#: went into the map. The blue cap measures V 187-231, so blue's V gate goes to 130,
+#: clear of the jaw's 108 and well under the cap. The gold cap straddled S 160, so it
+#: flickered in and out -- "no gold cap in view from the look pose" with the cap on
+#: screen. Its S gate drops to 110, still far over bare wood's 12-40.
+CAP_GATES: dict[str, tuple[int, int]] = {
+    "green": (MIN_SAT, MIN_VAL),
+    "blue": (115, 130),     # up close the cap overexposes to S 107-143 (median 124);
+                            # 115 keeps the lit wooden block (S 112) out
+    "gold": (110, 100),
+    "red": (150, 70),
+}
+#: A third value, when present, is a brightness CEILING. Gold had one (172) to keep an
+#: operator's hand out -- skin shares gold's hue and saturation -- and it was taken off
+#: the same evening: under brighter light the orange-gold cap reads as bright as skin,
+#: the detector lost it, and the pick went in blind. Hands out of the bench instead.
 
 #: A cap is a blob, not a streak. Measured here: the blue cap reads about 44x81 px at
 #: 25 cm and the green about 39x46 — the elongation is the tube body's specular streak
@@ -122,9 +152,13 @@ MAX_AREA = 60000.0
 
 
 def find_caps(bgr, *, exclude: tuple = (), exclude_r: float = 0.0,
-              colours: tuple = ("green", "blue", "gold"),
-              min_area: float = MIN_AREA, max_area: float = MAX_AREA) -> list[Cap]:
+              colours: tuple = ("green", "blue", "red"),
+              min_area: float = MIN_AREA, max_area: float = MAX_AREA,
+              gates: dict | None = None) -> list[Cap]:
     """Every cap in the frame, biggest first.
+
+    ``gates`` overrides CAP_GATES per colour -- for a different camera, whose caps are
+    smaller and more washed out (the top view reads the gold cap at S 76-98).
 
     ``exclude`` is a list of pixels — the fingertips — within ``exclude_r`` of which a
     blob is assumed to BE the gripper. Kept from the ported detector because the reason
@@ -137,13 +171,18 @@ def find_caps(bgr, *, exclude: tuple = (), exclude_r: float = 0.0,
         return []
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    # Saturation and value FIRST, hue second — see the module docstring.
-    vivid = (S >= MIN_SAT) & (V >= MIN_VAL)
 
     out: list[Cap] = []
     for colour in colours:
+        # Saturation and value FIRST, hue second — see the module docstring.
+        g = (gates or CAP_GATES).get(colour, (MIN_SAT, MIN_VAL))
+        s_min, v_min = g[0], g[1]
+        vivid = (S >= s_min) & (V >= v_min)
+        if len(g) > 2:
+            vivid &= V <= g[2]
         lo, hi = CAP_HSV[colour]
-        mask = (vivid & (H >= lo) & (H <= hi)).astype(np.uint8) * 255
+        hue = (H >= lo) & (H <= hi) if lo <= hi else (H >= lo) | (H <= hi)
+        mask = (vivid & hue).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         n, _lbl, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
@@ -169,7 +208,7 @@ def draw(bgr, caps, *, aim=None):
     """Annotate a copy: a box and a label per cap. For the FPV overlay."""
     vis = bgr.copy()
     COL = {"green": (60, 220, 90), "blue": (235, 170, 60),
-           "gold": (60, 200, 235)}
+           "gold": (60, 200, 235), "red": (60, 60, 230)}
     for c in caps:
         x1, y1, x2, y2 = (int(v) for v in c.bbox)
         col = COL.get(c.colour, (200, 200, 200))

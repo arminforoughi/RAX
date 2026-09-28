@@ -107,7 +107,7 @@ class TestTheThingsThatFooledThePortedDetector:
 
     def test_a_gold_cap_is_found(self):
         # Hue 25, and saturated the way an anodised cap is.
-        caps = find_caps(frame_with((320, 240, 22, (25, 205, 180))))
+        caps = find_caps(frame_with((320, 240, 22, (25, 205, 150))), colours=("gold",))
         assert [c.colour for c in caps] == ["gold"]
 
     def test_warm_bench_wood_is_still_not_a_gold_cap(self):
@@ -116,6 +116,42 @@ class TestTheThingsThatFooledThePortedDetector:
         # because it is washed out: S 12-40 against a gate of 160. If this test ever
         # fails, the gate moved, and the table is about to be reported as a tube.
         assert find_caps(frame_with((320, 240, 40, (22, 35, 190)))) == []
+
+    def test_gold_is_off_by_default_red_is_on(self):
+        # 2026-09-27: gold saw wood, stains and a hand as caps; the tubes got red caps.
+        assert find_caps(frame_with((320, 240, 22, (25, 205, 150)))) == []
+        caps = find_caps(frame_with((320, 240, 22, (178, 220, 180))))
+        assert [c.colour for c in caps] == ["red"]
+
+    def test_red_is_found_on_both_sides_of_the_hue_seam(self):
+        for h in (2, 176):
+            caps = find_caps(frame_with((320, 240, 22, (h, 220, 180))))
+            assert [c.colour for c in caps] == ["red"], h
+
+    def test_dark_wood_is_not_red(self):
+        # Measured: the dark wood the arm looks at, H 9-21, S median 64, p95 102.
+        assert find_caps(frame_with((320, 240, 40, (12, 102, 150)))) == []
+        assert find_caps(frame_with((320, 240, 40, (5, 95, 130)))) == []
+
+    def test_the_silver_rack_is_not_a_blue_cap(self):
+        # 2026-09-28: the silver rack's shadowed metal, H 104-106 S 117-131 V 136-186,
+        # was boxed "blue cap" and approached.
+        assert find_caps(frame_with((320, 240, 40, (105, 122, 153)))) == []
+
+    def test_the_overexposed_close_blue_cap_is_blue(self):
+        caps = find_caps(frame_with((320, 240, 30, (97, 124, 250))))
+        assert [c.colour for c in caps] == ["blue"]
+
+    def test_the_blue_tinted_jaw_is_not_a_blue_cap(self):
+        # Live frame, 2026-09-27: the left jaw read H 107 S 185 V 105 and was reported
+        # as a blue cap sitting on the gripper, then cast into the map as a tube.
+        assert find_caps(frame_with((320, 240, 30, (107, 185, 105)))) == []
+
+    def test_the_measured_gold_cap_is_found(self):
+        # Same frame: the gold cap read S 134-162 -- under the old single gate of 160,
+        # so it came and went, and the pick failed with the cap on screen.
+        caps = find_caps(frame_with((320, 240, 22, (18, 140, 140))), colours=("gold",))
+        assert [c.colour for c in caps] == ["gold"]
 
 
 class TestTheGreenBlueSplit:

@@ -41,6 +41,7 @@
   .viewlabel{position:absolute;bottom:8px;right:10px;font-size:10px;color:#5d6b7e;
              letter-spacing:.4px;text-transform:uppercase;pointer-events:none}
   #cam{display:block;width:100%;height:100%;object-fit:contain;background:#07090d}
+  .nocam[hidden]{display:none}
   .nocam{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
          color:#5d6b7e;font-size:12px;text-align:center;padding:20px;line-height:1.6}
 
@@ -96,7 +97,28 @@
   .held-y{color:var(--ok)} .held-n{color:var(--dim)}
 
   #log{font:11px/1.5 ui-monospace,Consolas,monospace;color:#8fa0b4;
-       max-height:190px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+       overflow-y:auto;white-space:pre-wrap;word-break:break-word;flex:1;min-height:0}
+  /* ---- activity: fills the fourth cell of the views grid ---- */
+  .activity{display:flex;flex-direction:column;gap:9px;padding:12px;aspect-ratio:auto}
+  .act-now{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .act-now .p{font:700 18px ui-monospace,Consolas,monospace;letter-spacing:.8px;color:var(--accent)}
+  .act-now .n{font-size:13px;color:var(--ink);flex:1;min-width:140px}
+  .act-now .busy{font-size:10px;text-transform:uppercase;letter-spacing:.6px;
+                 padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .act-now .busy.on{border-color:var(--accent);color:var(--accent)}
+  .tags{display:flex;gap:6px;flex-wrap:wrap}
+  .tag{font-size:11px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);
+       background:#10151d;color:var(--dim);white-space:nowrap}
+  .tag.good{border-color:#2c6b43;color:#8fe0aa}
+  .tag.bad{border-color:#7a3a33;color:#f0a39a}
+  .tag.warn{border-color:#6e5a26;color:#ecd08a}
+  .results{max-height:34%;overflow-y:auto;font-size:12px;border-top:1px solid var(--line);
+           padding-top:6px}
+  .results .r{display:flex;gap:8px;align-items:center;padding:3px 0;border-bottom:1px solid #1a212b}
+  .results .r .d{color:var(--dim);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap;font-size:11px}
+  .results .t, #log .t{color:#4f5d6f;font:11px ui-monospace,Consolas,monospace}
+  .sub{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin:0}
   #log div{padding:1px 0}
   #log .t{color:#4f5d6f;margin-right:6px}
   .warnbar{background:#2a1f33;border:1px solid var(--sim);color:#e2cdf5;
@@ -113,6 +135,23 @@
           This rig has no camera.<br>The simulator renders the 3D view only.
         </div>
         <div class="viewlabel">wrist camera</div>
+      </div>
+      <div class="stage" id="topstage">
+        <img id="topcam" alt="top camera" src="/topstream"
+             style="display:block;width:100%;height:100%;object-fit:contain;background:#07090d">
+        <div class="viewlabel">top camera · holes are estimates</div>
+      </div>
+      <div class="stage activity" id="activity">
+        <div class="act-now">
+          <span class="p" id="a-phase">IDLE</span>
+          <span class="n" id="a-note"></span>
+          <span class="busy" id="a-busy">idle</span>
+        </div>
+        <div class="tags" id="a-tags"></div>
+        <p class="sub">Results</p>
+        <div class="results" id="a-results"><div class="r"><span class="d">nothing yet</span></div></div>
+        <p class="sub">Log</p>
+        <div id="log"></div>
       </div>
     <div class="stage">
       <canvas id="scene"></canvas>
@@ -150,10 +189,10 @@
         <button class="stop" id="b-stop">Stop</button>
       </div>
       <div class="row" style="margin-top:7px">
-        <button class="go" id="b-all">Pick ALL &rarr; drop right</button>
+        <button class="go" id="b-all">Pick ALL &rarr; racks</button>
       </div>
       <div class="row" style="margin-top:7px">
-        <button id="b-scan">Scan</button>
+        <button id="b-scan">Scan mat</button>
         <button id="b-clearmap">Clear map</button>
         <button id="b-reset">Reset</button>
       </div>
@@ -168,10 +207,6 @@
       <div id="k-detail" style="font-size:11px;color:var(--dim);margin-top:7px"></div>
     </div>
 
-    <div class="panel">
-      <h2>Log</h2>
-      <div id="log"></div>
-    </div>
   </aside>
 </div>
 
@@ -374,10 +409,23 @@ function draw(){
     ctx.closePath(); ctx.strokeStyle='#6d7b8e'; ctx.lineWidth=1; ctx.stroke();
   }
   ctx.setLineDash([]);
+  // THE ONE BEING PICKED: ringed, with the path from the gripper to it. The rest dim.
+  const foc = (G.tubes||[]).find(t=>t.focus);
+  if(foc){
+    const pts=[]; for(let k=0;k<24;k++){const a=2*Math.PI*k/24;
+      pts.push(proj([foc.x+0.03*Math.cos(a), foc.y+0.03*Math.sin(a), 0.002]));}
+    ctx.beginPath(); pts.forEach((p,k)=>k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+    ctx.closePath(); ctx.strokeStyle='#ffd400'; ctx.lineWidth=2; ctx.stroke();
+    if(G.tip){
+      const a=proj(G.tip), b=proj([foc.x, foc.y, 0.02]);
+      ctx.setLineDash([6,4]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]);
+      ctx.strokeStyle='#ffd400'; ctx.lineWidth=1.5; ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
   // labels last, always legible
   for(const t of (G.tubes||[])){
     const s=proj([t.x, t.y, (t.standing ? (t.l||0.1) : (t.d||0.016)) + 0.045]);
-    ctx.fillStyle = (sel===t.id) ? '#fff' : '#8fa0b4';
+    ctx.fillStyle = t.focus ? '#ffd400' : foc ? '#4a5566' : (sel===t.id) ? '#fff' : '#8fa0b4';
     ctx.font = (sel===t.id ? '600 ' : '') + '10px ui-monospace,Consolas';
     ctx.fillText(`#${t.id} ${t.colour}`, s[0]+6, s[1]);
   }
@@ -430,18 +478,19 @@ function renderTubes(){
 
 function renderRacks(){
   const s=$('rack');
-  if(s.options.length === (G.racks||[]).length+1) return;   // don't fight the operator
+  if(s.options.length === (G.racks||[]).length+2) return;   // don't fight the operator
   const keep = s.value;
-  s.innerHTML='<option value="">hold it (do not place)</option>';
+  s.innerHTML='<option value="auto">auto: blue/green → black, red → silver</option>'
+             + '<option value="">hold it (do not place)</option>';
   for(const r of (G.racks||[])){
     const o=document.createElement('option'); o.value=r.name;
     const free = r.holes.length - (G.tubes||[])
       .filter(t=>t.rack===r.name && t.hole!=null).length;
-    o.textContent = `${r.name} rack — ${free} free`;
+    o.textContent = `${r.name} — ${r.holes.length} holes`;
     s.appendChild(o);
   }
   if(keep) s.value = keep;
-  else if((G.racks||[]).length) s.value = G.racks[0].name;
+  else s.value = 'auto';
 }
 
 async function pollGeom(){
@@ -479,8 +528,24 @@ async function pollState(){
       : 'no runs yet';
     $('b-pick').disabled = !!s.running;
     $('b-stop').disabled = !s.running;
+    $('a-phase').textContent = s.phase || 'IDLE';
+    $('a-note').textContent = s.note || '';
+    const b=$('a-busy'); b.textContent = s.running ? 'working' : 'idle';
+    b.className = 'busy' + (s.running ? ' on' : '');
+    const cls = t => /^placed|^picked/.test(t) ? 'good'
+                   : (t==='stopped' || t==='not found' || /unverified/.test(t)) ? 'warn' : 'bad';
+    const esc = x => String(x).replace(/[<&]/g,c=>({'<':'&lt;','&':'&amp;'}[c]));
+    $('a-tags').innerHTML = Object.entries(s.tags||{})
+      .map(([k,v])=>`<span class="tag ${cls(k)}">${v} × ${esc(k)}</span>`).join('');
+    const res = (s.results||[]).slice().reverse();
+    $('a-results').innerHTML = res.length ? res.map(r =>
+      `<div class="r"><span class="t">${r.t}</span>`
+      + `<span class="dot" style="background:${CAPCOL[r.colour]||'#8a93a0'}"></span>`
+      + `<span class="tag ${cls(r.tag)}">${esc(r.tag)}</span>`
+      + `<span class="d" title="${esc(r.detail)}">${esc(r.detail)}</span></div>`).join('')
+      : '<div class="r"><span class="d">nothing yet</span></div>';
     const lg=$('log'); lg.innerHTML='';
-    for(const e of (s.log||[]).slice(-60))
+    for(const e of (s.log||[]).slice(-150))
       lg.insertAdjacentHTML('afterbegin',
         `<div><span class="t">${e.t}</span>${e.m.replace(/[<&]/g,c=>({'<':'&lt;','&':'&amp;'}[c]))}</div>`);
   }catch(e){}
