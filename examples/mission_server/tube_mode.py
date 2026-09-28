@@ -513,7 +513,7 @@ def start(ms, port: int = 8486) -> None:
             tphase("DROP", f"lining the tube up with a free hole, slot {slot}")
             hole_uv = [(target["x"], target["y"])]
             aim_u = ms.jaw_frame().centre_uv[0]
-            sign = _probe_base(see_hole, hole_uv, aim_u)
+            gain_hole = _probe_base(see_hole, hole_uv, aim_u)
             pt = _table_xy((target["x"], target["y"])) or (x, y)
             q_goal, e_g = ms._ik_hold_pitch(ms.observe(False)[0].astype(float),
                                             np.array([pt[0], pt[1], GRASP_Z + 0.030]),
@@ -521,7 +521,7 @@ def start(ms, port: int = 8486) -> None:
             if e_g > 0.03:
                 raise RuntimeError(f"cannot reach the hole (residual {e_g*100:.1f}cm)")
             _vision_approach(see_hole, ms._clamp_joints(np.asarray(q_goal, float)),
-                             sign, "the hole", hole_uv)
+                             gain_hole, "the hole", hole_uv)
 
         ms.send_joints(ms.observe(False)[0], gripper=float(ms.ARM.gripper.place_open_pct))
         time.sleep(0.4)
@@ -667,7 +667,7 @@ def start(ms, port: int = 8486) -> None:
             return None
         return None if pt is None else (float(pt[0]), float(pt[1]))
 
-    def _vision_approach(see, q_goal, sign_base, what, last_uv):
+    def _vision_approach(see, q_goal, gain_base, what, last_uv):
         """Interpolate the joints toward ``q_goal`` while the BASE tracks what it sees.
 
         THE ONE APPROACH BOTH STAGES USE. Putting a cap between the jaws and putting a
@@ -697,7 +697,7 @@ def start(ms, port: int = 8486) -> None:
         """
         q_start = ms.observe(False)[0].astype(float)
         aim = ms.jaw_frame().centre_uv
-        misses, last_dist, last_ex, reached = 0, None, 0.0, False
+        misses, last_dist, reached = 0, None, False
         for step in range(N_APPROACH):
             ms.checkpoint()
             a = (step + 1) / N_APPROACH
@@ -732,12 +732,9 @@ def start(ms, port: int = 8486) -> None:
                  f"dx {ex:+.0f} dy {ey:+.0f}  {100*a:.0f}% down"
                  f"{'  IN GRIP' if in_grip else ''}")
 
-            if (last_dist is not None and sign_base != 0.0
-                    and abs(ex) > 30.0 and abs(ex) > abs(last_ex) + 15.0):
-                sign_base *= -1.0
-                tsay(f"        the error grew {abs(last_ex):.0f} -> {abs(ex):.0f}px "
-                     f"— wrong way, flipping to sign {sign_base:+.0f}")
-            last_ex, last_dist = ex, dist
+            # NO FLIP-ON-WORSE. It existed because a fixed sign could be wrong; the
+            # step is ex/gain now, so a correction that overshoots simply comes back.
+            last_dist = dist
 
             if (in_grip or dist < GRASP_RADIUS_PX) and a >= AT_DEPTH:
                 tsay(f"        aligned to {dist:.0f}px and {100*a:.0f}% down — done")
@@ -747,13 +744,11 @@ def start(ms, port: int = 8486) -> None:
             q = q_start + (q_goal - q_start) * a
             q[ms.ARM.roll_joint] = q_start[ms.ARM.roll_joint]
             pan_now = ms.observe(False)[0][ms.ARM.pan_joint]
-            if abs(ex) > 30 and sign_base != 0.0:
+            if abs(ex) > 30:
                 scale = 1.0 + 1.1 * a
-                d_pan = sign_base * float(np.clip(abs(ex) / (14.0 * scale),
-                                                  0.4, 3.2 / scale))
                 q[ms.ARM.pan_joint] = float(np.clip(
-                    pan_now + d_pan, ms.J_LO[ms.ARM.pan_joint],
-                    ms.J_HI[ms.ARM.pan_joint]))
+                    pan_now + _pan_step(ex, gain_base, 0.4, 3.2 / scale),
+                    ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
             else:
                 q[ms.ARM.pan_joint] = pan_now
             ms.goto_smooth(ms._clamp_joints(q), settle=0.10, step=2.2)
@@ -762,6 +757,21 @@ def start(ms, port: int = 8486) -> None:
             tsay(f"        finished {last_dist:.0f}px off — continuing anyway; the "
                  f"episode records how far")
         return reached, last_dist
+
+    def _pan_step(ex, gain, lo, hi):
+        """Degrees of base that remove a horizontal error of ``ex`` pixels.
+
+        ex is measured as (where the cap should be) - (where it is), so moving the cap
+        by -ex is what zeroes it, and the gain says how many pixels a degree moves it:
+        the step is ex/gain. The sign falls out of the arithmetic, which is the whole
+        point -- a fixed sign multiplied by ABS(ex) is only right while the error keeps
+        the sign it was measured with.
+        """
+        if not gain or abs(gain) < 1e-6:
+            return 0.0
+        step = ex / gain
+        mag = float(np.clip(abs(step), lo, hi))
+        return math.copysign(mag, step)
 
     def _probe_base(see, last_uv, aim_u):
         """Which way the base joint moves what we are watching. pick.py's probe.
@@ -793,9 +803,8 @@ def start(ms, port: int = 8486) -> None:
                      f"— under the noise floor")
                 continue
             gain = moved / probe_q
-            sign = 1.0 if ((aim_u - before_x) * gain) > 0 else -1.0
-            tsay(f"        base gain {gain:+.2f}px/deg -> sign {sign:+.0f}")
-            return sign
+            tsay(f"        base gain {gain:+.2f}px/deg")
+            return gain
         tsay("        could not measure the base direction")
         return 0.0
 
@@ -913,14 +922,23 @@ def start(ms, port: int = 8486) -> None:
         # pick.py's own comment records why this has to be measured hard: "A 3-unit probe
         # moved the cap less than the +-8px noise floor, so the sign stayed a guess -- and
         # then the flip-on-worse rule toggled it at random every step, leaving dx pinned
-        # at +100 for an entire descent while 'correcting'." So the threshold is 18px, not
-        # 8, and the sign folds in the error direction the way pick.py computes it:
+        # at +100 for an entire descent while 'correcting'."
         #
-        #     gain = moved / probe          sign = +1 if ex * gain > 0 else -1
+        # WHAT IS KEPT IS THE GAIN ITSELF, px of cap motion per degree of base -- not a
+        # sign distilled out of it. pick.py reduced it to `sign = +1 if ex * gain > 0`
+        # and then stepped ABS(ex) times that sign, which is only correct while the
+        # error keeps the sign it had at the probe. It does not. The moment a set point
+        # other than zero was introduced the error started NEGATIVE, the sign had been
+        # measured against a POSITIVE one, and the correction drove the wrong way on
+        # every single step --
         #
-        # and the step then uses ABS(ex) times that sign.
-        tphase("PROBE", "measuring which way the base moves the cap")
-        sign_base = 0.0
+        #     dx +8 -15 -42 -67 -93 -122 -154 -175 -204 -229 -254 -284
+        #
+        # -- twelve bites, monotonically away, "correcting" the whole time. Keeping the
+        # gain makes the step ex/gain, which carries the error's sign with it and cannot
+        # do this: if the error changes sign, so does the correction.
+        tphase("PROBE", "measuring how far the base moves the cap")
+        gain_base = 0.0
         for probe_q in (7.0, -10.0, 14.0):
             ms.checkpoint()
             before_x = cap["x"]
@@ -940,13 +958,11 @@ def start(ms, port: int = 8486) -> None:
                 tsay(f"        base {probe_q:+.0f} moved the cap only {moved:+.0f}px "
                      f"— under the noise floor, probing harder")
                 continue
-            gain = moved / probe_q
-            ex0 = AIM[0] - before_x
-            sign_base = 1.0 if (ex0 * gain) > 0 else -1.0
-            tsay(f"        base gain {gain:+.2f}px/deg, error {ex0:+.0f}px "
-                 f"-> correcting with sign {sign_base:+.0f}")
+            gain_base = moved / probe_q
+            tsay(f"        base gain {gain_base:+.2f}px/deg "
+                 f"({probe_q:+.0f}deg moved the cap {moved:+.0f}px)")
             break
-        if sign_base == 0.0:
+        if gain_base == 0.0:
             tsay("        could not measure the base direction — descending without "
                  "a horizontal correction")
         cap = _cap_now(last_uv[0], colour) or cap
@@ -975,11 +991,11 @@ def start(ms, port: int = 8486) -> None:
             if abs(ex) < AIM_TOL_PX:
                 tsay(f"        aimed: {abs(ex):.0f}px < {AIM_TOL_PX:.0f}px")
                 break
-            if sign_base == 0.0:
-                tsay("        no measured base direction — leaving the aim alone")
+            if gain_base == 0.0:
+                tsay("        no measured base gain — leaving the aim alone")
                 break
             q_a = ms.observe(False)[0].astype(float)
-            d_pan = sign_base * float(np.clip(abs(ex) / 14.0, 1.0, 5.0))
+            d_pan = _pan_step(ex, gain_base, 1.0, 5.0)
             q_a[ms.ARM.pan_joint] = float(np.clip(
                 q_a[ms.ARM.pan_joint] + d_pan,
                 ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
@@ -1050,7 +1066,6 @@ def start(ms, port: int = 8486) -> None:
             r_at = float(math.hypot(tip_h[0], tip_h[1]))
             z_at = float(tip_h[2])
             got, dxp, gone, gain, prev = False, None, 0.0, None, None
-            sign = sign_base
             for k in range(n_max):
                 ms.checkpoint()
                 c = _cap_now(last_uv[0], colour)
@@ -1129,9 +1144,9 @@ def start(ms, port: int = 8486) -> None:
                          f"over ({jump:.0f}deg) — stopping here")
                     break
                 pan = float(q_n[ms.ARM.pan_joint])
-                if abs(ex) > CENTRE_TOL_PX and sign != 0.0:
+                if abs(ex) > CENTRE_TOL_PX:
                     pan = float(np.clip(
-                        pan + sign * float(np.clip(abs(ex) / 22.0, 0.3, 1.8)),
+                        pan + _pan_step(ex, gain_base, 0.3, 1.8),
                         ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
                 q_s[ms.ARM.pan_joint] = pan
                 q_s[ms.ARM.roll_joint] = j5
@@ -1221,10 +1236,9 @@ def start(ms, port: int = 8486) -> None:
                     q_s = np.asarray(q_t, float)
             if q_s is None:
                 q_s = q_n.copy()
-            if abs(ex) > CENTRE_TOL_PX and sign_base != 0.0:
+            if abs(ex) > CENTRE_TOL_PX:
                 q_s[ms.ARM.pan_joint] = float(np.clip(
-                    float(q_n[ms.ARM.pan_joint])
-                    + sign_base * float(np.clip(abs(ex) / 20.0, 0.4, 2.2)),
+                    float(q_n[ms.ARM.pan_joint]) + _pan_step(ex, gain_base, 0.4, 2.2),
                     ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
             q_s[ms.ARM.roll_joint] = j5
             if np.allclose(q_s, q_n, atol=1e-3):
