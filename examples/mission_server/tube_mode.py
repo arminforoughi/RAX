@@ -87,7 +87,12 @@ TUBE_YAW_ALIGN = True
 #: grasping range and a tube is 16mm across, so being a few degrees off square costs
 #: almost nothing in effective opening; it is only the large misalignments that make a
 #: cylinder unpickable, and those are better fixed over several picks than in one lunge.
-TUBE_MAX_ROLL_DEG = 20.0
+#:
+#: 20 was the old value and it made the stage decorative: a tube lying 80 degrees out
+#: of square needed a 105-degree roll and got 20, so the jaws still closed along the
+#: cylinder. The joint's own limits are the real bound here, and they are enforced
+#: separately -- this only stops a bad angle measurement from spinning the wrist.
+TUBE_MAX_ROLL_DEG = 100.0
 
 #: Largest lateral correction the grid stage will make in ONE move, metres. The cap is
 #: re-measured after every step, so a real 4cm error still closes -- in two passes rather
@@ -108,11 +113,32 @@ GRIP_AIR_PCT = 6.5
 #: (holding > 31.9, air 30.2, no overlap). Every close logs its settled value, which is
 #: what turns this threshold into a measurement.
 GRIP_HOLDING_PCT = 10.5
+#: ...AND BELOW THIS, because holding is a band and not a floor. A parallel gripper on a
+#: 16mm tube comes to rest in a narrow range -- measured here at 13.8, 15.5 and 20.6 on
+#: three good picks -- and it CANNOT stop high: there is nothing in the workspace thick
+#: enough. So a close that settles at 43.4, 76.3 or 86.9 (all three logged, all three
+#: called HOLDING by a one-sided test) did not close on a tube at all; the jaws stopped
+#: early on a false contact and the squeeze fired while they were still wide open. That
+#: is the gripper "opening instead of closing": it never got near shut.
+GRIP_JAMMED_PCT = 36.0
+#: Opening above which a current rise is the motor starting rather than the fingers
+#: touching something. Passed into the close; see the note there.
+GRIP_TRUST_BELOW_PCT = 60.0
+#: How far the jaws are parted before the close. Enough to clear a 16mm tube and its cap
+#: with room either side, and nowhere near the 95 they used to swing through.
+GRIP_PREOPEN_PCT = 45.0
 
-#: How elongated the silhouette must be before its angle is allowed to move the wrist.
-#: `is_confident` is 2.0, which is enough to SAY which way a tube lies; acting on it
-#: deserves more. The reading that drove the 70-degree roll sat at 2.3.
-TUBE_ROLL_MIN_ELONGATION = 3.0
+
+#: Degrees out of square worth turning the wrist for. Below this the roll costs more in
+#: disturbance than it buys in alignment.
+TWIST_TOL_DEG = 12.0
+
+#: The roll used to MEASURE which way the picture turns, before correcting.
+TWIST_PROBE_DEG = 10.0
+#: Elongation the silhouette needs at the GRASP, where the tube is foreshortened.
+TWIST_MIN_ELONGATION = 1.8
+#: How far three consecutive angle reads may disagree and still be acted on.
+TWIST_MAX_SPREAD_DEG = 18.0
 
 #: How far the second look, taken from above, may move the answer before it stops being
 #: a refinement and starts being a different object. Mirrors mission_server's own
@@ -168,8 +194,16 @@ def start(ms, port: int = 8486) -> None:
     from rax.manipulation.episodes import EpisodeLog
     from rax.manipulation.grip import CurrentRise, reconcile, settled
     from rax.perception.tube_caps import draw as draw_caps
-    from rax.perception.tube_caps import find_caps, tube_axis
+    from rax.perception.tube_caps import find_caps, fold, tube_axis
     from rax.robots.urdf_visuals import link_visuals
+
+    # NO YOLO BOXES IN THIS MODE. Tubes are found by cap colour here; the
+    # open-vocabulary detector's boxes are a different detector's opinion drawn over
+    # the same picture, and they land on the tube the arm is aiming at.
+    try:
+        ms.DRAW_YOLO_BOXES[0] = False
+    except Exception:
+        pass
 
     app = Flask("tube_mode", static_folder=None)
     # THE MAP. Tubes persist here once seen, so the arm knows roughly where they are
@@ -425,12 +459,31 @@ def start(ms, port: int = 8486) -> None:
         pitch_hold = float(sum(q_now[i] for i in ms.ARM.pitch_chain))
         j5_now = float(q_now[ms.ARM.roll_joint])
 
-        # over the drop area first, high, so the rack comes into view
-        q_over, e_over = ms._ik_hold_pitch(q_now, np.array([x, y, 0.12]),
-                                           pitch_hold, j5_now, ret_err=True)
-        if e_over > 0.03:
-            raise RuntimeError(f"cannot carry to ({x*100:+.0f},{y*100:+.0f})cm "
-                               f"(IK residual {e_over*100:.1f}cm)")
+        # OVER THE DROP AREA FIRST, high, and at whatever radius the arm can make on
+        # that bearing: a run that had the tube properly in the jaws threw "cannot carry
+        # to (+24,-16)cm (IK residual 5.0cm)" and dropped a good pick on the floor of
+        # the log. The bearing is the part that matters; the hole detector takes it
+        # from there.
+        bear_d = math.atan2(y, x)
+        r_d = float(math.hypot(x, y))
+        q_over = None
+        while r_d > 0.12:
+            q_t, e_t = ms._ik_hold_pitch(
+                q_now, np.array([r_d * math.cos(bear_d), r_d * math.sin(bear_d), 0.12]),
+                pitch_hold, j5_now, ret_err=True)
+            if e_t <= 0.03:
+                q_over = q_t
+                if r_d < math.hypot(x, y) - 1e-6:
+                    tsay(f"        {math.hypot(x,y)*100:.0f}cm is past the arm's reach "
+                         f"holding {pitch_hold:+.0f}deg — going out to {r_d*100:.0f}cm "
+                         f"on the same bearing")
+                x, y = r_d * math.cos(bear_d), r_d * math.sin(bear_d)
+                break
+            r_d -= 0.02
+        if q_over is None:
+            raise RuntimeError(f"nothing on the bearing to "
+                               f"({x*100:+.0f},{y*100:+.0f})cm is reachable while "
+                               f"holding {pitch_hold:+.0f}deg")
         ms.goto_smooth(ms._clamp_joints(np.asarray(q_over, float)), settle=0.25, step=2.6)
 
         def see_hole():
@@ -506,45 +559,61 @@ def start(ms, port: int = 8486) -> None:
     #: needs more of them. With AIM running at the final pitch the error starts far
     #: smaller anyway, and the loop exits the moment it is inside the jaws.
     N_APPROACH = 12
-    #: Bites of forward reach taken after the interpolation ends, if the cap still is not
-    #: in the cells. Small, and re-looked between each.
-    CREEP_ON_STEP_M, N_CREEP_ON, CREEP_ON_MAX_M = 0.005, 14, 0.07
     #: pick.py's, and this rig's own [grip] log agrees with it: across 13 trials the
     #: target read <=67px from the grip centre on every pick that worked.
     GRASP_RADIUS_PX = 70.0
 
-    #: Grasp pitch. Steep, because a lying tube is approached from directly above: the
-    #: jaws have to straddle a 16mm cylinder, and a shallow wrist puts one finger into
-    #: the table before the other reaches the far side.
-    #: The hand comes STRAIGHT DOWN onto the tube: the pitch chain sums to 90 degrees,
-    #: so the gripper's approach axis is perpendicular to the table.
+    #: THE GRIP IS PERPENDICULAR TO THE TABLE. The pitch chain sums to a right angle,
+    #: so the jaws come straight down and straddle the lying tube. PERP asks for this
+    #: first and settles for the steepest angle that still reaches the tube.
     #:
-    #: It is set ONCE, before the approach, and held for the rest of the pick. Both
-    #: halves of that matter and each was got wrong separately. Holding a pitch the arm
-    #: merely happened to be at (25 degrees, from the look pose) reaches for a lying tube
-    #: at a slant. But CHANGING it during the approach is worse: the camera is bolted to
-    #: the wrist, so tilting it sweeps the whole picture upward while the jaw cells sit at
-    #: the bottom, and the cap climbs away from the jaws on every step -- measured, dy
-    #: going +87 -> +285 over one descent while the horizontal error stayed inside 51px.
-    #: Candidate wrist pitches, steepest first. The hand wants to come down on the tube
-    #: rather than reach at it, so steeper is better -- but only while the camera can
-    #: still SEE the cap, and the camera is bolted to the same wrist.
-    #:
-    #: 90 was tried on the operator's instruction and is too far: the wrist bends right
-    #: in, and the log is unambiguous about what that costs --
-    #:
-    #:     base  +7: lost the cap during the probe
-    #:     base -10: lost the cap during the probe
-    #:     base +14: lost the cap during the probe
-    #:     1-4: the blue cap not in view -- HOLDING
-    #:
-    #: The arm then closed blind and got something by luck. So the pitch is not a
-    #: constant any more: each candidate is tried and the steepest one that leaves the
-    #: cap comfortably inside the frame wins. "Comfortably" matters -- a cap clinging to
-    #: the frame edge survives the tilt and is gone the moment the base moves to probe.
-    GRASP_PITCH_CANDIDATES = (72.0, 60.0, 48.0, 36.0)
-    #: How far a cap must sit from the frame edge to count as safely in view, px.
-    PITCH_EDGE_MARGIN_PX = 60.0
+    #: It was briefly a SEARCH over what the CAMERA could see -- try 72, then 60, then
+    #: 48, keep the steepest angle the cap was still visible at -- and the arm kept
+    #: settling on 36, most of the way to parallel, because the camera is bolted to the
+    #: wrist and a steep pitch points it at the bench just in front of the jaws.
+    #: Backing the angle off to keep the cap in shot trades away the thing the grasp
+    #: needs. The angle is chosen by REACH now, which is a question about the arm rather
+    #: than about the view, and the approach keeps the cap in sight by staying shallow
+    #: until it is over the tube.
+    GRASP_PITCH = 90.0
+    #: How close to GRASP_DX_TARGET_PX the cap has to be before the jaws close. A
+    #: tolerance on the set point, not a distance from the jaw centre.
+    CENTRE_TOL_PX = 28.0
+    #: How far short of the cast the approach stops. The hand wants to arrive beside
+    #: the tube and stand up over it, not on top of it.
+    APPROACH_LEAD_M = 0.02
+    #: Close enough, radially, to call the approach done.
+    APPROACH_TOL_M = 0.015
+    #: Bites of each vertical descent.
+    N_DOWN = 8
+    #: The hover: high enough to be clear of everything on the bench, low enough that a
+    #: centimetre of reach is worth a useful number of pixels.
+    HOVER_Z = 0.06
+    #: The trim's budget and bites. Generous, because this is where the cast's inward
+    #: bias gets paid off -- the tube is routinely a few centimetres further out than
+    #: the cast says, and this is the stage that can see that and fix it.
+    TRIM_MAX_M, N_TRIM = 0.07, 10
+    #: The first bite of a reach, taken to MEASURE pixels-per-centimetre.
+    REACH_PROBE_M = 0.015
+    #: The most any single solved bite may be. The estimate is good enough to aim with
+    #: and not good enough to trust in one go.
+    REACH_BITE_MAX_M = 0.025
+    #: The most any reach joint may move for one reach. Beyond this the "solution" is
+    #: the other elbow configuration, not a reach.
+    REACH_MAX_JOINT_JUMP_DEG = 45.0
+    #: How near the fingers' landing point the cap must be ALONG the reach, in pixels.
+    #: Wider than the across-tolerance because a bite is 2.5cm and the gain near the end
+    #: is around 3000px/m, so one bite is roughly 75px of this error.
+    TRIM_DY_TOL_PX = 45.0
+    #: WHERE dx SHOULD END UP, in the pixels the overlay prints. The operator gave
+    #: the number directly: "I just want the dx value to be around +60-100, this should
+    #: be the target grid." So that is the set point -- not zero, and not a fraction of
+    #: a grid cell that has to be argued about. dx on the overlay is
+    #: (jaw centre x - cap x), so a positive target puts the cap to the LEFT of the jaw
+    #: centre and the hand to the RIGHT of the tube, which is what was asked for.
+    GRASP_DX_TARGET_PX = 80.0
+    #: The second pass after the wrist rolls. Small: the arm is already there.
+    RETRIM_MAX_M, N_RETRIM = 0.03, 5
 
     def _cap_now(want_uv=None, colour=None, tries=6):
         """The freshest cap OF THIS COLOUR, nearest ``want_uv``. Waits for the frame loop.
@@ -730,7 +799,7 @@ def start(ms, port: int = 8486) -> None:
         tsay("        could not measure the base direction")
         return 0.0
 
-    def cap_pick(colour, uv_hint):
+    def cap_pick(colour, uv_hint, map_xy=None):
         """Pick a tube by its cap, in pick.py's order: LOOK, AIM, PROBE, APPROACH, GRASP.
 
         THE ORDER IS THE ALGORITHM, and getting it wrong is what every failed run here
@@ -762,7 +831,54 @@ def start(ms, port: int = 8486) -> None:
                        settle=0.20, step=2.8)
         j5 = float(ms.observe(False)[0][ms.ARM.roll_joint])
 
+        # OPEN THE JAWS NOW, before anything approaches, so the hand arrives ready
+        # instead of travelling in with the fingers wherever the last run left them.
+        ms.send_joints(ms.observe(False)[0], gripper=GRIP_PREOPEN_PCT)
+        time.sleep(0.2)
+        tsay(f"        jaws open to {GRIP_PREOPEN_PCT:.0f} for the approach")
+
         cap = _cap_now(uv_hint or None, colour)
+        if cap is None and map_xy is not None:
+            # THE MAP KNOWS WHERE IT IS -- TURN AND LOOK. The look pose is one fixed
+            # view of a bench wider than the camera, so a tube the scan found perfectly
+            # well can sit outside it, and the pick died on the spot with "no green cap
+            # in view from the look pose" while the map listed it at 22cm. The scan's
+            # own position is the answer: face that bearing and look again, then sweep
+            # either side of it.
+            # The pan angle comes from the IK, not from an assumed sign convention:
+            # aim the tip at the mapped spot (at a radius the arm can certainly make --
+            # the bearing is the same all along it) and keep only the base joint.
+            q_l = ms.observe(False)[0].astype(float)
+            here = float(q_l[ms.ARM.pan_joint])
+            tip_l = ms._tip(q_l)
+            pitch_l = float(sum(q_l[i] for i in ms.ARM.pitch_chain))
+            bear_m = math.atan2(map_xy[1], map_xy[0])
+            r_m = min(float(math.hypot(map_xy[0], map_xy[1])), 0.20)
+            q_a, e_a = ms._ik_hold_pitch(
+                q_l, np.array([r_m * math.cos(bear_m), r_m * math.sin(bear_m),
+                               float(tip_l[2])]), pitch_l, j5, ret_err=True)
+            if e_a > 0.05:
+                tsay(f"        the map puts it at {math.degrees(bear_m):+.0f}deg but "
+                     f"no pose faces there — sweeping from here instead")
+                pan_want = here
+            else:
+                pan_want = float(q_a[ms.ARM.pan_joint])
+            for extra in (0.0, -18.0, 18.0, -36.0, 36.0):
+                ms.checkpoint()
+                want = float(np.clip(pan_want + extra,
+                                     ms.J_LO[ms.ARM.pan_joint],
+                                     ms.J_HI[ms.ARM.pan_joint]))
+                q_l[ms.ARM.pan_joint] = want
+                ms.goto_smooth(ms._clamp_joints(q_l), settle=0.30, step=2.8)
+                cap = _cap_now(None, colour)
+                tsay(f"        base {want:+.0f}deg "
+                     f"(map bearing {math.degrees(bear_m):+.0f}deg): "
+                     + ("found it" if cap else "nothing"))
+                if cap is not None:
+                    break
+            if cap is None:
+                q_l[ms.ARM.pan_joint] = here
+                ms.goto_smooth(ms._clamp_joints(q_l), settle=0.25, step=2.8)
         if cap is None:
             raise RuntimeError(f"no {colour} cap in view from the look pose")
         last_uv = [(cap["x"], cap["y"])]
@@ -774,49 +890,24 @@ def start(ms, port: int = 8486) -> None:
 
         AIM = ms.jaw_frame().centre_uv
 
-        # ---- PITCH: straight down, set once, before anything approaches -----------
-        AIM = ms.jaw_frame().centre_uv
-        tphase("PITCH", "choosing the steepest wrist angle that still sees the cap")
-        q_p = ms.observe(False)[0].astype(float)
-        pitch_before = float(sum(q_p[i] for i in ms.ARM.pitch_chain))
-        tip_p = np.asarray(ms._tip(q_p), float)
-        fw, fh = ms.CAM_FRAME_WH if hasattr(ms, "CAM_FRAME_WH") else (640, 480)
-
-        pitch_hold, c_after = None, None
-        for trial in GRASP_PITCH_CANDIDATES:
-            ms.checkpoint()
-            q_t, e_t = ms._ik_hold_pitch(q_p, tip_p, trial, j5, ret_err=True)
-            if e_t > 0.03:
-                tsay(f"        {trial:+.0f}deg: unreachable here "
-                     f"(residual {e_t*100:.1f}cm)")
-                continue
-            ms.goto_smooth(ms._clamp_joints(np.asarray(q_t, float)),
-                           settle=0.25, step=2.2)
-            c = _cap_now(last_uv[0], colour)
-            if c is None:
-                tsay(f"        {trial:+.0f}deg: the cap is out of frame")
-                continue
-            edge = min(c["x"], fw - c["x"], c["y"], fh - c["y"])
-            if edge < PITCH_EDGE_MARGIN_PX:
-                tsay(f"        {trial:+.0f}deg: the cap is only {edge:.0f}px from the "
-                     f"frame edge — too close, it will be lost on the first base move")
-                continue
-            pitch_hold, c_after = trial, c
-            tsay(f"        {trial:+.0f}deg: cap at ({c['x']:.0f},{c['y']:.0f})px, "
-                 f"{edge:.0f}px clear of the edge — taking it")
-            break
-
-        if pitch_hold is None:
-            raise RuntimeError(
-                f"no wrist pitch between {GRASP_PITCH_CANDIDATES[-1]:.0f} and "
-                f"{GRASP_PITCH_CANDIDATES[0]:.0f}deg keeps the {colour} cap in view")
-        tsay(f"        wrist {pitch_before:+.0f} -> {pitch_hold:+.0f}deg, held from here")
-        last_uv[0] = (c_after["x"], c_after["y"])
-        cap = c_after
-        xy_p = _table_xy((c_after["x"], c_after["y"]))
-        if xy_p is not None:
-            xy = xy_p
-            tsay(f"        re-fixed looking down: ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm")
+        # ---- THE WRIST STANDS UP ON THE WAY IN, not before -----------------------
+        #
+        # The grasp pose is solved at GRASP_PITCH, so the approach interpolates the hand
+        # to a right angle as it travels; it arrives perpendicular and it never needed a
+        # stage of its own.
+        #
+        # It HAD one, tipping to 90 in place at the look pose, and the log says what
+        # that costs: the camera rides on the wrist, so from up there a 26 -> 90 tip
+        # points it at the bench under the jaws and the cap is simply gone --
+        #
+        #     [AIM]    (nothing: no cap)
+        #     [CENTRE] centre 1: cap not in view — closing from here
+        #     [GRASP]  settled at 7.8 -> EMPTY
+        #
+        # -- three tries, every one of them blind from the second stage onward. Tipping
+        # while ALSO moving toward the tube keeps it in shot, because the arm is closing
+        # the distance the tilt is opening up.
+        pitch_hold = GRASP_PITCH
 
         # ---- PROBE the BASE JOINT, which is what the correction moves --------------
         # pick.py's own comment records why this has to be measured hard: "A 3-unit probe
@@ -906,58 +997,502 @@ def start(ms, port: int = 8486) -> None:
                 xy, cap = xy_a, c
                 last_uv[0] = (c["x"], c["y"])
 
-        # ---- THE GRASP POSE, solved ONCE, in joint space --------------------------
-        #
-        # NO CARTESIAN IK INSIDE THE LOOP, and that is the whole point of this rewrite.
-        # pick.py interpolates JOINT poses toward its demonstrated grasp and adds a base
-        # correction on top; it never solves IK during the descent. Every version of this
-        # that used _move_tip per step re-solved all five joints each increment, so the
-        # camera's orientation was not determined by what was commanded -- which makes
-        # the relationship between "the correction I applied" and "which way the cap
-        # moved" unstable, and that is why the sign appeared to behave at random.
-        #
-        # The SO-101 has no demonstrated grasp pose, so one is SOLVED, once, here. After
-        # this the approach is pure joint interpolation plus a base nudge, exactly as
-        # pick.py does it.
-        tphase("PLAN", "solving the grasp pose once, holding the wrist where it is")
-        q_start = ms.observe(False)[0].astype(float)
+        # A grasp pose used to be solved here and driven to by a joint interpolation
+        # that ignored the picture until it arrived. It is gone -- the stages below
+        # travel by what the camera measures on each bite -- and this is only the
+        # default PERP starts from.
+        pitch_hold = GRASP_PITCH
 
-        # THE WRIST PITCH DOES NOT CHANGE. It is read from the arm here and held for the
-        # whole pick -- the approach, the grasp and the lift.
+        # ---- THE ONE MOVE THAT MATTERS, as a function ----------------------------
         #
-        # This is the fault that produced every "it is going the opposite way". A grasp
-        # pitch of 78 degrees was being commanded, tipping the wrist far over from the
-        # ~25 it sits at, and THE CAMERA IS BOLTED TO THAT WRIST: tilting it sweeps the
-        # entire picture upward, and the jaw cells are at the bottom of the picture. So
-        # the cap climbed away from the jaws on every step while the approach was
-        # supposedly closing on it. Measured, one descent:
+        # "Calculate the IK to put the cap at the bottom of the camera view." That is
+        # the job, and this is it: measure how far the cap moves down the frame per
+        # centimetre of reach, then solve for the reach that lands it on the jaw cells.
         #
-        #     dy: +87 128 165 194 214 233 264 285      away, monotonically
-        #
-        # Solving with an unweighted orientation was no better: it let the IK choose
-        # whatever wrist angle was convenient for each target, so the pitch still moved,
-        # just unpredictably. `_ik_hold_pitch` pins it.
-        tsay(f"        holding the wrist at {pitch_hold:+.1f}deg for the whole pick")
+        # MEASURED, NOT PROJECTED. Casting the cap to the table and driving there trusts
+        # a hand-eye that reads short, and the arm stops with the cap 350px high.
+        # Casting the JAW pixel as well and differencing is worse -- the fingertips sit
+        # 13cm above the table, so their pixel projects far down its own sightline and
+        # the correction comes out a lunge. One small bite, though, moves the cap a
+        # number of pixels that can simply be counted, and that count has no calibration
+        # in it at all. It is re-estimated after every bite, because the gain grows as
+        # the hand closes in.
+        def _grasp_uv():
+            """The pixel the fingertips will occupy once they are down at the tube.
 
-        q_grasp, err = ms._ik_hold_pitch(q_start, np.array([xy[0], xy[1], GRASP_Z]),
-                                         pitch_hold, j5, ret_err=True)
-        q_grasp = ms._clamp_joints(np.asarray(q_grasp, float))
-        if err > 0.02:
-            raise RuntimeError(
-                f"no grasp pose for ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm at "
-                f"z={GRASP_Z*100:.1f}cm holding {pitch_hold:.0f}deg — "
-                f"IK residual {err*100:.1f}cm")
-        pitch_end = float(sum(q_grasp[i] for i in ms.ARM.pitch_chain))
-        tsay(f"        grasp pose {np.round(q_grasp,1).tolist()}, "
-             f"wrist ends at {pitch_end:+.1f}deg ({err*100:.1f}cm residual)")
+            NOT the jaw cells, and the difference is the whole reason the jaws kept
+            closing on nothing. The cells are where the fingers appear RIGHT NOW, nine
+            centimetres above the bench, and a cap lined up with them is lined up with
+            the SIGHTLINE through them -- which carries on down and forward and meets
+            the table well beyond where the fingers will land. One run trimmed the cap
+            neatly into the cells, "14px off centre", came straight down and closed on
+            air at 5.7.
 
-        reached, last_dist = _vision_approach(
-            lambda: _cap_now(last_uv[0], colour), q_grasp, sign_base,
-            f"the {colour} cap", last_uv)
+            So the target is the fingertip's own grasp position, (x, y, GRASP_Z),
+            projected into the picture through the same hand-eye the casts use. It moves
+            up the frame as the hand descends, which is exactly right: it is a point on
+            the table, seen from a camera that is getting closer to it.
+            """
+            q_g = ms.observe(False)[0]
+            t_g = ms._tip(q_g)
+            try:
+                uv = ms.project_base(np.array([t_g[0], t_g[1], GRASP_Z], float),
+                                     ms.T_cam_of(q_g))
+            except Exception:
+                return None
+            return None if uv is None else (float(uv[0]), float(uv[1]))
+
+        def _close_in(pitch_now, budget_m, n_max, what="closing in"):
+            """Reach until the cap is on the fingers' landing point. (reached, dx_px)."""
+            q_h = ms.observe(False)[0].astype(float)
+            tip_h = ms._tip(q_h)
+            bear = math.atan2(tip_h[1], tip_h[0])
+            r_at = float(math.hypot(tip_h[0], tip_h[1]))
+            z_at = float(tip_h[2])
+            got, dxp, gone, gain, prev = False, None, 0.0, None, None
+            sign = sign_base
+            for k in range(n_max):
+                ms.checkpoint()
+                c = _cap_now(last_uv[0], colour)
+                if c is None:
+                    tsay(f"        {what} {k+1}: cap not in view — stopping here")
+                    break
+                last_uv[0] = (c["x"], c["y"])
+                jg = ms.jaw_frame()
+                aim = _grasp_uv() or jg.centre_uv
+                # A CELL TO THE RIGHT OF THE TUBE, so the cap ends up in the lower LEFT
+                # of the grip rather than dead centre. Dead centre sounds right and is
+                # not: the moving finger sweeps in from one side, and a cap sitting on
+                # the line it sweeps through gets nudged along instead of captured. Put
+                # the tube slightly into the fixed finger's half and the closing jaw
+                # arrives against it.
+                aim = (aim[0] - GRASP_DX_TARGET_PX, aim[1])
+                ex = aim[0] - c["x"]
+                dy = aim[1] - c["y"]
+                dxp = abs(ex)
+                bb = c.get("bbox")
+                corners = ([(bb[0], bb[1]), (bb[2], bb[1]), (bb[0], bb[3]), (bb[2], bb[3])]
+                           if bb else [])
+                inside = (ms.GRID.in_grip((c["x"], c["y"]), jg)
+                          or any(ms.GRID.in_grip(k2, jg) for k2 in corners))
+                if abs(ex) <= CENTRE_TOL_PX and abs(dy) <= TRIM_DY_TOL_PX:
+                    tsay(f"        {what} {k+1}: cap on the fingers' landing point "
+                         f"({abs(ex):.0f}px across, {abs(dy):.0f}px along"
+                         + (", in the jaw cells" if inside else "")
+                         + ") — there")
+                    got = True
+                    break
+
+                if prev is not None and abs(prev[1]) > 1e-6:
+                    moved_px, moved_m = prev[0] - dy, prev[1]
+                    g_now = moved_px / moved_m
+                    if g_now > 200.0:
+                        gain = g_now if gain is None else 0.5 * (gain + g_now)
+                    elif not inside:
+                        tsay(f"        {what} {k+1}: {moved_m*100:.1f}cm moved the cap "
+                             f"only {moved_px:+.0f}px — not closing the gap this way")
+                        break
+
+                if gain is None:
+                    bite = REACH_PROBE_M
+                    why = f"probing {bite*100:.1f}cm to measure pixels per cm"
+                else:
+                    need = dy / gain
+                    bite = float(np.clip(need, 0.0, REACH_BITE_MAX_M))
+                    why = (f"{dy:+.0f}px high, {gain:.0f}px/m -> {need*100:.1f}cm to "
+                           f"go, taking {bite*100:.1f}cm")
+                if bite <= 0.001:
+                    tsay(f"        {what} {k+1}: nothing left to reach "
+                         f"({dy:+.0f}px along) — there")
+                    got = inside or abs(dy) <= TRIM_DY_TOL_PX
+                    break
+                if gone + bite > budget_m:
+                    bite = budget_m - gone
+                    if bite <= 0.001:
+                        tsay(f"        {what} {k+1}: {gone*100:.0f}cm used up — "
+                             f"stopping rather than pushing")
+                        break
+
+                q_n = ms.observe(False)[0].astype(float)
+                tgt = np.array([(r_at + bite) * math.cos(bear),
+                                (r_at + bite) * math.sin(bear), z_at])
+                q_s, e_s = ms._ik_hold_pitch(q_n, tgt, pitch_now, j5, ret_err=True)
+                if e_s > 0.03:
+                    tsay(f"        {what} {k+1}: r={(r_at+bite)*100:.1f}cm is past the "
+                         f"arm at {pitch_now:.0f}deg — stopping here")
+                    break
+                q_s = np.asarray(q_s, float)
+                jump = max(abs(float(q_s[i]) - float(q_n[i]))
+                           for i in ms.ARM.pitch_chain)
+                if jump > REACH_MAX_JOINT_JUMP_DEG:
+                    tsay(f"        {what} {k+1}: that only solves by flipping the arm "
+                         f"over ({jump:.0f}deg) — stopping here")
+                    break
+                pan = float(q_n[ms.ARM.pan_joint])
+                if abs(ex) > CENTRE_TOL_PX and sign != 0.0:
+                    pan = float(np.clip(
+                        pan + sign * float(np.clip(abs(ex) / 22.0, 0.3, 1.8)),
+                        ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
+                q_s[ms.ARM.pan_joint] = pan
+                q_s[ms.ARM.roll_joint] = j5
+                tsay(f"        {what} {k+1}: cap {ms.GRID.cell_of((c['x'], c['y']))} "
+                     f"dx {ex:+.0f} dy {dy:+.0f}px — {why}")
+                ms.goto_smooth(ms._clamp_joints(q_s), settle=0.12, step=2.0)
+                r_at += bite
+                gone += bite
+                prev = (dy, bite)
+            return got, dxp
+
+        # ---- APPROACH: get over the cap WITH IT IN VIEW ---------------------------
+        #
+        # THE HAND STAYS SHALLOW FOR THIS, so the cap never leaves the picture. Going in
+        # already perpendicular points the camera at the bench right under the jaws and
+        # a tube any distance out is off the top of the frame before the arm has moved:
+        # three runs descended blind that way and closed on air.
+        #
+        # AND THE IMAGE CANNOT SAY WHEN IT HAS ARRIVED. Measured on this rig, at this
+        # angle: one 1.5cm bite outward moved the cap 38px UP the frame, not down. That
+        # is not a fluke, it is the geometry -- the camera tilts with the forearm, and
+        # pick.py measured the same thing (+31.8px per unit of reach) and concluded the
+        # image "cannot decide the descent". A loop waiting for the cap to come down to
+        # the jaws at this pitch waits forever.
+        #
+        # So each signal is used where it is sound: THE BEARING from the picture, which
+        # the base closes reliably, and THE DISTANCE from the table cast, re-taken every
+        # bite. The cast is biased down a grazing sightline and gets better as the hand
+        # gets nearer and looks more steeply down -- so the estimate that matters most,
+        # the last one, is also the best one.
+        tphase("APPROACH", "moving over the cap, keeping it in view")
+        pitch_see = float(sum(ms.observe(False)[0][i] for i in ms.ARM.pitch_chain))
+        tsay(f"        approaching at {pitch_see:+.0f}deg, where the cap stays visible")
+        reached, last_dist, r_goal = False, None, float(math.hypot(xy[0], xy[1]))
+        for k in range(N_APPROACH):
+            ms.checkpoint()
+            c = _cap_now(last_uv[0], colour)
+            if c is None:
+                tsay(f"        approach {k+1}: cap not in view — holding here")
+                break
+            last_uv[0] = (c["x"], c["y"])
+            jg = ms.jaw_frame()
+            # THE SAME OFFSET THE TRIM USES, and it belongs here most of all: this is
+            # the loop that closes the sideways error, and it was centring on the bare
+            # jaw pixel while the offset sat in a later stage that often stops early.
+            # So the bias was in the code and never on the robot.
+            # dx is driven to GRASP_DX_TARGET_PX, not to zero.
+            ex = (jg.centre_uv[0] - c["x"]) - GRASP_DX_TARGET_PX
+            last_dist = abs(ex)
+            xy_c = _table_xy((c["x"], c["y"]))
+            if xy_c is not None:
+                xy = xy_c
+                r_goal = 0.5 * (r_goal + float(math.hypot(xy_c[0], xy_c[1])))
+            q_n = ms.observe(False)[0].astype(float)
+            tip_n = ms._tip(q_n)
+            r_now = float(math.hypot(tip_n[0], tip_n[1]))
+            gap = r_goal - APPROACH_LEAD_M - r_now
+            # PRINT THE dx THE OVERLAY PRINTS, not the control error. They differ by
+            # the set point, and a log that quietly reports a different number than the
+            # picture is a log that cannot be checked against the picture.
+            tsay(f"        approach {k+1}: cap {ms.GRID.cell_of((c['x'], c['y']))} "
+                 f"dx {ex + GRASP_DX_TARGET_PX:+.0f}px "
+                 f"(target {GRASP_DX_TARGET_PX:+.0f}, so {ex:+.0f} off), "
+                 f"cast {r_goal*100:.1f}cm, hand {r_now*100:.1f}cm "
+                 f"-> {gap*100:+.1f}cm to go")
+            if gap <= APPROACH_TOL_M and abs(ex) <= CENTRE_TOL_PX:
+                tsay(f"        over the tube ({gap*100:+.1f}cm, {abs(ex):.0f}px) "
+                     f"— stopping here")
+                reached = True
+                break
+
+            bite = float(np.clip(gap, 0.0, REACH_BITE_MAX_M))
+            bear_n = math.atan2(tip_n[1], tip_n[0])
+            q_s = None
+            if bite > 0.002:
+                tgt = np.array([(r_now + bite) * math.cos(bear_n),
+                                (r_now + bite) * math.sin(bear_n), float(tip_n[2])])
+                q_t, e_t = ms._ik_hold_pitch(q_n, tgt, pitch_see, j5, ret_err=True)
+                if e_t > 0.03:
+                    tsay(f"        approach {k+1}: {(r_now+bite)*100:.1f}cm is past the "
+                         f"arm at {pitch_see:+.0f}deg — going no further out")
+                elif max(abs(float(q_t[i]) - float(q_n[i]))
+                         for i in ms.ARM.pitch_chain) > REACH_MAX_JOINT_JUMP_DEG:
+                    tsay(f"        approach {k+1}: that only solves by flipping the arm "
+                         f"over — going no further out")
+                else:
+                    q_s = np.asarray(q_t, float)
+            if q_s is None:
+                q_s = q_n.copy()
+            if abs(ex) > CENTRE_TOL_PX and sign_base != 0.0:
+                q_s[ms.ARM.pan_joint] = float(np.clip(
+                    float(q_n[ms.ARM.pan_joint])
+                    + sign_base * float(np.clip(abs(ex) / 20.0, 0.4, 2.2)),
+                    ms.J_LO[ms.ARM.pan_joint], ms.J_HI[ms.ARM.pan_joint]))
+            q_s[ms.ARM.roll_joint] = j5
+            if np.allclose(q_s, q_n, atol=1e-3):
+                tsay(f"        approach {k+1}: nothing left to move — stopping")
+                break
+            ms.goto_smooth(ms._clamp_joints(q_s), settle=0.14, step=2.2)
+
+        # ---- DOWN TO A HOVER, still shallow --------------------------------------
+        #
+        # HEIGHT BEFORE ANGLE, and the order is not arbitrary. Standing the hand up at
+        # the look pose's altitude puts the camera 15cm above the bench, where one
+        # centimetre of reach moves the cap 15px -- measured, gain 1550px/m -- and the
+        # trim computed that it needed 25cm more reach, which is nonsense the arm cannot
+        # act on anyway. Six centimetres up the same bite moves the cap several times as
+        # far, the cast down a near-vertical sightline is at its most accurate, and the
+        # radius the arm can make at a right angle is larger down there than it is up
+        # here. So: come down first, at the angle that keeps the tube in shot.
+        def _down_to(z_want, pitch_now, what):
+            """Straight down to ``z_want`` at fixed x and y. Returns the height reached."""
+            tip0 = np.asarray(ms._tip(ms.observe(False)[0]), float)
+            z0 = float(tip0[2])
+            if z0 <= z_want + 0.002:
+                tsay(f"        already at {z0*100:+.1f}cm")
+                return z0
+            tsay(f"        {z0*100:+.1f}cm -> {z_want*100:+.1f}cm at "
+                 f"({tip0[0]*100:+.1f},{tip0[1]*100:+.1f})cm")
+            for k in range(N_DOWN):
+                ms.checkpoint()
+                z_k = z0 + (z_want - z0) * ((k + 1) / N_DOWN)
+                q_n = ms.observe(False)[0].astype(float)
+                q_d, e_d = ms._ik_hold_pitch(
+                    q_n, np.array([tip0[0], tip0[1], z_k]), pitch_now, j5, ret_err=True)
+                if e_d > 0.02:
+                    tsay(f"        {what} {k+1}: z={z_k*100:+.1f}cm not reachable "
+                         f"(residual {e_d*100:.1f}cm) — stopping here")
+                    break
+                ms.goto_smooth(ms._clamp_joints(np.asarray(q_d, float)),
+                               settle=0.12, step=1.8)
+            z_end = float(ms._tip(ms.observe(False)[0])[2])
+            tsay(f"        at {z_end*100:+.1f}cm")
+            return z_end
+
+        tphase("DOWN", f"down to a hover {HOVER_Z*100:.0f}cm up, still able to see it")
+        _down_to(HOVER_Z, pitch_see, "hover")
+
+        # ---- PERPENDICULAR: stand the hand up OVER the tube ----------------------
+        #
+        # Holding the fingertip where it is and only changing the angle: the hand is
+        # already over the cap, so the fingers stay there while the forearm comes
+        # upright.
+        tphase("PERP", "standing up over the tube, as square as the reach allows")
+        q_u = ms.observe(False)[0].astype(float)
+        tip_u = np.asarray(ms._tip(q_u), float)
+        bear_u = math.atan2(tip_u[1], tip_u[0])
+        r_u = float(math.hypot(tip_u[0], tip_u[1]))
+        r_need = max(r_goal, r_u)
+        tsay(f"        hand at {r_u*100:.1f}cm, the tube casts to {r_goal*100:.1f}cm")
+
+        # THE ANGLE IS CHOSEN BY WHETHER IT CAN REACH THE TUBE, and this is the fault
+        # that has been wasting whole runs. Standing the wrist up ON THE SPOT and only
+        # then asking the reach to close the gap gets the refusal every time --
+        #
+        #     trim 2: r=28.1cm is past the arm at 90deg — stopping here
+        #     trim 3: r=30.2cm is past the arm at 85deg — stopping here
+        #
+        # -- and the arm closes its jaws 390px short of a tube it was never going to
+        # touch. A right angle costs radial reach: the forearm points down instead of
+        # out, and past about 25cm this arm cannot do both. So the question is asked in
+        # the order that matters: for each angle, steepest first, CAN THE HAND GET TO
+        # THE TUBE? The first yes wins, and the move is made to that radius at that
+        # angle in one go. The log then says plainly how square the grasp will be.
+        best = None
+        for trial in np.arange(GRASP_PITCH, GRASP_PITCH - 40.0, -5.0):
+            for r_try in (r_need, r_need - 0.01, r_need - 0.02):
+                if r_try <= r_u - 0.01:
+                    continue
+                tgt = np.array([r_try * math.cos(bear_u), r_try * math.sin(bear_u),
+                                float(tip_u[2])])
+                q_t, e_t = ms._ik_hold_pitch(q_u, tgt, float(trial), j5, ret_err=True)
+                if e_t > 0.02:
+                    continue
+                if max(abs(float(q_t[i]) - float(q_u[i]))
+                       for i in ms.ARM.pitch_chain) > 70.0:
+                    continue
+                best = (float(trial), float(r_try), np.asarray(q_t, float))
+                break
+            if best is not None:
+                break
+
+        if best is None:
+            # Nothing reaches it. Stand up where we are and let the trim do what it can
+            # -- but say so, because this is the arm's limit and not a tuning problem.
+            tsay(f"        no angle down to {GRASP_PITCH-35:.0f}deg reaches "
+                 f"{r_need*100:.1f}cm — standing up here and trimming by eye")
+            pitch_hold = None
+            for trial in np.arange(GRASP_PITCH, GRASP_PITCH - 35.0, -5.0):
+                q_t, e_t = ms._ik_hold_pitch(q_u, tip_u, float(trial), j5, ret_err=True)
+                if e_t <= 0.02:
+                    ms.goto_smooth(ms._clamp_joints(np.asarray(q_t, float)),
+                                   settle=0.28, step=2.2)
+                    pitch_hold = float(trial)
+                    break
+            if pitch_hold is None:
+                pitch_hold = float(sum(q_u[i] for i in ms.ARM.pitch_chain))
+            tsay(f"        wrist at {pitch_hold:+.0f}deg")
+        else:
+            pitch_hold, r_set, q_set = best
+            q_set[ms.ARM.roll_joint] = j5
+            tsay(f"        {pitch_hold:+.0f}deg reaches {r_set*100:.1f}cm"
+                 + ("" if pitch_hold >= GRASP_PITCH else
+                    f" — {GRASP_PITCH:.0f}deg cannot get out that far")
+                 + f", going there ({(r_set - r_u)*100:+.1f}cm out)")
+            ms.goto_smooth(ms._clamp_joints(q_set), settle=0.28, step=2.2)
+
+        # ---- TRIM: the one place the picture can judge the reach ------------------
+        #
+        # Right angle, low over the bench: now the camera looks down just ahead of the
+        # jaws, so reaching out walks the cap DOWN the frame and arrival is something
+        # the picture shows rather than something the cast has to be trusted for. This
+        # is the loop that has worked every time it had room -- dy 345 -> 125px and into
+        # the jaws.
+        tphase("TRIM", "reaching by eye until the cap sits in the jaws")
+        seen, d_after = _close_in(pitch_hold, TRIM_MAX_M, N_TRIM, what="trim")
+        if d_after is not None:
+            last_dist = d_after
+            reached = reached and seen if seen is not None else reached
+
+        # ---- TWIST: close ACROSS the tube, not along it ---------------------------
+        #
+        # A parallel gripper has to meet a cylinder side-on. If the tube lies at an angle
+        # to the jaw line the fingers hit it at a tangent, roll it away, and close on the
+        # gap where it used to be.
+        #
+        # The detector already measures the axis -- `tube_axis` fits the body's
+        # silhouette and every cap in LAST_CAPS carries its `angle` and `elong`. So the
+        # error is the tube's angle against the jaw line plus a right angle, and the
+        # wrist roll turns through it. On this arm the camera rides past the roll joint,
+        # so rolling turns the picture as well: `JawFrame.roll_gain` is the measured
+        # degrees of image rotation per degree of roll (+1.00 here), which is what makes
+        # the correction a division rather than a guess.
+        #
+        # Done BEFORE the final reach, while the jaws are still clear of the tube --
+        # turning the wrist with the fingers already around it would sweep it aside.
+        def _axis_now():
+            """The tube's angle in the picture: median of three reads, or None.
+
+            THREE READS, NOT ONE. A single read produced "rolled -4.5deg -> 70deg out
+            of square": the angle was noise, the gain computed from it was nonsense, and
+            the wrist moved on both.
+
+            AND A LOWER ELONGATION GATE THAN A DISTANT TUBE NEEDS. Standing over the
+            tube the camera sees it foreshortened -- measured 1.9, 2.0, 2.1 at exactly
+            the moment the twist matters -- so a threshold of 3.0 skipped the stage run
+            after run in silence. The spread check carries the weight instead.
+            """
+            vals, last = [], None
+            for _ in range(3):
+                c = _cap_now(last_uv[0], colour)
+                last = c if c is not None else last
+                if c is None or c.get("angle") is None:
+                    continue
+                if float(c.get("elong") or 0.0) < TWIST_MIN_ELONGATION:
+                    continue
+                vals.append(float(c["angle"]))
+                time.sleep(0.05)
+            if not vals:
+                return None, last
+            base = vals[0]
+            folded = [base + fold(v - base) for v in vals]
+            spread = float(max(folded) - min(folded))
+            if len(vals) >= 2 and spread > TWIST_MAX_SPREAD_DEG:
+                tsay(f"        the tube's angle reads {spread:.0f}deg apart across "
+                     f"{len(vals)} looks — too unsteady to roll on")
+                return None, last
+            return fold(float(np.median(folded))), last
+
+        a0, c_t = _axis_now()
+        if a0 is None:
+            el = None if c_t is None else c_t.get("elong")
+            tsay(f"        no usable tube axis (elongation "
+                 f"{'none' if el is None else format(el, '.1f')}, needs "
+                 f"{TWIST_MIN_ELONGATION:.1f}) — leaving the wrist where it is")
+        else:
+            jaw_sq = float(ms.jaw_frame().axis_deg) + 90.0
+            err = fold(a0 - jaw_sq)
+            if abs(err) <= TWIST_TOL_DEG:
+                tsay(f"        tube is already square to the jaws ({abs(err):.0f}deg)")
+            else:
+                tphase("TWIST", "turning the wrist so the jaws close across the tube")
+                tsay(f"        tube lies at {a0:+.0f}deg, square to the jaws is "
+                     f"{fold(jaw_sq):+.0f}deg — {err:+.0f}deg out")
+
+                # MEASURE WHICH WAY THE ROLL TURNS THE PICTURE. The stored roll_gain is
+                # +1.00 and acting on it turned the tube the wrong way on this rig, so
+                # the direction is taken from the arm: roll a known amount, watch the
+                # angle, divide.
+                q_w0 = ms.observe(False)[0].astype(float)
+                q_probe = q_w0.copy()
+                q_probe[ms.ARM.roll_joint] = float(np.clip(
+                    q_w0[ms.ARM.roll_joint] + TWIST_PROBE_DEG,
+                    ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]))
+                moved = q_probe[ms.ARM.roll_joint] - q_w0[ms.ARM.roll_joint]
+                ms.goto_smooth(ms._clamp_joints(q_probe), settle=0.25, step=2.4)
+                a1, _c1 = _axis_now()
+                if a1 is None or abs(moved) < 1.0:
+                    tsay("        lost the tube axis during the probe — rolling back")
+                    ms.goto_smooth(ms._clamp_joints(q_w0), settle=0.25, step=2.4)
+                else:
+                    gain = fold(a1 - a0) / moved
+                    tsay(f"        roll {moved:+.0f}deg turned the tube "
+                         f"{fold(a1 - a0):+.0f}deg -> gain {gain:+.2f}deg/deg")
+                    if abs(gain) < 0.3:
+                        tsay("        the roll barely turns the picture — leaving the "
+                             "wrist alone")
+                        ms.goto_smooth(ms._clamp_joints(q_w0), settle=0.25, step=2.4)
+                    else:
+                        err1 = fold(a1 - jaw_sq)
+                        # MINUS. The measured gain is d(tube angle)/d(roll), so to
+                        # remove an error of err1 the wrist turns -err1/gain. The
+                        # opposite sign was tried on the operator's report and turned
+                        # the wrist the wrong way; this is the direction that was right
+                        # before. The check below undoes it either way if it does not
+                        # actually improve the squareness.
+                        d_roll = float(np.clip(-err1 / gain, -TUBE_MAX_ROLL_DEG,
+                                               TUBE_MAX_ROLL_DEG))
+                        q_w = ms.observe(False)[0].astype(float)
+                        q_w[ms.ARM.roll_joint] = float(np.clip(
+                            q_w[ms.ARM.roll_joint] + d_roll,
+                            ms.J_LO[ms.ARM.roll_joint], ms.J_HI[ms.ARM.roll_joint]))
+                        ms.goto_smooth(ms._clamp_joints(q_w), settle=0.25, step=2.4)
+                        a2, c2 = _axis_now()
+                        if a2 is not None:
+                            e2 = fold(a2 - (float(ms.jaw_frame().axis_deg) + 90.0))
+                            tsay(f"        rolled {d_roll:+.1f}deg -> {abs(e2):.0f}deg "
+                                 f"out of square (was {abs(err1):.0f}deg)")
+                            if c2 is not None:
+                                last_uv[0] = (c2["x"], c2["y"])
+                            if abs(e2) > abs(err1) + 5.0:
+                                tsay("        that is worse — rolling back")
+                                ms.goto_smooth(ms._clamp_joints(q_w0),
+                                               settle=0.25, step=2.4)
+                        j5 = float(ms.observe(False)[0][ms.ARM.roll_joint])
+
+        if _grasp_uv() is not None:
+            tphase("TRIM", "re-checking the aim after the twist")
+            _s2, d2 = _close_in(pitch_hold, RETRIM_MAX_M, N_RETRIM, what="re-trim")
+            if d2 is not None:
+                last_dist = d2
+
+        # ---- DOWN THE LAST BIT ---------------------------------------------------
+        tphase("DOWN", "the last few centimetres onto the tube")
+        _down_to(GRASP_Z, pitch_hold, "down")
 
         # ---- GRASP ----------------------------------------------------------------
         tphase("GRASP", "closing across the tube")
-        held_i, idle = ms.close_with_current(step=4.0, delay=0.08)
+        # OPEN A LITTLE, NOT ALL THE WAY. A 16mm tube needs the jaws barely parted --
+        # they rest at 6.5 on air and at 13-21 holding one -- so the 95 they were opened
+        # to was 70 units of travel spent before the fingers were anywhere near the
+        # tube, and every one of those units was a chance to knock it. Opening to
+        # GRIP_PREOPEN_PCT leaves clear room around the tube and starts the close where
+        # the work actually is.
+        ms.send_joints(ms.observe(False)[0], gripper=GRIP_PREOPEN_PCT)
+        time.sleep(0.25)
+        tsay(f"        jaws opened to {GRIP_PREOPEN_PCT:.0f} (wide is "
+             f"{ms.ARM.gripper.open_pct:.0f}) — closing from there on the torque")
+        held_i, idle = ms.close_with_current(step=3.0, delay=0.09,
+                                             ignore_above_pct=GRIP_TRUST_BELOW_PCT,
+                                             from_pct=GRIP_PREOPEN_PCT)
 
         # WHERE THE JAWS COME TO REST, because the current says nothing on this arm.
         # gripper_current() reads 0 here run after run -- the servo either does not
@@ -971,10 +1506,12 @@ def start(ms, port: int = 8486) -> None:
         # mid-close the jaws pass THROUGH the holding band on their way shut.
         pos = settled(lambda: float(ms.state.get("gripper") or 0.0),
                       tol=0.4, timeout=1.5, dt=0.06)
-        held = pos > GRIP_HOLDING_PCT
+        held = GRIP_HOLDING_PCT < pos < GRIP_JAMMED_PCT
+        verdict = ("HOLDING" if held else
+                   "NEVER CLOSED" if pos >= GRIP_JAMMED_PCT else "EMPTY")
         tsay(f"        gripper settled at {pos:.1f} "
-             f"(air closes to {GRIP_AIR_PCT:.1f}, holding is above "
-             f"{GRIP_HOLDING_PCT:.1f}) -> {'HOLDING' if held else 'EMPTY'}"
+             f"(air closes to {GRIP_AIR_PCT:.1f}, a tube holds between "
+             f"{GRIP_HOLDING_PCT:.1f} and {GRIP_JAMMED_PCT:.1f}) -> {verdict}"
              f"   [current said {'contact' if held_i else 'nothing'}, "
              f"idle {idle:.1f}]")
 
@@ -991,6 +1528,11 @@ def start(ms, port: int = 8486) -> None:
                 f"the jaws closed, but the cap was last seen {last_dist:.0f}px away — "
                 f"further than {2.0*GRASP_RADIUS_PX:.0f}px, so whatever is between them "
                 f"is not this tube")
+        if not held and pos >= GRIP_JAMMED_PCT:
+            raise RuntimeError(
+                f"the jaws never closed — they stopped at {pos:.1f}, nearly open "
+                f"(a tube holds between {GRIP_HOLDING_PCT:.1f} and "
+                f"{GRIP_JAMMED_PCT:.1f}); a false contact fired the squeeze early")
         if not held:
             raise RuntimeError(
                 f"closed on nothing — the jaws settled at {pos:.1f}, at the air stop "
@@ -1007,14 +1549,14 @@ def start(ms, port: int = 8486) -> None:
         return ((float(deg) + period / 2.0) % period) - period / 2.0
 
     # ---- the run ---------------------------------------------------------------
-    def run(label, dest_hole, colour, uv_hint):
+    def run(label, dest_hole, colour, uv_hint, map_xy=None):
         ep = episodes.start("tube_pick", label, arm=ms.ARM.name, simulated=False,
                             dest=("rack hole %d" % dest_hole) if dest_hole is not None
                             else None)
 
         def action(n):
             tphase("PICK", f"{label}, attempt {n}")
-            detail = cap_pick(colour, uv_hint)
+            detail = cap_pick(colour, uv_hint, map_xy)
             if "nothing" in detail:
                 raise RuntimeError(detail)
             if dest_hole is None:
@@ -1186,7 +1728,9 @@ def start(ms, port: int = 8486) -> None:
         sample_idle()
         colour = found[0]["colour"]
         uv_hint = tuple(found[0].get("uv") or (0, 0))
-        threading.Thread(target=run, args=(label, hole, colour, uv_hint),
+        mx, my = found[0].get("x"), found[0].get("y")
+        map_xy = None if mx is None or my is None else (float(mx), float(my))
+        threading.Thread(target=run, args=(label, hole, colour, uv_hint, map_xy),
                          daemon=True).start()
         return jsonify(ok=True, label=label, colour=colour, hole=hole)
 

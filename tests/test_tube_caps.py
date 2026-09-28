@@ -98,10 +98,24 @@ class TestTheThingsThatFooledThePortedDetector:
         cv2.rectangle(img, (100, 300), (300, 318), BLUE, -1)      # 200x18
         assert find_caps(cv2.cvtColor(img, cv2.COLOR_HSV2BGR)) == []
 
-    def test_gold_is_not_offered_at_all(self):
-        # This bench has no gold caps, and warm wood lands in gold's hue window. A
-        # colour nobody has a cap for is all false positives and no true ones.
-        assert "gold" not in CAP_HSV
+    def test_gold_is_offered_now_that_the_bench_has_gold_caps(self):
+        # It was NOT offered, deliberately: warm wood lands in gold's hue window and a
+        # colour nobody has a cap for is all false positives and no true ones. The
+        # bench has gold-capped tubes now, so the trade has changed -- but the reason
+        # gold was risky has not, which is what the next two tests pin.
+        assert "gold" in CAP_HSV
+
+    def test_a_gold_cap_is_found(self):
+        # Hue 25, and saturated the way an anodised cap is.
+        caps = find_caps(frame_with((320, 240, 22, (25, 205, 180))))
+        assert [c.colour for c in caps] == ["gold"]
+
+    def test_warm_bench_wood_is_still_not_a_gold_cap(self):
+        # THE WHOLE RISK OF ADDING GOLD, in one case. Bare wood sits right inside
+        # gold's hue window -- measured 10-25 on this bench -- and is rejected only
+        # because it is washed out: S 12-40 against a gate of 160. If this test ever
+        # fails, the gate moved, and the table is about to be reported as a tube.
+        assert find_caps(frame_with((320, 240, 40, (22, 35, 190)))) == []
 
 
 class TestTheGreenBlueSplit:

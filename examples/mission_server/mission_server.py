@@ -587,6 +587,12 @@ def find_label(rgb, label, T_base_cam=None):
 #: the dependency only ever points one way, from the mode to the server.
 OVERLAY_HOOKS = []
 
+#: Whether publish() draws the YOLO detections. The tube mode turns this off: it finds
+#: its tubes by cap colour, so a second set of boxes from a different detector -- drawn
+#: around whatever the open-vocabulary query happened to match, on its own 2.5s cycle --
+#: is not a second opinion, it is clutter over the thing being aimed at.
+DRAW_YOLO_BOXES = [True]
+
 
 def publish(rgb, joints=None):
     img = np.ascontiguousarray(rgb[:, :, ::-1])
@@ -671,7 +677,7 @@ def publish(rgb, joints=None):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 235, 255), 1)
     for tk, color, name in ((red_tracker, (0, 0, 255), "red"), (green_tracker, (0, 200, 0), "green")):
         tr = tk.last
-        if tr is not None and now - tr.t < 0.7:   # fresh only — no wandering stale boxes
+        if tr is not None and now - tr.t < 0.7 and DRAW_YOLO_BOXES[0]:
             x1, y1, x2, y2 = (int(v) for v in tr.bbox_xyxy)
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             # THE EXACT PIXEL the tracker is locked to — same marker the generic
@@ -696,7 +702,7 @@ def publish(rgb, joints=None):
     with lock:
         dets = dict(DETECT.latest.dets)
         d_age = time.time() - DETECT.latest.t
-    if d_age < 4.0:
+    if d_age < 4.0 and DRAW_YOLO_BOXES[0]:
         # One physical object often matches SEVERAL words in the query - a pen fires
         # as both "pen" and "knife" - and drawing each one stacks unreadable labels
         # on top of each other. Collapse overlapping boxes and keep the best-scoring
@@ -1143,7 +1149,7 @@ def triangulate(finder, tracker, label):
     return p
 
 
-def close_with_current(step=None, delay=None):
+def close_with_current(step=None, delay=None, ignore_above_pct=None, from_pct=None):
     """Close the gripper in small increments, watching the servo current, and
     stop the instant it rises (torque change = fingers on the object). Smaller
     step / longer delay = the slow, gentle close the user asked for.
@@ -1156,7 +1162,10 @@ def close_with_current(step=None, delay=None):
     delay = g.close_delay_s if delay is None else delay
     idle = [c for c in (gripper_current() for _ in range(5)) if c is not None]
     i_idle = float(np.mean(idle)) if idle else 0.0
-    pct = g.open_pct
+    # START FROM WHERE THE JAWS ACTUALLY ARE, when the caller says so. Sweeping from
+    # wide open every time wastes travel and, on a gripper whose fingers pass the object
+    # on the way, is how a close picks up a false contact before it is anywhere near.
+    pct = g.open_pct if from_pct is None else float(from_pct)
     while pct > g.closed_pct:
         checkpoint()
         pct -= step
@@ -1164,6 +1173,13 @@ def close_with_current(step=None, delay=None):
         send_joints(joints, gripper=pct)
         time.sleep(delay)
         c = gripper_current()
+        # A CURRENT RISE WHILE THE JAWS ARE STILL WIDE IS THE MOTOR STARTING, NOT AN
+        # OBJECT. `ignore_above_pct` is the opening above which contact is not believed.
+        # Without it the first strokes of the close read as a grasp and the squeeze fires
+        # immediately, leaving the gripper parked near open -- this rig logged settled
+        # values of 76.3 and 86.9 reported as HOLDING with nothing between the fingers.
+        if ignore_above_pct is not None and pct > float(ignore_above_pct):
+            continue
         if c is not None and abs(c - i_idle) >= g.contact_current_delta:
             # firmer squeeze — ΔI=1.8 holds slipped the cube during transit
             send_joints(joints, gripper=max(0.0, pct - g.squeeze_extra_pct))

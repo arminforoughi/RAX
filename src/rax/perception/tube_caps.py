@@ -79,6 +79,13 @@ class Cap:
 CAP_HSV: dict[str, tuple[int, int]] = {
     "green": (72, 92),
     "blue": (93, 112),
+    # GOLD/AMBER CAPS. Hue 16-34 in OpenCV's 0-179 scale is yellow through orange.
+    # This is the one band that shares hue with the bench itself -- bare wood runs
+    # roughly 10-25 -- so it leans entirely on the saturation gate below: the wood
+    # measures 12-40 and MIN_SAT is 160. If a gold cap is ever missed on a light
+    # bench, measure it before widening the hue; dropping MIN_SAT would turn the whole
+    # table into a cap.
+    "gold": (16, 34),
 }
 
 #: THE REAL GATE. Both measured caps sit above 190; the turntable is 12-40 and the
@@ -115,7 +122,7 @@ MAX_AREA = 60000.0
 
 
 def find_caps(bgr, *, exclude: tuple = (), exclude_r: float = 0.0,
-              colours: tuple = ("green", "blue"),
+              colours: tuple = ("green", "blue", "gold"),
               min_area: float = MIN_AREA, max_area: float = MAX_AREA) -> list[Cap]:
     """Every cap in the frame, biggest first.
 
@@ -161,7 +168,8 @@ def find_caps(bgr, *, exclude: tuple = (), exclude_r: float = 0.0,
 def draw(bgr, caps, *, aim=None):
     """Annotate a copy: a box and a label per cap. For the FPV overlay."""
     vis = bgr.copy()
-    COL = {"green": (60, 220, 90), "blue": (235, 170, 60)}
+    COL = {"green": (60, 220, 90), "blue": (235, 170, 60),
+           "gold": (60, 200, 235)}
     for c in caps:
         x1, y1, x2, y2 = (int(v) for v in c.bbox)
         col = COL.get(c.colour, (200, 200, 200))
