@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-scene="cubes">
 <canvas id="arm" aria-hidden="true"></canvas>
 
 <nav class="top" aria-label="Main">
@@ -122,6 +122,7 @@
         <p>Every attempt is saved with its camera frames, its joint states and an outcome the robot assigns on its own, from the grip and a look from above. Development alone left <b>672 labelled episodes</b> on disk, sorted by what went wrong. That is the data a learned policy needs, collected without a human in the loop, and the next step closes it: teleoperation episodes that were too few to train a whole policy are plenty to train the part that sees. The precise controller becomes the data engine for the learned one.</p>
         <div class="links" aria-label="More projects">
           <a href="https://kinesislabs.tech/">Kinesis Labs</a>
+          <a href="https://biorobotix.tech/">BioRobotix</a>
           <a href="https://github.com/arminforoughi/RAX">RAX on GitHub</a>
           <a href="https://arminforoughi.github.io/">Armin Foroughi</a>
         </div>

@@ -8,6 +8,7 @@
   const ctx = cv.getContext("2d");
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   let W = 0, H = 0, dpr = 1;
+  const CUBES = document.body.dataset.scene === "cubes";
 
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -90,6 +91,27 @@
     { t: 9.8, p: [12, -4, 18], a: -0.5, g: 1, s: "in" },
     { t: 11.4, p: [14, 2, 16], a: -0.5, g: 1, s: "in" },
   ];
+  // ---- scene 2: stacking cubes (the platform page) ----------------------------------
+  const CUBE = 4, cubeStart = [[22, 12], [27, 3], [21, -4]], stackAt = [13, -15];
+  const CUBEP = boxPts(CUBE, CUBE, CUBE, 0.5, 4);
+  if (CUBES) {
+    keys.length = 0;
+    let t = 0;
+    const hover = 15, at = (i) => 2.2 + CUBE * i;       // fingertip at a cube's middle
+    keys.push({ t, p: [14, 2, 17], a: -0.5, g: 1, held: -1, n: 0 });
+    cubeStart.forEach(([x, y], i) => {
+      keys.push({ t: t += 1.4, p: [x, y, hover], a: P, g: 1, held: -1, n: i });
+      keys.push({ t: t += 0.8, p: [x, y, 2.2], a: P, g: 1, held: -1, n: i });
+      keys.push({ t: t += 0.45, p: [x, y, 2.2], a: P, g: 0.35, held: i, n: i });
+      keys.push({ t: t += 0.8, p: [x, y, hover + 2], a: P, g: 0.35, held: i, n: i });
+      keys.push({ t: t += 1.3, p: [stackAt[0], stackAt[1], hover + 2 + CUBE * i], a: P, g: 0.35, held: i, n: i });
+      keys.push({ t: t += 0.8, p: [stackAt[0], stackAt[1], at(i)], a: P, g: 0.35, held: i, n: i });
+      keys.push({ t: t += 0.4, p: [stackAt[0], stackAt[1], at(i)], a: P, g: 1, held: -1, n: i + 1 });
+      keys.push({ t: t += 0.6, p: [stackAt[0], stackAt[1], hover + CUBE * (i + 1)], a: P, g: 1, held: -1, n: i + 1 });
+    });
+    keys.push({ t: t += 1.6, p: [14, 2, 17], a: -0.5, g: 1, held: -1, n: 3 });
+    keys.push({ t: t += 1.2, p: [14, 2, 17], a: -0.5, g: 1, held: -1, n: 3 });
+  }
   const T = keys[keys.length - 1].t;
   const ease = (u) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
   const lerp = (a, b, u) => a + (b - a) * u;
@@ -99,10 +121,12 @@
       if (t >= A.t && t <= B.t) {
         const u = ease((t - A.t) / (B.t - A.t));
         return { p: A.p.map((v, k) => lerp(v, B.p[k], u)), a: lerp(A.a, B.a, u), g: lerp(A.g, B.g, u),
-                 s: B.s === "drop" ? "drop" : A.s, u, roll: B.tw ? u * 0.6 : (A.tw ? 0.6 : 0) };
+                 s: B.s === "drop" ? "drop" : A.s, u, roll: B.tw ? u * 0.6 : (A.tw ? 0.6 : 0),
+                 held: B.held === -1 && A.held !== -1 ? A.held : (A.held ?? -1),
+                 n: Math.min(A.n ?? 0, B.n ?? 0) };
       }
     }
-    return { p: keys[0].p, a: keys[0].a, g: 1, s: "rest", u: 0, roll: 0 };
+    return { p: keys[0].p, a: keys[0].a, g: 1, s: "rest", u: 0, roll: 0, held: -1, n: 0 };
   }
 
   function solve(p, a) {                              // base yaw + planar 2-link IK
@@ -134,7 +158,7 @@
     const y = q[1] * c + q[2] * s, z = -q[1] * s + q[2] * c;
     const depth = 95 + y;
     const f = Math.min(W * 0.62, H * 0.95) * 1.35 / depth;
-    const cx = W > 900 ? W * 0.79 : W * 0.5, cy = H * (W > 900 ? 0.74 : 0.8);
+    const cx = W > 900 ? W * (CUBES ? 0.7 : 0.79) : W * 0.45, cy = H * (W > 900 ? 0.74 : 0.8);
     return [cx + q[0] * f, cy - z * f, depth];
   }
 
@@ -175,13 +199,21 @@
                            CAPP.forEach((v) => push(add(o, [v[0] + 5, v[1], v[2] + 0.8]), 1, 1.9)); };
     const standing = (o) => { TUBEP.forEach((v) => push(add(o, [v[1], v[2], v[0] - 10]), 0.9, 1.5));
                               CAPP.forEach((v) => push(add(o, [v[1], v[2], v[0] + 0.3]), 1, 1.9)); };
-    if (s.s === "rest") lying([tubeAt.x, tubeAt.y, 0]);
-    else if (s.s === "held") lying(add(tip, [0, 0, -1.6]));
-    else if (s.s === "up") standing(add(tip, [0, 0, 1.5]));
-    else if (s.s === "drop") standing(add(tip, [0, 0, 1.5 - s.u * 6]));
-    else standing([hole.x, hole.y, RACK.h + 7.5]);
-
-    RACKP.forEach((v) => push([v[0] + RACK.x, v[1] + RACK.y, v[2]], 0.75, 1.3));
+    if (CUBES) {
+      const cube = (o) => CUBEP.forEach((v) => push(add(o, [v[0] - CUBE / 2, v[1], v[2]]), 0.95, 1.5));
+      cubeStart.forEach(([x, y], i) => {
+        if (i === s.held) cube(add(tip, [0, 0, -2.2]));
+        else if (i < s.n) cube([stackAt[0], stackAt[1], CUBE * i + CUBE / 2]);
+        else cube([x, y, CUBE / 2]);
+      });
+    } else {
+      if (s.s === "rest") lying([tubeAt.x, tubeAt.y, 0]);
+      else if (s.s === "held") lying(add(tip, [0, 0, -1.6]));
+      else if (s.s === "up") standing(add(tip, [0, 0, 1.5]));
+      else if (s.s === "drop") standing(add(tip, [0, 0, 1.5 - s.u * 6]));
+      else standing([hole.x, hole.y, RACK.h + 7.5]);
+      RACKP.forEach((v) => push([v[0] + RACK.x, v[1] + RACK.y, v[2]], 0.75, 1.3));
+    }
 
     pts.sort((a, b) => b[2] - a[2]);                  // far points first
     for (const [x, y, d, a, sz] of pts) {
