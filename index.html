@@ -3,165 +3,84 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>RAX · Seeing Hands</title>
-<meta name="description" content="How RAX picks lab tubes with one wrist camera: detection, orientation and IK-driven motion that checks itself, works across arms, and records its own training data.">
+<title>RAX</title>
+<meta name="description" content="RAX: an open robot manipulation stack. Any arm, any camera, and the robot measures what usually gets hand-tuned.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&family=Archivo+Narrow:wght@500;700&display=swap">
-<style>
-  :root{
-    --bp:#0c3b6b; --bp-deep:#082c52; --line:rgba(190,222,255,.14); --line-2:rgba(190,222,255,.28);
-    --ink:#eaf4ff; --soft:#a9c8e8; --cyan:#7fd4ff; --chalk:#ffffff; --amber:#ffd27a;
-    --mono:"IBM Plex Mono", ui-monospace, Consolas, monospace;
-    --sans:"IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
-    --cond:"Archivo Narrow", "Arial Narrow", system-ui, sans-serif;
-    color-scheme:dark;
-  }
-  *{box-sizing:border-box}
-  html{background:var(--bp-deep)}
-  body{margin:0; color:var(--ink); font:17px/1.65 var(--sans);
-       background-color:var(--bp);
-       background-image:
-         linear-gradient(var(--line-2) 1px, transparent 1px),
-         linear-gradient(90deg, var(--line-2) 1px, transparent 1px),
-         linear-gradient(var(--line) 1px, transparent 1px),
-         linear-gradient(90deg, var(--line) 1px, transparent 1px);
-       background-size:120px 120px,120px 120px,24px 24px,24px 24px;
-       padding:max(28px, env(safe-area-inset-top)) 20px max(56px, env(safe-area-inset-bottom))}
-  .sheet{max-width:780px; margin:0 auto; border:1.5px solid var(--line-2); outline:1px solid var(--line);
-         outline-offset:6px; background:rgba(8,44,82,.55); padding:40px clamp(18px,5vw,48px) 36px;
-         display:flex; flex-direction:column; gap:36px}
-  .tag{font:500 12px/1 var(--mono); letter-spacing:.16em; text-transform:uppercase; color:var(--cyan)}
-  h1{font:700 clamp(38px,7vw,64px)/1.02 var(--cond); letter-spacing:.01em; margin:10px 0 14px;
-     color:var(--chalk); text-transform:uppercase; text-wrap:balance}
-  .dek{font-size:19px; color:var(--soft); margin:0; max-width:60ch}
-  h2{font:700 24px/1.2 var(--cond); text-transform:uppercase; letter-spacing:.04em; margin:0;
-     color:var(--chalk); display:flex; gap:12px; align-items:baseline; text-wrap:balance}
-  h2 .ref{font:500 12px var(--mono); color:var(--cyan); letter-spacing:.1em}
-  section{display:flex; flex-direction:column; gap:14px}
-  p{margin:0; max-width:66ch}
-  b{color:var(--chalk); font-weight:500}
-  .dim{color:var(--cyan); font-family:var(--mono); font-size:.9em}
-  figure{margin:0; border:1px dashed var(--line-2); padding:14px; overflow-x:auto}
-  figcaption{font:12px/1.4 var(--mono); color:var(--soft); margin-top:10px; letter-spacing:.04em}
-  svg text{font-family:var(--mono)}
-  .parts{display:grid; grid-template-columns:1fr 1fr; gap:0; border:1px solid var(--line-2)}
-  .part{padding:16px 18px; border-right:1px solid var(--line); border-bottom:1px solid var(--line);
-        display:flex; flex-direction:column; gap:6px}
-  .part:nth-child(2n){border-right:0}
-  .part:nth-last-child(-n+2){border-bottom:0}
-  .part .no{font:500 12px var(--mono); color:var(--cyan); letter-spacing:.1em}
-  .part h3{margin:0; font:700 17px/1.25 var(--cond); text-transform:uppercase; letter-spacing:.03em; color:var(--chalk)}
-  .part p{font-size:15.5px; color:var(--soft)}
-  .note{border-left:2px solid var(--amber); padding:4px 0 4px 14px; color:var(--soft); font-size:15.5px}
-  .note b{color:var(--amber)}
-  .titleblock{display:grid; grid-template-columns:repeat(4,1fr); border:1.5px solid var(--line-2);
-              font:12px/1.35 var(--mono); color:var(--soft)}
-  .titleblock div{padding:8px 10px; border-right:1px solid var(--line)}
-  .titleblock div:last-child{border-right:0}
-  .titleblock span{display:block; color:var(--cyan); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase}
-  a{color:var(--cyan)}
-  a:focus-visible{outline:2px solid var(--amber); outline-offset:2px}
-  @media (max-width:640px){
-    .parts{grid-template-columns:1fr}
-    .part{border-right:0}
-    .part:nth-last-child(2){border-bottom:1px solid var(--line)}
-    .titleblock{grid-template-columns:1fr 1fr}
-    .titleblock div:nth-child(2){border-right:0}
-    .titleblock div:nth-child(-n+2){border-bottom:1px solid var(--line)}
-  }
-</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo+Narrow:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main class="sheet">
+<canvas id="arm" aria-hidden="true"></canvas>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="./">RAX</a>
+    <a href="./" aria-current="page">Platform</a>
+    <a href="tube-sorting.html">Tube sorting</a>
+    <a href="https://github.com/arminforoughi/RAX">GitHub</a>
+  </nav>
 
-  <header>
-    <div class="tag">RAX · Field note 01</div>
-    <h1>Seeing hands</h1>
-    <p class="dek">A robot arm that picks lab tubes using one camera on its wrist. No training data, no hand-placed coordinates: it looks, reasons about geometry, moves a little, and looks again.</p>
+  <header class="hero">
+    <span class="kicker">Open manipulation stack</span>
+    <h1>Robots that <em>measure</em> themselves.</h1>
+    <p class="dek">Point a camera at a table, name an object, and an arm finds it and picks it up. The numbers that usually get hand-tuned for one robot on one table are measured by the robot instead, so the same stack moves to the next arm.</p>
+    <div class="ctas">
+      <a class="btn" href="tube-sorting.html">See it sort tubes</a>
+      <a class="btn ghost" href="https://github.com/arminforoughi/RAX">Read the code</a>
+    </div>
   </header>
 
-  <section>
-    <h2><span class="ref">A1</span>The idea</h2>
-    <p>Most learned robot policies map pixels straight to motor commands. RAX splits the job the way a person would. <b>The camera answers where and which way.</b> <b>The robot's own kinematic model answers how.</b> Every move is small, and after every move the camera checks whether it worked.</p>
-    <figure>
-      <svg viewBox="0 0 720 150" width="100%" role="img" aria-label="Pipeline: wrist camera, detect, locate, orient, solve IK, move, verify, looping back to the camera">
-        <g fill="none" stroke="#bfe0ff" stroke-width="1.4">
-          <rect x="8" y="46" width="92" height="46"/><rect x="128" y="46" width="92" height="46"/>
-          <rect x="248" y="46" width="92" height="46"/><rect x="368" y="46" width="92" height="46"/>
-          <rect x="488" y="46" width="92" height="46"/><rect x="608" y="46" width="104" height="46"/>
-          <path d="M100 69h28M220 69h28M340 69h28M460 69h28M580 69h28"/>
-          <path d="M660 92v36H54V92" stroke-dasharray="5 4"/>
-        </g>
-        <g fill="#bfe0ff"><path d="M128 69l-7-4v8zM248 69l-7-4v8zM368 69l-7-4v8zM488 69l-7-4v8zM608 69l-7-4v8zM54 92l-4 7h8z"/></g>
-        <g fill="#ffffff" font-size="13" text-anchor="middle">
-          <text x="54" y="74">WRIST CAM</text><text x="174" y="74">DETECT</text><text x="294" y="74">LOCATE</text>
-          <text x="414" y="74">ORIENT</text><text x="534" y="74">SOLVE IK</text><text x="660" y="74">MOVE</text>
-        </g>
-        <g fill="#7fd4ff" font-size="11" text-anchor="middle">
-          <text x="174" y="36">colour + shape</text><text x="294" y="36">ray → table</text>
-          <text x="414" y="36">tube body</text><text x="534" y="36">arm model</text><text x="660" y="36">small step</text>
-          <text x="357" y="144">look again · correct · verify</text>
-        </g>
-      </svg>
-      <figcaption>FIG. 1 · Closed loop. Vision sets the target, the model solves the joints, vision checks the result.</figcaption>
-    </figure>
-  </section>
-
-  <section>
-    <h2><span class="ref">A2</span>Key technical parts</h2>
-    <div class="parts">
-      <div class="part">
-        <span class="no">01 · DETECT</span>
-        <h3>Measured, not guessed</h3>
-        <p>Caps are found by colour windows measured on the actual camera, each with a test pinning why it sits where it does: the rack's metal, the gripper's tint and the wood grain are all proven out.</p>
-      </div>
-      <div class="part">
-        <span class="no">02 · LOCATE</span>
-        <h3>Pixel to world, through the arm</h3>
-        <p>The camera rides the wrist, so its pose is always known from forward kinematics. A pixel becomes a ray, the ray meets the table: the tube's position in robot coordinates, from one image.</p>
-      </div>
-      <div class="part">
-        <span class="no">03 · ORIENT</span>
-        <h3>Read the body, not the cap</h3>
-        <p>Rays cast out from the cap are scored by contrast against their neighbours; the tube's body is the streak that stands out. The wrist turns so the jaws close across it, then re-checks that the picture rotated as predicted.</p>
-      </div>
-      <div class="part">
-        <span class="no">04 · SOLVE</span>
-        <h3>Vision steers, IK drives</h3>
-        <p>Image error steers only what the camera can judge; the kinematic model solves every joint. A multi-start solver finds a grasp square to the table out to ~30 cm, and the last centimetres are a straight vertical drop.</p>
-      </div>
+  <section class="band">
+    <span class="label">Why it is different</span>
+    <h2>Most robot code is welded to one robot.</h2>
+    <p>Joint indices written as literals, the camera pose as a global, and grasp constants dialled in against one object. Porting it means rewriting it. RAX pulls the robot out into data, the sensor out into an interface, and replaces the hand-tuned numbers with measurements.</p>
+    <div class="cards">
+      <article class="card">
+        <span class="no">01</span>
+        <h3>Measure, don't tune</h3>
+        <p>Grasp height comes from the object's measured size and the camera's field of view. The reach envelope and IK seeds are probed from the arm's own solver. Localisation error is fitted from the arm's own motion, with <b>forward kinematics as ground truth</b>.</p>
+      </article>
+      <article class="card">
+        <span class="no">02</span>
+        <h3>Any camera, any mount</h3>
+        <p>Webcam, stereo or RGB-D; on the wrist or on a mast. <b>Six combinations, one code path</b>, with the depth strategy chosen from what the sensor can actually deliver.</p>
+      </article>
+      <article class="card">
+        <span class="no">03</span>
+        <h3>An arm is a file</h3>
+        <p>A robot is described as data: its URDF, its camera mount, and which joint does what. The visual servo needs just <b>four things</b> from an arm. Running on the SO-101, with an X250 wired up and a full simulator for no-hardware runs.</p>
+      </article>
+      <article class="card">
+        <span class="no">04</span>
+        <h3>Every attempt is training data</h3>
+        <p>Each run is recorded as an episode: frames before and after, joint states, and an outcome the robot <b>labels itself</b>. A precise controller that collects its own dataset for the learned policy that comes next.</p>
+      </article>
     </div>
-    <p class="note"><b>Self-calibrating.</b> Before correcting, the arm makes a small test move and measures how the target shifts in the image. Directions and gains are measured on the rig, never assumed: on this arm the base turns opposite to intuition, which a guessed sign would get wrong.</p>
   </section>
 
-  <section>
-    <h2><span class="ref">A3</span>Beyond tubes</h2>
-    <p>Nothing in the loop is specific to tubes. Swap the detector and the same pipeline, <span class="dim">detect → locate → orient → solve → verify</span>, picks cubes, pens or vials, and places into racks, trays or bins. The same visual servo already drives both halves of the task here: bringing a cap between the jaws and bringing a held tube over a hole are one problem seen twice.</p>
+  <section class="band">
+    <span class="label">The loop</span>
+    <h2>Vision decides where. The model decides how.</h2>
+    <p>Learned policies map pixels straight to motor commands. RAX splits the job: the camera sets the target, inverse kinematics on the robot's own model solves the joints, and the camera checks after every small move. Before correcting, the arm makes a test move and measures how the target shifts in the image, so directions and gains are measured on the rig, never guessed.</p>
+    <pre class="code"><span class="c"># no robot needed: the whole pipeline runs synthetically</span>
+pip install -e ".[dev]"
+python -m rax.grasp --arm head_mono --query "red cube"
+pytest -q</pre>
   </section>
 
-  <section>
-    <h2><span class="ref">A4</span>A data engine, for free</h2>
-    <p>Every attempt is recorded as an episode: joint states, camera frames before and after, and an outcome the robot <b>labels itself</b>: placed, missed hole, missed grasp, not found. <span class="dim">672 tube episodes</span> are on disk from development alone. That is exactly the data a learned policy needs, collected autonomously and sorted by what went wrong, so the precise controller can train its own successor.</p>
+  <section class="band">
+    <span class="label">Where it goes</span>
+    <h2>Precise where learning is weak. Learning where rules are weak.</h2>
+    <p>A learned policy generalises to new objects and clutter. A measured, self-checking servo lands the last millimetres and knows when it failed. RAX is built to be both halves: the reliable controller that finishes the task, and the data engine that trains the policy to start it.</p>
   </section>
 
-  <section>
-    <h2><span class="ref">A5</span>Any arm</h2>
-    <p>An arm is described as data: its URDF, its camera mount and which joint does what. The servo needs just four things from an arm. The same stack runs on the <b>SO-101</b> and in <b>simulation</b>, and an <b>X250</b> is wired to the same controller. Porting to a new arm is a profile file, not a rewrite.</p>
-  </section>
-
-  <section>
-    <h2><span class="ref">A6</span>Status</h2>
-    <p>Finding, approaching, squaring up and grasping work on the bench. Dropping into a rack hole is the open problem: it depends on an overhead camera calibration that is still rough. Colour detection is tuned per setup today; a learned detector is the natural next step.</p>
-  </section>
-
-  <footer class="titleblock">
+  <footer>
     <div><span>Project</span>RAX</div>
-    <div><span>Sheet</span>Tube pick · 01</div>
+    <div><span>Sheet</span>Platform · 01</div>
     <div><span>Arms</span>SO-101 · X250 · sim</div>
-    <div><span>Date</span>2026-09-28</div>
+    <div><span>Source</span><a href="https://github.com/arminforoughi/RAX">github.com/arminforoughi/RAX</a></div>
   </footer>
-
-</main>
+</div>
+<script src="arm.js"></script>
 </body>
 </html>

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RAX Tube Sorting</title>
+<meta name="description" content="RAX sorts lab tubes into racks with one wrist camera: detection, orientation, a square grasp solved on the arm's own model, and a drop it checks from above.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo+Narrow:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="arm" aria-hidden="true"></canvas>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="./">RAX</a>
+    <a href="./">Platform</a>
+    <a href="tube-sorting.html" aria-current="page">Tube sorting</a>
+    <a href="https://github.com/arminforoughi/RAX">GitHub</a>
+  </nav>
+
+  <header class="hero">
+    <span class="kicker">Application · Lab automation</span>
+    <h1>One camera. <em>Every tube</em> in its rack.</h1>
+    <p class="dek">A 5-axis arm with a single camera on its wrist maps the tubes lying on a bench, picks each one square to the table, stands it upright, and drops it into the rack for its cap colour. No demonstrations and no hand-placed coordinates.</p>
+    <div class="ctas">
+      <a class="btn" href="#how">How it works</a>
+      <a class="btn ghost" href="https://github.com/arminforoughi/RAX/tree/x250-tube-pick">Source</a>
+    </div>
+  </header>
+
+  <section class="stats" aria-label="Key figures">
+    <div class="stat"><span class="v">0</span><span class="k">Demonstrations needed</span></div>
+    <div class="stat"><span class="v">1</span><span class="k">Camera makes every approach decision</span></div>
+    <div class="stat"><span class="v">90°</span><span class="k">Grasp square to the table, out to ~30 cm</span></div>
+    <div class="stat"><span class="v">672</span><span class="k">Self-labelled episodes recorded</span></div>
+  </section>
+
+  <section class="band" id="how">
+    <span class="label">What's new</span>
+    <h2>Six ideas that make it work</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="n">01</span>
+        <div><h3>Map once, then tap tap</h3>
+        <p>One sweep of the wrist camera across the bench, looking out and looking down, builds a map of every tube. Then the arm goes tube by tube in a single direction instead of searching back and forth.</p></div>
+        <span class="spec">3 bearings × 2 tilts · one pass</span>
+      </div>
+      <div class="step">
+        <span class="n">02</span>
+        <div><h3>Pixel to world, through the arm</h3>
+        <p>The camera rides the wrist, so its pose is always known from the arm's own kinematics. A cap's pixel becomes a ray, the ray meets the table, and the tube has a position in robot coordinates. Turning toward it is read off the model, never from an assumed sign convention.</p></div>
+        <span class="spec">FK camera pose · ray-to-plane cast</span>
+      </div>
+      <div class="step">
+        <span class="n">03</span>
+        <div><h3>Read the body, not the cap</h3>
+        <p>A cap is about as long as it is wide, so its shape says nothing about direction. RAX casts rays out of the cap and scores each by contrast against its neighbours; the tube body is the streak that stands out, on wood or on a dark mat. After turning the wrist it checks the picture rotated as predicted, and undoes a turn that was based on a bad read.</p></div>
+        <span class="spec">3° rays · contrast vs ±36° · median of 3 frames</span>
+      </div>
+      <div class="step">
+        <span class="n">04</span>
+        <div><h3>Vision steers, IK drives</h3>
+        <p>The sideways error in the image steers only the base, through a gain the arm measures with a small test turn. Every joint angle is solved on the arm's own model. A multi-start solver finds a grasp square to the table where a single start gives up at 70°, and the last centimetres are a straight vertical drop, so the fingers never sweep the tube away.</p></div>
+        <span class="spec">measured px/deg · multi-seed IK · fixed-angle descent</span>
+      </div>
+      <div class="step">
+        <span class="n">05</span>
+        <div><h3>Stand it up, drop it in</h3>
+        <p>Held from above, the tube lies across the jaws. Level the hand and it hangs vertical. The arm carries it high over the rack, lowers over a free hole it can reach, releases, and looks from above for a cap in that hole.</p></div>
+        <span class="spec">blue · green → black rack · red → silver rack</span>
+      </div>
+      <div class="step">
+        <span class="n">06</span>
+        <div><h3>It knows when it failed</h3>
+        <p>A grip is judged by the jaws: they close fully on air and stop short on a tube. While picking, a guardrail keeps the arm from ever turning toward the racks. Every attempt is tagged with what happened, and the tags are the labels of a dataset collected for free.</p></div>
+        <span class="spec">placed · missed hole · missed grasp · not found · unreachable</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="band">
+    <span class="label">Beyond tubes</span>
+    <h2>The same loop picks anything it can see.</h2>
+    <p>Nothing in detect → locate → orient → solve → verify is specific to tubes. Swap the detector and the pipeline picks vials, cubes or parts, and places into trays or bins. Bringing a cap between the jaws and bringing a held tube over a hole are the same visual servo, used twice.</p>
+    <div class="status">
+      <span class="chip ok">Picking · working on the bench</span>
+      <span class="chip wip">Drop into hole · calibrating</span>
+    </div>
+  </section>
+
+  <footer>
+    <div><span>Project</span>RAX</div>
+    <div><span>Sheet</span>Tube sorting · 02</div>
+    <div><span>Arm</span>SO-101 · OAK-D wrist</div>
+    <div><span>Source</span><a href="https://github.com/arminforoughi/RAX/tree/x250-tube-pick">x250-tube-pick</a></div>
+  </footer>
+</div>
+<script src="arm.js"></script>
+</body>
+</html>
