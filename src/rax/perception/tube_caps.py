@@ -114,7 +114,8 @@ MIN_VAL = 85
 #: flickered in and out -- "no gold cap in view from the look pose" with the cap on
 #: screen. Its S gate drops to 110, still far over bare wood's 12-40.
 CAP_GATES: dict[str, tuple[int, int]] = {
-    "green": (MIN_SAT, MIN_VAL),
+    "green": (120, MIN_VAL),   # 2026-09-28: a green cap read S 147-175 (median 163) and
+                               # half of it failed 160 -- the cap was missed in plain view
     "blue": (115, 130),     # up close the cap overexposes to S 107-143 (median 124);
                             # 115 keeps the lit wooden block (S 112) out
     "gold": (110, 100),

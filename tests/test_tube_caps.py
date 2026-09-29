@@ -133,6 +133,11 @@ class TestTheThingsThatFooledThePortedDetector:
         assert find_caps(frame_with((320, 240, 40, (12, 102, 150)))) == []
         assert find_caps(frame_with((320, 240, 40, (5, 95, 130)))) == []
 
+    def test_the_measured_pale_green_cap_is_found(self):
+        # Missed in plain view on 2026-09-28: S 147-175 against a gate of 160.
+        caps = find_caps(frame_with((320, 240, 22, (85, 150, 160))))
+        assert [c.colour for c in caps] == ["green"]
+
     def test_the_silver_rack_is_not_a_blue_cap(self):
         # 2026-09-28: the silver rack's shadowed metal, H 104-106 S 117-131 V 136-186,
         # was boxed "blue cap" and approached.

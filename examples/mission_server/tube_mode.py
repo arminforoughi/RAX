@@ -213,9 +213,13 @@ TOP_RACKS = [
 #: The left jaw's corner of the wrist view (x < this, y > that) is masked from the
 #: detector: the jaw kept reading as a blue cap.
 JAW_CORNER_X, JAW_CORNER_Y = 200.0, 340.0
+#: Fingertip height the approach reaches out at (the look pose leaves it at 2.8cm).
+APPROACH_Z_M = 0.08
 #: Fingertip height where the hand is squared and the wrist twisted -- clear of a lying
 #: tube (1.6cm) -- before the straight, fixed-angle descent to the grasp.
-TWIST_Z = 0.04
+TWIST_Z = 0.06    # 6cm, not 4: squaring the hand shifted the tips ~0.9cm sideways at 4cm
+#: Second, lower squaring height when TWIST_Z could not reach 90 (tips ~2cm over a tube).
+SQUARE_LOW_Z = 0.035
 #: The twist is small by design (the operator: "you don't need to twist much"): at most
 #: this many degrees either way, and none at all within TWIST_TOL_DEG of square.
 TWIST_MAX_DEG = 45.0
@@ -248,6 +252,8 @@ PICK_MIN_BEARING_DEG = -15.0
 #: Bearings (deg, robot frame, + = left) the one wrist scan stops at.
 SCAN_BEARINGS_DEG = (40.0, 20.0, 0.0)   # not toward the racks (right, ~-25..-45deg): their
                                          # place is known, the scan has no business there
+#: Caps below this row of the wrist view (the gripper's strip) are not mapped.
+MAP_MAX_Y_PX = 330.0
 #: At each scan bearing the wrist also tilts down this much, to see near the base.
 SCAN_TILTS_DEG = (0.0, 25.0)
 #: A mapped cap this close to a rack hole is in the rack, not on the mat.
@@ -395,7 +401,7 @@ def start(ms, port: int = 8486) -> None:
     from rax.manipulation.episodes import EpisodeLog
     from rax.manipulation.grip import CurrentRise, reconcile, settled
     from rax.perception.tube_caps import draw as draw_caps
-    from rax.perception.tube_caps import find_caps, fold, tube_axis
+    from rax.perception.tube_caps import find_caps, fold
     from rax.robots.urdf_visuals import link_visuals
 
     # NO YOLO BOXES IN THIS MODE. Tubes are found by cap colour here; the
@@ -452,6 +458,12 @@ def start(ms, port: int = 8486) -> None:
         except Exception:
             return
         for c in caps:
+            # NOT FROM THE GRIPPER'S STRIP. Something on the gripper reads as a cap in
+            # every frame; cast onto the table it put fake tubes on the map, and the arm
+            # turned to them and found nothing ("not found" x8). Tubes on the bench are
+            # higher in the frame during the scan.
+            if c["y"] > MAP_MAX_Y_PX:
+                continue
             try:
                 pt = ms.ray_to_table((c["x"], c["y"]), T)
             except Exception:
@@ -528,8 +540,10 @@ def start(ms, port: int = 8486) -> None:
         for c in caps:
             # The window scales with the cap: a tube is about six cap-diameters
             # long, so a fixed radius that fits at 25cm crops the body at 15cm.
-            ax = tube_axis(clean, (c.x, c.y),
-                           r=int(max(90, min(220, 3.2 * max(c.w, c.h)))))
+            # NO PER-FRAME AXIS FIT: it ran for every cap on every frame and made the
+            # wrist view (and the detections the pick reads) lag. Nothing that moves the
+            # arm uses it -- the twist reads the tube body itself, when it needs it.
+            ax = None
             found.append({"colour": c.colour, "x": c.x, "y": c.y, "area": c.area,
                           "bbox": list(c.bbox),
                           "angle": None if ax is None else ax.angle_deg,
@@ -1581,7 +1595,17 @@ def start(ms, port: int = 8486) -> None:
         # the last one, is also the best one.
         tphase("APPROACH", "moving over the cap, keeping it in view")
         pitch_see = float(sum(ms.observe(False)[0][i] for i in ms.ARM.pitch_chain))
-        tsay(f"        approaching at {pitch_see:+.0f}deg, where the cap stays visible")
+        # UP FIRST. The look pose leaves the fingertip 2.8cm off the table, and the
+        # approach used to reach out at that height -- the hand skimmed the bench all
+        # the way to the tube and slid it. Lift to APPROACH_Z, reach out up there.
+        tip_a = ms._tip(ms.observe(False)[0])
+        if float(tip_a[2]) < APPROACH_Z_M:
+            ms._move_tip(np.array([tip_a[0], tip_a[1], APPROACH_Z_M]), pitch_see, j5,
+                         settle=0.2, step=2.0)
+            c_up = _cap_now(last_uv[0], colour)
+            if c_up is not None:
+                last_uv[0] = (c_up["x"], c_up["y"])
+        tsay(f"        approaching at {pitch_see:+.0f}deg, {APPROACH_Z_M*100:.0f}cm up")
         reached, last_dist, r_goal = False, None, float(math.hypot(xy[0], xy[1]))
         for k in range(N_APPROACH):
             ms.checkpoint()
@@ -1625,7 +1649,8 @@ def start(ms, port: int = 8486) -> None:
             q_s = None
             if bite > 0.002:
                 tgt = np.array([(r_now + bite) * math.cos(bear_n),
-                                (r_now + bite) * math.sin(bear_n), float(tip_n[2])])
+                                (r_now + bite) * math.sin(bear_n),
+                                max(float(tip_n[2]), APPROACH_Z_M)])
                 q_t, e_t = ms._ik_hold_pitch(q_n, tgt, pitch_see, j5, ret_err=True)
                 if e_t > 0.03:
                     tsay(f"        approach {k+1}: {(r_now+bite)*100:.1f}cm does not solve "
@@ -1945,6 +1970,21 @@ def start(ms, port: int = 8486) -> None:
             _go(q_sq, settle=0.25, step=1.8)
             tsay(f"        hand squared to {p_sq:+.0f}deg at {TWIST_Z*100:.0f}cm, over the spot")
         p_now = float(sum(ms.observe(False)[0][i] for i in ms.ARM.pitch_chain))
+
+        # STILL SHORT OF SQUARE? Lower, the arm reaches a right angle further out (90 at
+        # 28cm from 5cm up, at 30cm from 1cm). The operator needs the grasp at 90 -- a
+        # tube taken at an angle hangs at an angle and misses the hole -- so drop to
+        # SQUARE_LOW_Z, square again there, put the tips back over the spot.
+        if p_now < GRASP_PITCH - 2.0:
+            _down_to(SQUARE_LOW_Z, p_now, "down")
+            spot_lo = np.array([spot[0], spot[1], SQUARE_LOW_Z])
+            q_c = ms.observe(False)[0].astype(float)
+            q_sq, p_sq = _ik_steep(q_c, spot_lo, p_now, GRASP_PITCH)
+            if q_sq is not None and p_sq > p_now:
+                q_sq[ms.ARM.roll_joint] = j5
+                _go(q_sq, settle=0.25, step=1.6)
+                tsay(f"        hand squared to {p_sq:+.0f}deg at {SQUARE_LOW_Z*100:.1f}cm")
+            p_now = float(sum(ms.observe(False)[0][i] for i in ms.ARM.pitch_chain))
 
         # straight down, the angle held -- no arc, no sweep
         _down_to(GRASP_Z, p_now, "down")
