@@ -68,6 +68,8 @@ class Target:
     grasp_z: float = 0.010
     #: Jaw opening to approach with, percent.
     open_pct: float = 45.0
+    #: Jaws stopping wider than this mean two were taken (None: do not check).
+    max_grip_pct: float | None = None
 
     def detect(self, bgr: np.ndarray) -> list[Detection]:
         raise NotImplementedError

@@ -28,7 +28,7 @@ class X250(WristCameraArm):
     profile_name = "x250"
     jaw_axis_deg = 0.0          # NOT MEASURED on this camera: measure before trusting TWIST
     roll_gain = 1.0
-    grip_levels = {"air": 30.2, "blocked": 31.2, "jammed": 50.0, "two": 45.0}
+    grip_levels = {"air": 30.2, "blocked": 31.2, "jammed": 50.0}
     close_by_current = False
 
     def __init__(self, port: str, handeye_file: str | None = None, log=print,

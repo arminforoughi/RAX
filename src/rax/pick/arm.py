@@ -144,14 +144,17 @@ def move_to(arm: Arm, p, pitch: float, roll: float, what: str, speed=1.0, settle
     return q
 
 
-def straight_down(arm: Arm, z: float, pitch: float, roll: float, steps: int = 8) -> float:
+def straight_down(arm: Arm, z: float, pitch: float, roll: float,
+                  step_m: float = 0.02) -> float:
     """Lower the fingertip to height ``z`` at fixed x, y and angle. Returns the height reached.
 
-    In small steps, each solved on the model, so the fingers travel a straight line and
-    never sweep sideways into the object.
+    One IK-solved waypoint every ``step_m``, so the fingers follow a straight vertical
+    line (a single joint-space move would arc sideways into the object) without the
+    stop-and-settle of many tiny moves: only the last waypoint settles.
     """
     p0 = arm.tip(arm.joints())
     z0 = float(p0[2])
+    steps = max(1, math.ceil(abs(z0 - z) / step_m))
     for k in range(1, steps + 1):
         arm.checkpoint()
         zk = z0 + (z - z0) * k / steps
@@ -159,5 +162,5 @@ def straight_down(arm: Arm, z: float, pitch: float, roll: float, steps: int = 8)
         if q is None:
             arm.log(f"        z={zk*100:+.1f}cm not reachable at {pitch:.0f}deg — stopping")
             break
-        arm.move(q, speed=0.9, settle=0.12)
+        arm.move(q, speed=0.9, settle=0.12 if k == steps else 0.0)
     return float(arm.tip(arm.joints())[2])

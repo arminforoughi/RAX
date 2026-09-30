@@ -67,7 +67,10 @@ class PickConfig:
 
     probe_deg: float = 8.0       # base test move that measures px/deg
     default_gain: float = 0.0    # px/deg if the probe loses the object (0: don't steer)
-    aim_tol_px: float = 150.0
+    aim_tol_px: float = 40.0      # AIM turns the base until the object is this near across
+    aim_max_deg: float = 15.0     # largest base turn per step, by stage: the correction is
+    approach_max_deg: float = 6.0  # error / measured gain, so big steps are safe; these only
+    trim_max_deg: float = 5.0     # bound a misread
     aim_offset_px: float = 0.0   # >0 puts the object this far LEFT of the grip centre
     centre_tol_px: float = 28.0  # across the reach
     along_tol_px: float = 45.0   # along the reach
@@ -88,7 +91,7 @@ class PickConfig:
     twist_ambiguous: float | None = None  # past this, always roll negative (rig quirk)
 
     # the grip verdict, from where the jaws stop (percent open); None: the arm's own
-    # ``grip_levels`` (air, blocked, jammed, two)
+    # ``grip_levels`` (air, blocked, jammed), and the target's ``max_grip_pct`` for two
     grip_air: float | None = None       # closed on nothing
     grip_blocked: float | None = None   # stopped above this: something is between the jaws
     grip_jammed: float | None = None    # stopped above this: a false contact, never closed
@@ -193,9 +196,12 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     pitch_see = pitch_of(arm, arm.joints())
     eye.hits = 0
     r_goal, off = _approach(arm, eye, gain, xy, pitch_see, roll, cfg)
-    if eye.hits == 0:
-        raise RuntimeError(f"lost the {label or target.name} before reaching it "
-                           f"— not going down blind")
+    if eye.hits == 0:                                # out of view: look again, lower
+        arm.log("        lost it on the way in — tilting down to find it again")
+        if xy is None or _find(arm, eye, xy) is None:
+            raise RuntimeError(f"lost the {label or target.name} before reaching it "
+                               f"— not going down blind")
+        pitch_see = pitch_of(arm, arm.joints())
     if r_goal is None:
         tip = arm.tip(arm.joints())
         r_goal = math.hypot(tip[0], tip[1])
@@ -301,7 +307,7 @@ def _aim(arm: Arm, eye: Eye, gain: float, cfg: PickConfig):
         if abs(ex) < cfg.aim_tol_px:
             break
         q = arm.joints()
-        arm.move(with_pan(arm, q, q[arm.pan] + _pan_step(ex, gain, 1.0, 5.0)),
+        arm.move(with_pan(arm, q, q[arm.pan] + _pan_step(ex, gain, 1.0, cfg.aim_max_deg)),
                  speed=1.3, settle=0.18)
     d = eye.see()
     return None if d is None else arm.cast((d.u, d.v), arm.joints())
@@ -315,6 +321,7 @@ def _approach(arm: Arm, eye: Eye, gain, xy, pitch, roll, cfg: PickConfig):
         if q is not None:
             arm.move(q, speed=1.0, settle=0.2)
     r_goal, off = (None if xy is None else math.hypot(*xy)), None
+    stuck = 0
     for k in range(cfg.approach_steps):
         arm.checkpoint()
         d = eye.see()
@@ -342,9 +349,15 @@ def _approach(arm: Arm, eye: Eye, gain, xy, pitch, roll, cfg: PickConfig):
                               max(float(tip[2]), cfg.approach_z)), pitch, roll, seed=q,
                         tol=0.03, max_jump=cfg.max_joint_jump)
             if q_s is not None:
-                q_next = q_s
+                q_next, stuck = q_s, 0
+            else:
+                stuck += 1
+                if stuck >= 2:        # this angle cannot get there: STAND and TRIM will
+                    arm.log(f"        approach {k+1}: {gap*100:+.1f}cm is out of reach at "
+                            f"{pitch:.0f}deg — handing over to the stand-up")
+                    break
         if abs(ex) > cfg.centre_tol_px:
-            q_next[arm.pan] = q[arm.pan] + _pan_step(ex, gain, 0.4, 2.2)
+            q_next[arm.pan] = q[arm.pan] + _pan_step(ex, gain, 0.4, cfg.approach_max_deg)
         if np.allclose(q_next, q, atol=1e-3):
             break
         arm.move(q_next, speed=1.1, settle=0.14)
@@ -404,7 +417,7 @@ def _trim(arm: Arm, eye: Eye, target: Target, gain, r_goal, pitch, roll, cfg: Pi
         q = arm.joints()
         if abs(ex) > cfg.centre_tol_px:                   # sideways: turn the base
             arm.log(f"        trim {k+1}: dx {ex:+.0f}px — turning the base")
-            arm.move(with_pan(arm, q, q[arm.pan] + _pan_step(ex, gain, 0.3, 1.8)),
+            arm.move(with_pan(arm, q, q[arm.pan] + _pan_step(ex, gain, 0.3, cfg.trim_max_deg)),
                      speed=1.0, settle=0.12)
             prev = None
             continue
@@ -524,7 +537,7 @@ def _side_grasp(arm, eye, target, gain, r_goal, roll, grasp, cfg, off):
             ex = (arm.jaw_uv[0] - d.u) - cfg.aim_offset_px
             off = abs(ex)
             if abs(ex) > cfg.centre_tol_px:
-                q_s[arm.pan] = q[arm.pan] + _pan_step(ex, gain, 0.3, 1.8)
+                q_s[arm.pan] = q[arm.pan] + _pan_step(ex, gain, 0.3, cfg.trim_max_deg)
         arm.move(q_s, speed=0.9, settle=0.12)
     return _grasp_and_lift(arm, eye, target, roll, cfg, off)
 
@@ -536,10 +549,11 @@ def _grasp_and_lift(arm, eye, target, roll, cfg: PickConfig, off) -> PickResult:
     contact = arm.close(from_pct=target.open_pct)
     pos = arm.grip_pos()
     lv = dict(getattr(arm, "grip_levels", None) or
-              {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0})
-    air, blocked, jammed, two = (v if v is not None else lv[k] for k, v in (
-        ("air", cfg.grip_air), ("blocked", cfg.grip_blocked),
-        ("jammed", cfg.grip_jammed), ("two", cfg.grip_two)))
+              {"air": 1.2, "blocked": 3.5, "jammed": 36.0})
+    air, blocked, jammed = (v if v is not None else lv[k] for k, v in (
+        ("air", cfg.grip_air), ("blocked", cfg.grip_blocked), ("jammed", cfg.grip_jammed)))
+    # wider than one of THIS object allows: that is an object property, not the arm's
+    two = cfg.grip_two if cfg.grip_two is not None else target.max_grip_pct
     held = blocked < pos < jammed or (contact and air + 1.0 < pos < jammed)
     arm.log(f"        jaws stopped at {pos:.1f} (air {air:.1f}, held above "
             f"{blocked:.1f}) -> {'HOLDING' if held else 'EMPTY'}")
@@ -554,7 +568,7 @@ def _grasp_and_lift(arm, eye, target, roll, cfg: PickConfig, off) -> PickResult:
     up = solve(arm, (tip[0], tip[1], tip[2] + cfg.lift_m), pitch, roll, tol=0.03)
     if up is not None:
         arm.move(up, speed=0.8, settle=0.2)
-    if pos >= two:
+    if two is not None and pos >= two:
         arm.log(f"        jaws at {pos:.1f}: two objects — putting them back")
         down = solve(arm, (tip[0], tip[1], tip[2] + 0.01), pitch, roll, tol=0.03)
         if down is not None:

@@ -58,8 +58,8 @@ class WristCameraArm:
     #: Image degrees the scene turns per degree of wrist roll.
     roll_gain = 1.0
     #: Where the jaws stop, in this gripper's own percent: shut on air, stopped by
-    #: something (holding), stopped too early (a false contact), wide enough for two.
-    grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0}
+    #: something (holding), stopped too early (a false contact).
+    grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0}
     #: Close by current (stop when it rises) or by position only.
     close_by_current = True
     #: What this arm's pick was tuned to: PickConfig fields (see PickConfig.for_arm).

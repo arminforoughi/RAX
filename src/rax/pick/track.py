@@ -44,6 +44,7 @@ class StickyTarget(Target):
                  min_colour: float = 0.5, search_px: int = 120):
         self.inner = inner
         self.name, self.grasp_z, self.open_pct = inner.name, inner.grasp_z, inner.open_pct
+        self.max_grip_pct = inner.max_grip_pct
         self.hold_s, self.min_ncc, self.min_colour = hold_s, min_ncc, min_colour
         self.search_px = search_px
         self._box = self._label = self._hist = self._tmpl = None

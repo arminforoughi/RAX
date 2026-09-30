@@ -27,7 +27,7 @@ class So101(WristCameraArm):
     #: Fingertips measured at about (154,382) and (400,376) on a live frame.
     jaw_axis_deg = 179.0
     roll_gain = 1.0                       # measured +0.96 / +1.01
-    grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0}
+    grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0}
     close_by_current = True
     pick_tuning = {
         "default_gain": -7.5,     # base px/deg measured here: -5.1 .. -10.4

@@ -37,7 +37,8 @@ UI = os.path.join(HERE, "ui")
 # ---- the tubes ----------------------------------------------------------------------
 #: Caps are found by colour. The left jaw's corner of the wrist view reads blue.
 TUBE = ColourTarget(name="tube", colours=("green", "blue", "red"),
-                    ignore=((0.0, 340.0, 200.0, 1e4),), grasp_z=0.010, open_pct=45.0)
+                    ignore=((0.0, 340.0, 200.0, 1e4),), grasp_z=0.010, open_pct=45.0,
+                    max_grip_pct=16.0)     # one 16mm tube stops the jaws under 16
 TUBE_D_M, TUBE_L_M = 0.016, 0.100
 
 #: Jaw stop that means something is held (percent open): below it, the jaws shut on air.
