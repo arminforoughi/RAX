@@ -22,8 +22,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
-from rax.manipulation.arms.kinematics import make_kinematics  # noqa: E402
-from rax.manipulation.arms.urdf_kinematics import UrdfKinematics  # noqa: E402
+from rax.kinematics.model import make_kinematics  # noqa: E402
+from rax.kinematics.urdf import UrdfKinematics  # noqa: E402
 from rax.robots.profiles import load_profile  # noqa: E402
 
 

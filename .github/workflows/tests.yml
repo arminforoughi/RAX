@@ -33,14 +33,10 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests examples
 
       - name: Test
         run: pytest -q
 
-      - name: Pick an object with no hardware at all
-        # The published entry point, on the two rigs a new user is most likely to
-        # have. A green suite with a broken CLI would be the worst outcome here.
-        run: |
-          python -m rax.grasp --arm head_mono --query "red object" --survey-frames 6 --settle 0
-          python -m rax.grasp --arm mock --query "green object" --survey-frames 6 --settle 0
+      - name: Map, pick and place on the simulated SO-101
+        run: python examples/pick_demo.py

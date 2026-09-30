@@ -35,6 +35,8 @@ stack_mission2_stdout.log.err
 supervise.log
 camserver_stdout.log*
 handeye_tf.json*
+jaw_frame.json
+drop_offset.json
 floor_plane.json
 guest_log.jsonl
 feedback.jsonl
@@ -91,3 +93,20 @@ mission_server_stdout.prev.log
 # preserved in git history, but out of the published tree — nothing imports it, and
 # mission_server.py replaces it.
 examples/legacy/
+
+# Snapshots the demo server writes beside itself while running: the current map,
+# the last camera view, the status blob. Regenerated every run, meaningless in a clone.
+/m.json
+/p.json
+/q.json
+/st.json
+/view.jpg
+/placed.jpg
+
+# tube-sorting server logs
+examples/tube_sorting/server.log*
+examples/*/server.log*
+examples/.server_stdin.txt
+examples/*/handeye_*.json
+examples/server.log*
+examples/server.prev.log*

@@ -43,10 +43,22 @@ JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wri
 # tuned pose below is valid again -- it is an angle in that convention, not a raw
 # encoder reading, so it survived the motor swap.
 #
-# CAVEAT: wrist_roll (id 5) was recentered the same arbitrary way on 2026-08-12 and
-# has NOT yet been re-fitted to a physical reference, so the -4.7 here is the one
-# component still open. See [[rax-known-defects]].
-HOME_DEG = (-14.1, -99.1, 90.8, 33.2, -4.7)
+# wrist_roll: -4.7 -> +104.6 (2026-09-09). This is a POSE change, not a calibration
+# one -- id 5's zero is still the arbitrary one written on 2026-08-12, and the
+# calibration JSON was deliberately not touched. What changed is where the hand RESTS:
+# the operator wanted the gripper twisted roughly a quarter turn from the old rest
+# orientation, so the angle was taken from the joint itself rather than guessed. Torque
+# was cut on id 5 alone (the other five kept holding), the wrist was set by hand, and
+# the joint reported +104.57 dead steady over a 4-minute window -- that reading IS the
+# number below. Do not "tidy" it to 105 or to 90: it is a measurement of where the
+# hand physically sits, and the sign question (+90 vs -90 look identical on a 2-jaw
+# gripper but flip the wrist camera) is settled by it having been measured, not chosen.
+#
+# SURVEY_TILT_DEG deliberately keeps its own -4.7 roll: the survey is what every range
+# estimate is computed from, and its camera orientation is the one the 0.4 cm
+# repeatability and the hand-eye TF were measured against. Rolling HOME does not roll
+# the survey. See [[rax-known-defects]].
+HOME_DEG = (-14.1, -99.1, 90.8, 33.2, 104.6)
 
 # The tilt the SURVEY localizes from -- deliberately NOT HOME_DEG[1:] any more.
 # It used to be derived from HOME, which coupled a cosmetic "how does the idle pose
@@ -57,7 +69,15 @@ HOME_DEG = (-14.1, -99.1, 90.8, 33.2, -4.7)
 # viewing; these stay at HOME's ORIGINAL 2026-07-20 tilt, the one the 0.4 cm
 # survey repeatability was measured against. Keep the leading value equal to
 # HOME's shoulder_lift or `survey_pose_for` starts from a different arm shape.
-SURVEY_TILT_DEG = (-99.1, 90.8, 33.2, -4.7)
+# 2026-08-26: wrist pitch 33.2 -> 68.2. At 33.2 the camera sat 3 deg ABOVE horizontal
+# and a full pan sweep covered 40% of the reachable table -- nothing inside 30cm was
+# ever in frame, so near objects were localized from whatever grazing view clipped the
+# frame edge, and the range error that comes back is amplified ~8x at that incidence.
+# 68.2 puts the camera 27 deg down and covers 100% at every radius from 18 to 42cm.
+# Only id4 moves: it is the one joint that re-aims the camera without changing the
+# arm's shape, so reach, IK seeds and the approach trims are all untouched.
+# Live-tunable at runtime as the `survey_pitch_deg` knob.
+SURVEY_TILT_DEG = (-99.1, 90.8, 68.2, -4.7)
 # Wrist twisted 90 deg so the jaws are square to a table cube.
 GRASP_ROLL_DEG = 90.0
 VIEW_DEG = (5.0, 37.1, 48.1, -40.4, GRASP_ROLL_DEG)
@@ -115,10 +135,7 @@ BUS = BusProfile(
 
 PROFILE = ArmProfile(
     name="so101",
-    urdf="SO101/so101_new_calib.urdf",
-    # The same directory: it holds assets/*.stl and a robot.urdf (a copy of the calib
-    # URDF, kept because lerobot's mesh loader looks for that exact filename).
-    mesh_dir="SO101",
+    urdf="robots/so101_model/so101.urdf",      # meshes in robots/so101_model/assets
     ee_frame="gripper_frame_link",
     joint_names=JOINT_NAMES,
     # Empty by default. A serial port is a fact about the machine the robot is
@@ -139,7 +156,7 @@ PROFILE = ArmProfile(
     # reach a pose that IS reachable, escaping it needs a seed from the other branch.
     # None = keep the caller's value for that joint.
     #
-    # DERIVED, not hand-picked. manipulation.arms.workspace probes the (radius, height,
+    # DERIVED, not hand-picked: a workspace analysis probed the (radius, height,
     # pitch) space with the bare solver, records which sampled seeds rescue which cells,
     # and takes a minimal cover. This single seed is the mirrored elbow configuration —
     # exactly what an elbow flip needs — and it replaced five seeds that had accumulated
@@ -166,10 +183,26 @@ PROFILE = ArmProfile(
     # this plane to localize. If the grasp stops short/high, raise it a few mm; if it
     # drives into the table, lower it.
     table_z_m=0.02,
-    # Nothing that matters is outside the arm's own workspace (~42 cm reach), so a
-    # "cube" localized at 92 cm is a broken solve, not a distant object.
+    # Nothing that matters is outside the arm's own workspace, so a "cube" localized
+    # at 92 cm is a broken solve, not a distant object. This is a PLAUSIBILITY bound,
+    # deliberately looser than what the arm can grasp.
     reach_min_m=0.08,
     reach_max_m=0.55,
+    # MEASURED 2026-09-06, IK-verified, not guessed. Two independent probes agree:
+    # workspace.analyze_workspace on a 2 cm grid, and a 5 mm scan against the bare
+    # solver at 3 mm tolerance. Max fingertip radius at table height (z=2 cm):
+    #
+    #     pitch   0-15 deg  ->  47-48 cm     <- a flat wrist reaches furthest
+    #     pitch  30    deg  ->  44 cm
+    #     pitch  45    deg  ->  42 cm
+    #     pitch  60    deg  ->  38 cm
+    #     pitch  75    deg  ->  34 cm        <- the first grasp pitch tried
+    #     pitch  90    deg  ->  30 cm
+    #
+    # So "how far can it reach" has no single answer: it costs ~17 cm to go from a
+    # flat wrist to a vertical one. 0.47 is the best case, used as the hard ceiling;
+    # plan_pitch discovers the pitch-specific limit per target by solving for it.
+    reach_grasp_max_m=0.47,
 
     gripper=GRIPPER,
     camera=CAMERA,
