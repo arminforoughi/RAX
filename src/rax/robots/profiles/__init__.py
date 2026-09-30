@@ -355,10 +355,6 @@ class ArmProfile:
 # until it is actually asked for.
 _PROFILES = {
     "so101": ("rax.robots.profiles.so101", "PROFILE"),
-    "x250": ("rax.robots.profiles.x250", "PROFILE"),
-    "mock": ("rax.robots.profiles.mock", "PROFILE"),
-    "head_mono": ("rax.robots.profiles.head_mono", "PROFILE"),
-    "wrist_mono": ("rax.robots.profiles.wrist_mono", "PROFILE"),
 }
 
 

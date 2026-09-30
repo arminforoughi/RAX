@@ -29,8 +29,17 @@ import numpy as np
 import pytest
 
 from rax.perception.tube_caps import (
-    CAP_HSV, MAX_AREA, MIN_AREA, MIN_SAT, MIN_VAL, Cap, draw, find_caps, fold,
-    tube_axis, twist_error)
+    CAP_HSV,
+    MAX_AREA,
+    MIN_AREA,
+    MIN_SAT,
+    MIN_VAL,
+    draw,
+    find_caps,
+    fold,
+    tube_axis,
+    twist_error,
+)
 
 
 def frame_with(*blobs, bg_hsv=(20, 25, 165), size=(480, 640)):

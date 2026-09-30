@@ -145,11 +145,12 @@ class PromptTarget(Target):
 
     def detect(self, bgr):
         if self._detector is None:
-            from rax.models.detection.prompt_detector import YoloWorldDetector
-            self._detector = YoloWorldDetector(self.model_path, self.min_confidence)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            from ultralytics import YOLOWorld  # pip install "rax[detect]"
+            self._detector = YOLOWorld(self.model_path)
+            self._detector.set_classes([self.prompt])
         out = []
-        for d in self._detector.detect(rgb, self.prompt):
-            u, v = d.center
-            out.append(Detection(u, v, tuple(float(b) for b in d.box), d.label))
+        for r in self._detector.predict(bgr, conf=self.min_confidence, verbose=False):
+            for x0, y0, x1, y1 in r.boxes.xyxy.tolist():
+                out.append(Detection((x0 + x1) / 2, (y0 + y1) / 2, (x0, y0, x1, y1),
+                                     self.prompt))
         return out

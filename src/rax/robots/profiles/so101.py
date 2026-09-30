@@ -135,15 +135,7 @@ BUS = BusProfile(
 
 PROFILE = ArmProfile(
     name="so101",
-    urdf="robots/arms/lerobot_so101/SO101/so101_new_calib.urdf",
-    # The same directory: it holds assets/*.stl and a robot.urdf (a copy of the calib
-    # URDF, kept because lerobot's mesh loader looks for that exact filename).
-    # NOTE the directory holds the same URDF twice, under two names, and both are
-    # load-bearing: `urdf` names the file the kinematics read, while the Rerun mesh
-    # viewer calls robot_urdf_file_in_dir(), which looks for a file literally called
-    # robot.urdf. Deleting it as a duplicate costs you the 3D view, and the error
-    # ("No robot.urdf in directory") arrives far from here.
-    mesh_dir="robots/arms/lerobot_so101/SO101",
+    urdf="robots/so101_model/so101.urdf",      # meshes in robots/so101_model/assets
     ee_frame="gripper_frame_link",
     joint_names=JOINT_NAMES,
     # Empty by default. A serial port is a fact about the machine the robot is
@@ -164,7 +156,7 @@ PROFILE = ArmProfile(
     # reach a pose that IS reachable, escaping it needs a seed from the other branch.
     # None = keep the caller's value for that joint.
     #
-    # DERIVED, not hand-picked. manipulation.arms.workspace probes the (radius, height,
+    # DERIVED, not hand-picked: a workspace analysis probed the (radius, height,
     # pitch) space with the bare solver, records which sampled seeds rescue which cells,
     # and takes a minimal cover. This single seed is the mirrored elbow configuration —
     # exactly what an elbow flip needs — and it replaced five seeds that had accumulated

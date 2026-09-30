@@ -24,10 +24,10 @@ import numpy as np
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from rax.manipulation.episodes import EpisodeLog
 from rax.perception.tube_caps import find_caps
 from rax.pick import ColourTarget, PickConfig, pick, place, scan
 from rax.pick.arm import bearing_of, move_to, solve
+from rax.pick.episodes import EpisodeLog
 from rax.robots.so101 import So101
 from rax.robots.urdf_visuals import link_visuals
 
@@ -658,7 +658,10 @@ def main():
     ap.add_argument("--http", type=int, default=8486, help="the UI's port")
     a = ap.parse_args()
 
-    arm = So101(a.port, handeye_file=os.path.join(HERE, "handeye_tf.json"))
+    handeye = os.path.join(HERE, "handeye_tf.json")      # your own fit, if you have one
+    if not os.path.exists(handeye):
+        handeye = os.path.join(HERE, "handeye_tf.example.json")
+    arm = So101(a.port, handeye_file=handeye)
     arm.pace = FAST
     tube = TubeApp(arm)
     tube.say(f"connecting the SO-101 on {a.port} ...")

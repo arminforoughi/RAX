@@ -20,10 +20,7 @@ import time
 
 import numpy as np
 
-from rax.manipulation.arms.ik_strategy import make_ik
-from rax.manipulation.arms.kinematics import make_kinematics
-from rax.manipulation.arms.motion import MotionLimits, quintic_waypoints
-from rax.manipulation.grip import settled
+from rax.kinematics import MotionLimits, make_ik, make_kinematics, quintic_waypoints
 from rax.perception.camera_geometry import (
     CameraGeometry,
     EyeInHand,
@@ -31,6 +28,19 @@ from rax.perception.camera_geometry import (
     parse_tf,
 )
 from rax.robots.profiles import load_profile
+
+
+def settled(read, tol=0.4, timeout=1.5, dt=0.06) -> float:
+    """Read a value once it has stopped changing (mid-close the jaws pass every value)."""
+    last = float(read())
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(dt)
+        v = float(read())
+        if abs(v - last) <= tol:
+            return v
+        last = v
+    return last
 
 
 class Stopped(Exception):

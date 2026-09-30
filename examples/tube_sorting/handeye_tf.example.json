@@ -1,0 +1,5 @@
+{
+ "_comment": "The wrist camera's pose in the gripper frame (x,y,z m, rotation vector rad), fitted on ONE SO-101 by reprojection over 14 views. Use it to get started; refit for your own mount.",
+ "tf": "-0.0140,-0.0854,-0.0417,-0.8057,-0.0210,0.0627",
+ "rms_px": 10.55
+}

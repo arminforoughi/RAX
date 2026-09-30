@@ -157,10 +157,9 @@ Do not confuse the two `Realtek RealManage COM1/COM2` devices for usable serial
 ports. They are class `MultiFunction`, part of the board's IPMI/out-of-band
 management, and they are always present.
 
-## Related: the room camera (camsurv)
+## Related: the overhead camera
 
-`mission_server.py` proxies a second camera at `/stream2` from
-`CAMSURV = ("http://127.0.0.1:5000", "camsurv123")` - a separate app at
-`C:\Users\labot\Documents\camsurv\camserver.py`, not part of this repo. It is
-optional: `/stream2` swallows the failure and the robot side is unaffected. If
-the room view is blank, check whether anything is listening on :5000.
+The server reads an optional overhead MJPEG camera (a CamSurv server) set by
+`RAX_CAMSURV_URL`, `RAX_CAMSURV_PASSWORD` and `RAX_CAMSURV_STREAM`. Without it the drop
+goes to each hole's estimated position and is not verified; the robot side is
+unaffected. If the top view is blank, check whether anything is listening on that URL.

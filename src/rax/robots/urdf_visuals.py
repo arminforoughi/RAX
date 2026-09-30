@@ -1,6 +1,6 @@
 """Link visual geometry from a URDF, as triangles the browser can draw.
 
-WHY THIS IS NOT lerobot's LOADER. `mission_server`'s /urdf route calls
+WHY THIS IS NOT lerobot's LOADER. lerobot's own route calls
 `lerobot.utils.urdf_visual_meshes.load_link_visual_meshes_cached`, which resolves
 `<mesh filename=...>` to STL files on disk. That works for the SO-101 and cannot work
 for the X250: this repo has no X250 meshes, no Interbotix install to take them from, and

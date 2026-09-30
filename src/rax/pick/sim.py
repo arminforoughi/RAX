@@ -46,8 +46,8 @@ class SimArm:
     """Implements :class:`rax.pick.arm.Arm` with the SO-101's model and a drawn picture."""
 
     def __init__(self, tubes=(), profile: str = "so101", handeye: str = SO101_HANDEYE):
-        from rax.manipulation.arms.ik_strategy import make_ik
-        from rax.manipulation.arms.kinematics import make_kinematics
+        from rax.kinematics.ik import make_ik
+        from rax.kinematics.model import make_kinematics
         from rax.perception.camera_geometry import (
             CameraGeometry,
             EyeInHand,

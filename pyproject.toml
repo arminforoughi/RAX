@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rax"
-version = "0.1.0"
-description = "Approach and grasp with an arm and a camera you already own"
+version = "0.2.0"
+description = "Pick up any object a camera can see, with no training"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -17,10 +17,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# The core stack localizes, plans and drives an arm. It needs numeric and image
-# primitives and nothing else — no deep learning framework, no vendor SDK, no ROS.
-# That is deliberate: `pip install rax` on a laptop with a webcam has to work, and
-# every heavy thing below is an optional upgrade to a pipeline that already runs.
+# The method needs numeric and image primitives and nothing else: no deep learning
+# framework, no vendor SDK, no ROS. The simulator and the tests run on a laptop.
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
@@ -28,23 +26,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Open-vocabulary detection. Without it the colour-blob and foreground-blob
-# detectors still work, which is enough for the demos and for coloured objects.
+# Open-vocabulary detection for PromptTarget ("cup", "screwdriver", ...).
 detect = ["ultralytics>=8.3"]
-# Learned stereo matchers. SGBM ships with OpenCV and is the automatic fallback.
-stereo = ["torch>=2.1"]
-# Per-vendor camera SDKs. Pick the one you own; none are needed for a webcam.
-realsense = ["pyrealsense2>=2.54"]
-oakd = ["depthai>=2.24"]
-# OPTIONAL accelerator. URDF kinematics work out of the box on the numpy backend;
-# placo is a better solver near singularities, and publishes no wheels on Windows.
+# The real SO-101 + wrist OAK-D, and the tube-sorting server.
+robot = ["lerobot", "depthai>=2.24", "flask>=3.0", "requests>=2.31"]
+# Optional faster IK backend near singularities (no Windows wheels).
 kinematics = ["placo>=0.9"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
-# Everything a full SO-101 + OAK-D rig uses.
-all = ["rax[detect,stereo,oakd,kinematics]"]
-
-[project.scripts]
-rax-grasp = "rax.grasp:main"
+all = ["rax[detect,robot,kinematics]"]
 
 [project.urls]
 Homepage = "https://github.com/arminforoughi/RAX"
@@ -54,11 +43,8 @@ Issues = "https://github.com/arminforoughi/RAX/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-# The URDF ships: without it `--arm so101` resolves a profile whose kinematics file
-# does not exist in an installed copy. The STL meshes deliberately do NOT ship — they
-# are 17 MB and only the optional Rerun viewer reads them, so an installed rax falls
-# back to a mesh-less view rather than tripling the wheel.
-"rax" = ["py.typed", "robots/arms/lerobot_so101/SO101/*.urdf"]
+# The URDF ships; the STL meshes (17 MB) only feed the 3D view and do not.
+"rax" = ["py.typed", "robots/so101_model/*.urdf"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -68,19 +54,13 @@ addopts = "-q"
 [tool.ruff]
 line-length = 96
 src = ["src", "tests"]
-extend-exclude = ["examples/legacy", "SO101"]
+extend-exclude = ["examples/legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = [
     "E501",   # long lines are usually prose in a docstring here
     "B008",   # argparse/dataclass defaults built in the signature are intentional
-    # The rules below flag existing style, not defects. Turning them on would mean a
-    # mechanical sweep over code that is currently correct and well commented, and
-    # B905 in particular changes behaviour: strict=True raises where the code today
-    # tolerates a length mismatch. Enable them deliberately, with tests, not as part
-    # of a packaging pass.
     "B905",   # zip() without strict=
-    "E741",   # `l` as a variable name, in URDF/label parsing loops
-    "E702",   # semicolon-separated statements, in one older test file
+    "E741",   # `l` as a variable name, in URDF parsing loops
 ]

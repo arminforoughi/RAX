@@ -27,14 +27,25 @@ Conventions: the camera frame is OpenCV's (+Z along the optical axis, +X image r
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from rax.models.depth.stereo import StereoIntrinsics
+
+@dataclass(frozen=True)
+class Intrinsics:
+    """Pinhole intrinsics of the camera, pixels."""
+
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int = 0
+    height: int = 0
 
 __all__ = [
-    "CameraGeometry", "CameraPose", "EyeInHand", "FixedCamera",
+    "CameraGeometry", "CameraPose", "EyeInHand", "FixedCamera", "Intrinsics",
     "intrinsics_from_dict", "parse_tf", "tf_to_string",
 ]
 
@@ -81,7 +92,7 @@ class FixedCamera:
 class CameraGeometry:
     """Pixel <-> base-frame conversions for one camera."""
 
-    def __init__(self, intrinsics: StereoIntrinsics, pose: CameraPose):
+    def __init__(self, intrinsics: Intrinsics, pose: CameraPose):
         self.intr = intrinsics
         self.pose = pose
 
@@ -98,7 +109,7 @@ class CameraGeometry:
     @property
     def cy(self) -> float: return float(self.intr.cy)
 
-    def set_intrinsics(self, intrinsics: StereoIntrinsics) -> None:
+    def set_intrinsics(self, intrinsics: Intrinsics) -> None:
         """Swap in the intrinsics the camera reported once it is connected."""
         self.intr = intrinsics
 
@@ -223,11 +234,8 @@ def tf_to_string(T: np.ndarray, places: int = 4) -> str:
     return ",".join(f"{v:.{places}f}" for v in [*T[:3, 3], *rv])
 
 
-def intrinsics_from_dict(d, width: int = 0, height: int = 0,
-                         baseline_m: float = 0.0) -> StereoIntrinsics:
-    """``{fx, fy, cx, cy}`` (what the cameras report) -> :class:`StereoIntrinsics`."""
-    return StereoIntrinsics(
-        fx=float(d["fx"]), fy=float(d["fy"]), cx=float(d["cx"]), cy=float(d["cy"]),
-        baseline_m=float(d.get("baseline_m", baseline_m)),
-        width=int(d.get("width", width)), height=int(d.get("height", height)),
-    )
+def intrinsics_from_dict(d, width: int = 0, height: int = 0) -> Intrinsics:
+    """``{fx, fy, cx, cy}`` (what the cameras report) -> :class:`Intrinsics`."""
+    return Intrinsics(fx=float(d["fx"]), fy=float(d["fy"]), cx=float(d["cx"]),
+                      cy=float(d["cy"]), width=int(d.get("width", width)),
+                      height=int(d.get("height", height)))

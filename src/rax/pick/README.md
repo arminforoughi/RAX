@@ -39,7 +39,7 @@ short means holding, and too wide means it took two.
 
 - **A robot:** implement `rax.pick.arm.Arm`, about fifteen methods covering joints, FK,
   IK, camera frame, cast and project, gripper, and log.
-  `examples/mission_server/so101_arm.py` does it for the SO-101.
+  `rax.robots.so101.So101` does it for the SO-101 with a wrist OAK-D.
 - **An object:** subclass `Target` and write `detect()`. `ColourTarget` finds HSV blobs
   (test-tube caps). `PromptTarget` uses YOLO-World with a text prompt.
 

@@ -102,3 +102,6 @@ examples/legacy/
 /st.json
 /view.jpg
 /placed.jpg
+
+# tube-sorting server logs
+examples/tube_sorting/server.log*
