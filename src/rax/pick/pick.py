@@ -87,11 +87,12 @@ class PickConfig:
     twist_max: float = 180.0     # largest single roll
     twist_ambiguous: float | None = None  # past this, always roll negative (rig quirk)
 
-    # the grip verdict, from where the jaws stop (percent open)
-    grip_air: float = 1.2        # closed on nothing
-    grip_blocked: float = 3.5    # stopped above this: something is between the jaws
-    grip_jammed: float = 36.0    # stopped above this: a false contact, never closed
-    grip_two: float = 16.0       # wider than one object allows: took two
+    # the grip verdict, from where the jaws stop (percent open); None: the arm's own
+    # ``grip_levels`` (air, blocked, jammed, two)
+    grip_air: float | None = None       # closed on nothing
+    grip_blocked: float | None = None   # stopped above this: something is between the jaws
+    grip_jammed: float | None = None    # stopped above this: a false contact, never closed
+    grip_two: float | None = None       # wider than one object allows: took two
 
 
 @dataclass
@@ -166,11 +167,9 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     det = _find(arm, eye, near_xy)
     if det is None:
         raise RuntimeError(f"no {label or target.name} in view")
-    xy = arm.cast((det.u, det.v), arm.joints())
-    if xy is None:
-        raise RuntimeError("could not cast the object onto the table")
-    arm.log(f"        {det.label or target.name} at ({det.u:.0f},{det.v:.0f})px -> "
-            f"({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm")
+    xy = arm.cast((det.u, det.v), arm.joints())       # None without a hand-eye transform
+    arm.log(f"        {det.label or target.name} at ({det.u:.0f},{det.v:.0f})px"
+            + ("" if xy is None else f" -> ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm"))
 
     # ---- PROBE, AIM ----------------------------------------------------------------
     arm.phase("PROBE", "measuring how far the base moves the object")
@@ -182,6 +181,9 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     arm.phase("APPROACH", "reaching over it, keeping it in view")
     pitch_see = pitch_of(arm, arm.joints())
     r_goal, off = _approach(arm, eye, gain, xy, pitch_see, roll, cfg)
+    if r_goal is None:
+        tip = arm.tip(arm.joints())
+        r_goal = math.hypot(tip[0], tip[1])
 
     if grasp.pitch < 45.0:
         return _side_grasp(arm, eye, target, gain, r_goal, roll, grasp, cfg, off)
@@ -294,7 +296,7 @@ def _approach(arm: Arm, eye: Eye, gain, xy, pitch, roll, cfg: PickConfig):
         q = solve(arm, (tip[0], tip[1], cfg.approach_z), pitch, roll)
         if q is not None:
             arm.move(q, speed=1.0, settle=0.2)
-    r_goal, off = math.hypot(*xy), None
+    r_goal, off = (None if xy is None else math.hypot(*xy)), None
     for k in range(cfg.approach_steps):
         arm.checkpoint()
         d = eye.see()
@@ -306,10 +308,11 @@ def _approach(arm: Arm, eye: Eye, gain, xy, pitch, roll, cfg: PickConfig):
         off = abs(ex)
         cast = arm.cast((d.u, d.v), q)
         if cast is not None:                         # nearer looks are better: average in
-            r_goal = 0.5 * (r_goal + math.hypot(*cast))
+            r_goal = math.hypot(*cast) if r_goal is None else 0.5 * (r_goal + math.hypot(*cast))
         tip = arm.tip(q)
         r_now = math.hypot(tip[0], tip[1])
-        gap = r_goal - cfg.approach_lead_m - r_now
+        # no cast (no hand-eye): the approach only turns; the trim reaches by eye
+        gap = 0.0 if r_goal is None else r_goal - cfg.approach_lead_m - r_now
         arm.log(f"        approach {k+1}: dx {ex:+.0f}px off, {gap*100:+.1f}cm to go")
         if abs(gap) <= cfg.approach_tol_m and abs(ex) <= cfg.centre_tol_px:
             break
@@ -514,11 +517,15 @@ def _grasp_and_lift(arm, eye, target, roll, cfg: PickConfig, off) -> PickResult:
     arm.grip(target.open_pct)
     contact = arm.close(from_pct=target.open_pct)
     pos = arm.grip_pos()
-    held = cfg.grip_blocked < pos < cfg.grip_jammed or (
-        contact and cfg.grip_air + 1.0 < pos < cfg.grip_jammed)
-    arm.log(f"        jaws stopped at {pos:.1f} (air {cfg.grip_air:.1f}, held above "
-            f"{cfg.grip_blocked:.1f}) -> {'HOLDING' if held else 'EMPTY'}")
-    if not held and pos >= cfg.grip_jammed:
+    lv = dict(getattr(arm, "grip_levels", None) or
+              {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0})
+    air, blocked, jammed, two = (v if v is not None else lv[k] for k, v in (
+        ("air", cfg.grip_air), ("blocked", cfg.grip_blocked),
+        ("jammed", cfg.grip_jammed), ("two", cfg.grip_two)))
+    held = blocked < pos < jammed or (contact and air + 1.0 < pos < jammed)
+    arm.log(f"        jaws stopped at {pos:.1f} (air {air:.1f}, held above "
+            f"{blocked:.1f}) -> {'HOLDING' if held else 'EMPTY'}")
+    if not held and pos >= jammed:
         raise RuntimeError(f"the jaws never closed (stopped at {pos:.1f})")
     if not held:
         raise RuntimeError(f"closed on nothing (jaws at {pos:.1f})")
@@ -529,7 +536,7 @@ def _grasp_and_lift(arm, eye, target, roll, cfg: PickConfig, off) -> PickResult:
     up = solve(arm, (tip[0], tip[1], tip[2] + cfg.lift_m), pitch, roll, tol=0.03)
     if up is not None:
         arm.move(up, speed=0.8, settle=0.2)
-    if pos >= cfg.grip_two:
+    if pos >= two:
         arm.log(f"        jaws at {pos:.1f}: two objects — putting them back")
         down = solve(arm, (tip[0], tip[1], tip[2] + 0.01), pitch, roll, tol=0.03)
         if down is not None:

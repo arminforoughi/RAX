@@ -1,6 +1,6 @@
-"""Tube sorting on the SO-101: map the mat, pick each tube, stand it up in its rack.
+"""Tube sorting: map the mat, pick each tube, stand it up in its rack.
 
-    python examples/tube_sorting/server.py --port COM4        (UI on http://127.0.0.1:8486)
+    python examples/tube_sorting/server.py --arm so101 --port COM4    (UI on :8486)
 
 The pick and the place are the generic ones in :mod:`rax.pick`; this file adds what is
 specific to this bench: which caps count, where the racks are (from an overhead
@@ -13,23 +13,24 @@ estimated position and is not verified.
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
-import threading
+import sys
 import time
 
 import cv2
 import numpy as np
 import requests
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Response, jsonify, request, send_from_directory
 
-from rax.perception.tube_caps import find_caps
-from rax.pick import ColourTarget, PickConfig, pick, place, scan
-from rax.pick.arm import bearing_of, move_to, solve
-from rax.pick.episodes import EpisodeLog
-from rax.robots.so101 import So101
-from rax.robots.urdf_visuals import link_visuals
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rig_app import RigApp, arm_from_args  # noqa: E402
+
+from rax.perception.tube_caps import find_caps  # noqa: E402
+from rax.pick import ColourTarget, PickConfig, pick, place, scan  # noqa: E402
+from rax.pick.arm import bearing_of, move_to, solve  # noqa: E402
+from rax.pick.episodes import EpisodeLog  # noqa: E402
+from rax.robots.urdf_visuals import link_visuals  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI = os.path.join(HERE, "ui")
@@ -193,53 +194,31 @@ def top_caps(colour):
                                max_area=900, gates=TOP_CAP_GATES)]
 
 
-class TubeApp:
-    """The state of one sorting session: the arm, the map, the log and the results."""
+class TubeApp(RigApp):
+    """The state of one sorting session: the arm, the map, the racks and the results."""
 
-    def __init__(self, arm: So101):
-        self.arm = arm
-        self.lock = threading.Lock()
-        self.phase_name, self.note = "IDLE", "ready"
-        self.running = False
+    def __init__(self, arm):
+        super().__init__(arm, "tube_sorting")
         self.held = False
-        self.log: list[dict] = []
-        self.results: list[dict] = []
         self.used_holes: dict[str, list[int]] = {}
         self.tube_map: dict[int, dict] = {}
         self.focus = {"colour": None, "xy": None}
         self.caps: list[dict] = []
-        self.jpeg = None
-        arm.log_fn, arm.phase_fn = self.say, self.phase
         self.episodes = EpisodeLog(os.path.join(HERE, "episodes.jsonl"),
                                    probe=lambda: {"joints": [round(float(v), 1) for v in arm.q]},
                                    note=self.say)
-
-    # ---- log -----------------------------------------------------------------------
-    def say(self, msg):
-        print(msg, flush=True)
-        with self.lock:
-            self.log.append({"t": time.strftime("%H:%M:%S"), "m": str(msg)[:220]})
-            del self.log[:-200]
-
-    def phase(self, name, note=""):
-        with self.lock:
-            self.phase_name, self.note = name, note
-        self.say(f"[{name}] {note}" if note else f"[{name}]")
 
     def holding(self):
         return self.arm.gripper_pct > GRIP_BLOCKED_PCT
 
     # ---- the wrist view -----------------------------------------------------------
-    def render(self, rgb, q):
-        """The wrist frame with the grid, the grip cells and the caps drawn on it."""
-        img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    def draw(self, img, q):
+        """The grid, the grip cells (between the two fingertips) and the caps."""
         clean = img.copy()
+        self.draw_grid(img)
         h, w = img.shape[:2]
-        for c in range(1, 6):
-            cv2.line(img, (c * w // 6, 0), (c * w // 6, h), (80, 80, 80), 1)
-        for r in range(1, 5):
-            cv2.line(img, (0, r * h // 5), (w, r * h // 5), (80, 80, 80), 1)
-        (fu, fv), (mu, mv) = self.arm.p.gripper.hand_uv, So101.MOVING_TIP_UV
+        (fu, fv), (ju, jv) = self.arm.p.gripper.hand_uv, self.arm.jaw_uv
+        mu, mv = 2 * ju - fu, 2 * jv - fv            # the other fingertip
         cells = {(min(5, int((fu + (mu - fu) * t) * 6 / w)), min(4, int((fv + (mv - fv) * t) * 5 / h)))
                  for t in np.linspace(0, 1, 21)}
         for c, r in cells:
@@ -251,33 +230,13 @@ class TubeApp:
             dets = [d for d in dets if d.label == self.focus["colour"]]
         self.caps = [{"colour": d.label, "x": d.u, "y": d.v, "area": d.area,
                       "bbox": list(d.box)} for d in dets]
-        ju, jv = (int(v) for v in self.arm.jaw_uv)
         for d in dets:
             x0, y0, x1, y1 = (int(v) for v in d.box)
             cv2.rectangle(img, (x0, y0), (x1, y1), (60, 220, 90), 2)
             cv2.putText(img, f"{d.label} cap", (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (60, 220, 90), 1, cv2.LINE_AA)
-            cv2.line(img, (int(d.u), int(d.v)), (ju, jv), (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.drawMarker(img, (ju, jv), (255, 120, 255), cv2.MARKER_TILTED_CROSS, 16, 2)
-        cv2.putText(img, self.phase_name, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                    (90, 255, 90), 2, cv2.LINE_AA)
-        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if ok:
-            self.jpeg = jpg.tobytes()
-
-    def camera_loop(self):
-        """Keep the view fresh: render the latest frame, and read one when idle."""
-        last = None
-        while True:
-            try:
-                if not self.running:
-                    self.arm.observe(check_stop=False)
-                if self.arm.rgb is not None and self.arm.rgb is not last:
-                    last = self.arm.rgb
-                    self.render(last, self.arm.q)
-            except Exception:
-                pass
-            time.sleep(0.1)
+            cv2.line(img, (int(d.u), int(d.v)), (int(ju), int(jv)), (0, 255, 255), 1,
+                     cv2.LINE_AA)
 
     # ---- the map --------------------------------------------------------------------
     def tubes(self):
@@ -397,7 +356,7 @@ class TubeApp:
         arm = self.arm
         colour, xy = t["colour"], (t["x"], t["y"])
         self.focus.update(colour=colour, xy=xy)
-        ep = self.episodes.start("tube_pick", t["label"], arm="so101", simulated=False,
+        ep = self.episodes.start("tube_pick", t["label"], arm=self.arm.p.name, simulated=False,
                                  dest=rack_name)
         try:
             if math.degrees(bearing_of(xy)) < PICK_MIN_BEARING_DEG:
@@ -457,29 +416,8 @@ class TubeApp:
         placed = tally.get("placed", 0) + tally.get("placed (unverified)", 0)
         self.phase("DONE" if placed and placed == sum(tally.values()) else "PARTIAL", summary)
 
-    def start_job(self, target):
-        """Run ``target`` on the arm in the background, one job at a time."""
-        with self.lock:
-            if self.running:
-                return jsonify(ok=False, error="the arm is busy"), 409
-            self.running = True
-        self.arm.stop_flag.clear()
-
-        def go():
-            try:
-                target()
-            except Exception as e:
-                self.phase("FAILED", f"{type(e).__name__}: {e}")
-            finally:
-                with self.lock:
-                    self.running = False
-        threading.Thread(target=go, daemon=True).start()
-        return jsonify(ok=True)
-
-
-def make_app(tube: TubeApp) -> Flask:
-    app = Flask("tube_sorting", static_folder=None)
-    arm = tube.arm
+def add_routes(tube: TubeApp) -> None:
+    app, arm = tube.app, tube.arm
     urdf = [None]
 
     @app.route("/urdf")
@@ -489,7 +427,7 @@ def make_app(tube: TubeApp) -> Flask:
                         "f": [int(i) for i in F.ravel()]}
                        for n, (V, F) in link_visuals(arm.p.urdf_path,
                                                      mesh_dir=arm.p.mesh_path).items()]
-        return jsonify(links=urdf[0], arm="so101")
+        return jsonify(links=urdf[0], arm=arm.p.name)
 
     @app.route("/geom")
     def r_geom():
@@ -503,7 +441,7 @@ def make_app(tube: TubeApp) -> Flask:
             xf["moving_jaw_so101_v1_link"] = [
                 round(float(v), 5) for v in (np.asarray(chain["gripper_link"]) @ JAW_T).ravel()]
         g = arm.p.gripper
-        return jsonify(arm="so101", simulated=False, xf=xf,
+        return jsonify(arm=arm.p.name, simulated=False, xf=xf,
                        tip=[round(float(v), 4) for v in arm.tip(q)],
                        opening=float(np.clip((arm.gripper_pct - g.closed_pct)
                                              / (g.open_pct - g.closed_pct), 0, 1)),
@@ -519,20 +457,11 @@ def make_app(tube: TubeApp) -> Flask:
         tags = {}
         for r in res:
             tags[r["tag"]] = tags.get(r["tag"], 0) + 1
-        return jsonify(arm="so101", simulated=False, phase=tube.phase_name, note=tube.note,
+        return jsonify(arm=arm.p.name, simulated=False, phase=tube.phase_name, note=tube.note,
                        running=tube.running, held=tube.held, grip_detail="",
                        gripper=round(arm.gripper_pct, 1), log=log,
                        episodes=tube.episodes.tally("tube_pick"), target=None, dest=None,
                        results=res[-30:], tags=tags)
-
-    @app.route("/stream")
-    def r_stream():
-        def gen():
-            while True:
-                if tube.jpeg is not None:
-                    yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + tube.jpeg + b"\r\n"
-                time.sleep(0.1)
-        return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=f")
 
     @app.route("/topstream")
     def r_topstream():
@@ -616,33 +545,10 @@ def make_app(tube: TubeApp) -> Flask:
         tube.say("map, used holes and results cleared")
         return jsonify(ok=True)
 
-    @app.route("/stop", methods=["POST"])
-    def r_stop():
-        arm.stop_flag.set()
-        tube.say("STOP requested")
-        return jsonify(ok=True)
-
-    @app.route("/reset", methods=["POST"])
-    def r_reset():
-        arm.stop_flag.clear()
-        tube.phase("IDLE", "ready")
-        return jsonify(ok=True)
-
     @app.route("/episodes")
     def r_episodes():
         return jsonify(tally=tube.episodes.tally("tube_pick"),
                        recent=tube.episodes.records("tube_pick")[-25:])
-
-    @app.route("/shutdown", methods=["POST"])
-    def r_shutdown():
-        """Release the camera and the bus, then exit. Use this, not a process kill:
-        a killed process leaves the OAK-D booted with no owner."""
-        def bye():
-            time.sleep(0.3)
-            arm.disconnect()
-            os._exit(0)
-        threading.Thread(target=bye, daemon=True).start()
-        return jsonify(ok=True)
 
     @app.route("/")
     def index():
@@ -650,29 +556,13 @@ def make_app(tube: TubeApp) -> Flask:
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    return app
-
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--port", default=os.environ.get("RAX_ARM_PORT", "COM4"),
-                    help="the arm's serial port")
-    ap.add_argument("--http", type=int, default=8486, help="the UI's port")
-    a = ap.parse_args()
-
-    handeye = os.path.join(HERE, "handeye_tf.json")      # your own fit, if you have one
-    if not os.path.exists(handeye):
-        handeye = os.path.join(HERE, "handeye_tf.example.json")
-    arm = So101(a.port, handeye_file=handeye)
+    a, arm = arm_from_args(__doc__.split("\n\n")[0], 8486, HERE)
     arm.pace = FAST
     tube = TubeApp(arm)
-    tube.say(f"connecting the SO-101 on {a.port} ...")
-    arm.connect()
-    import atexit
-    atexit.register(arm.disconnect)
-    threading.Thread(target=tube.camera_loop, daemon=True).start()
-    tube.say(f"tube sorting UI: http://127.0.0.1:{a.http}/")
-    make_app(tube).run(host="0.0.0.0", port=a.http, threaded=True)
+    add_routes(tube)
+    tube.run(a.http)
 
 
 if __name__ == "__main__":
