@@ -202,9 +202,11 @@
 
   <section class="band tint" id="next">
     <div class="wrap">
-      <h2>What's next</h2>
+      <h2>What's next: training it to near perfect</h2>
       <div class="prose">
-        <p>Collect data with the current method: the robot runs unattended and labels every attempt itself. Use that data for training in simulation, then train <b>GR00T</b> on it.</p>
+        <p><b>Close the last millimetre.</b> The drop misses on 1 mm of clearance, below what a camera-driven move can hit. The next fixes are local: feel the rim through the gripper current and search outward until the tube falls in, servo on the hole with the wrist camera instead of trusting the overhead calibration, and let cheap hardware help, with chamfered holes and fingers that centre the tube.</p>
+        <p><b>Then train, in three steps.</b> Collect data with the current method: the robot runs unattended and labels every attempt itself, hundreds of consistent episodes a day instead of 117 teleoperated ones. Train in simulation on that data. Then train <b>GR00T</b> on it, with a learned detector replacing the colour thresholds along the way.</p>
+        <p><b>A fair rematch for the VLA.</b> The same data fixes what held SmolVLA back: an instruction that names the tube and the rack, episodes that end when the task does, no duplicates or failed runs, and the free holes given as input.</p>
       </div>
     </div>
   </section>
