@@ -23,7 +23,7 @@
 </nav>
 
 <main>
-  <header class="hero">
+  <header class="hero hero-left">
     <div class="wrap">
       <div class="copy">
         <p class="eyebrow">Lab automation</p>
@@ -184,7 +184,6 @@
         <p><b>Too few examples of the rule.</b> Blue and green go to the black rack, red to the silver one, and the policy had to infer that from pixels with about 43 episodes per colour. Green really had 22: 21 of its 43 were exact duplicates. A rule that fits in a three-row lookup table was being learned from a few dozen examples.</p>
         <p><b>The instruction said nothing.</b> Every frame of every episode carried the same sentence, "Pick up the blood tube and place it in the rack", one instruction for about 69,000 frames. It never said which phase, which tube or which rack, so the language half of the model had nothing to do.</p>
         <p><b>Noisy, fixed-length demonstrations.</b> Episodes were cut at a fixed 20 seconds, not when the task ended, so on average 18% of each is the arm idling after the release. One in eleven taught the wrong thing: recording stopped while still holding the tube, the grasp was missing, or nothing was picked. And the training stack loaded one recording session at a time, so early runs saw 18 to 20 episodes, not 117.</p>
-        <p><b>It can't see what it needs.</b> Nothing in the policy's input says which rack holes are free, so it can't choose one. And imitation reproduces the average of the demonstrations; averaging moves that differ by a few millimetres misses a 1 mm hole. That is a contact problem, not a pattern-matching one.</p>
         <p>So the pipeline splits the work. Geometry, the arm's own kinematics and sensing do what they can do exactly, and learning goes where it pays off: the teleop episodes that were too few for a whole policy are plenty to train the detector that sees the tubes. The VLA stays as a baseline to beat.</p>
       </div>
     </div>
@@ -203,15 +202,9 @@
 
   <section class="band tint" id="next">
     <div class="wrap">
-      <h2>What's next: training it to near perfect</h2>
+      <h2>What's next</h2>
       <div class="prose">
-        <p><b>Feel the last millimetre.</b> The drop fails on 1 mm of clearance, below what any camera-driven move can hit. The fix is contact, not pixels: lower the tube until it touches the rim, read the gripper current, and spiral outward in small steps until it falls in. That turns a 50% guess into a search that ends in the hole.</p>
-        <p><b>Servo on the hole itself.</b> The drop still trusts a rough overhead calibration to find the rack. The same see, measure, solve loop that brings a cap between the jaws can bring the held tube over a free hole the wrist camera is looking at, so the rack's position never has to be calibrated at all.</p>
-        <p><b>Help from the hardware.</b> Chamfered or funnel-topped rack holes and fingers with a V-notch that centres the tube in the jaws each buy millimetres for almost nothing, and millimetres are exactly what the drop is short of.</p>
-        <p><b>A learned eye.</b> Colour thresholds are the most fragile part of the pipeline, and a change of lighting, bench or cap colour has meant re-measuring them. A small rotated-box detector trained on the 200 teleoperation episodes, auto-labelled by foundation models, gives each tube's position, direction and colour in one pass, and raises the 80% pick with it.</p>
-        <p><b>Let it train its successor.</b> Every run is already a self-labelled episode. Successful drops are clean, consistent demonstrations of exactly the step a learned policy is best at, so a short-horizon insertion policy can be trained on them and put in the one place where contact matters most, with the geometric loop doing the rest.</p>
-        <p><b>More training, and better data to train on.</b> The robot can now run unattended and record every attempt, so data stops being the bottleneck: hundreds of consistent episodes a day instead of 117 teleoperated ones. Each failure it tags becomes a correction to learn from, and each round of training makes the next round of data better, the same loop as the servo, one level up.</p>
-        <p><b>Retrain the VLA the right way.</b> Every reason SmolVLA fell short has a direct fix in that data: an instruction per episode that names the tube and the rack ("put the red tube in the silver rack"), episodes cut when the task ends instead of at 20 seconds, duplicates and failed runs removed, every recording session loaded at once, and the rack's free holes given to the policy as input. Trained on that, the end-to-end model becomes a fair comparison, and a policy worth putting on the arm.</p>
+        <p>Collect data with the current method: the robot runs unattended and labels every attempt itself. Use that data for training in simulation, then train <b>GR00T</b> on it.</p>
       </div>
     </div>
   </section>

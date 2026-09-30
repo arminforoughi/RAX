@@ -64,6 +64,8 @@ footer{border-top:1px solid var(--line); padding-block:2rem 3rem; color:var(--mu
 footer .wrap{display:flex; flex-wrap:wrap; gap:.6rem 1.6rem; justify-content:space-between}
 footer a{color:var(--muted)}
 @media (max-width:900px){ #arm{opacity:.35} .hero .copy{background:none} }
+/* keep the headline clear of the robot: pin it to the left edge */
+.hero-left .wrap{max-width:none; margin:0; padding-inline:clamp(16px,5vw,64px)}
 
 .video{margin:1.6rem 0 0; border-radius:20px; overflow:hidden; border:1px solid var(--line); background:#000; max-width:56rem}
 .video video{display:block; width:100%; height:auto}
