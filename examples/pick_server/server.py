@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rig_app import App  # noqa: E402
 
 from rax.perception.handeye import calibrate  # noqa: E402
-from rax.pick import SIDE, TOP, PickConfig, PromptTarget, pick, place, scan  # noqa: E402
+from rax.pick import SIDE, TOP, PromptTarget, pick, place, scan  # noqa: E402
 from rax.pick.arm import pitch_of, steepest  # noqa: E402
 from rax.pick.episodes import EpisodeLog  # noqa: E402
 
@@ -45,7 +45,7 @@ class PickApp(App):
         super().__init__(rig)
         self.target = PromptTarget(prompt=os.environ.get("RAX_PROMPT", "red cube, green cube"),
                                    grasp_z=0.02)
-        self.cfg = PickConfig()
+        self.cfg = None                        # the arm's own tuning (PickConfig.for_arm)
         self.objects: list[dict] = []          # the 2D map
         self.dets: list = []                   # latest detections, for the view
         self.held: str | None = None

@@ -62,6 +62,8 @@ class WristCameraArm:
     grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0}
     #: Close by current (stop when it rises) or by position only.
     close_by_current = True
+    #: What this arm's pick was tuned to: PickConfig fields (see PickConfig.for_arm).
+    pick_tuning: dict = {}
 
     def __init__(self, port: str, handeye_file: str | None = None, log=print):
         self.p = load_profile(self.profile_name)

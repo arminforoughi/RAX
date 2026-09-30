@@ -94,6 +94,12 @@ class PickConfig:
     grip_jammed: float | None = None    # stopped above this: a false contact, never closed
     grip_two: float | None = None       # wider than one object allows: took two
 
+    @classmethod
+    def for_arm(cls, arm, **overrides) -> PickConfig:
+        """The defaults, then what this arm was tuned to (``arm.pick_tuning``), then
+        ``overrides``: every app on the same arm picks the same way."""
+        return cls(**{**dict(getattr(arm, "pick_tuning", None) or {}), **overrides})
+
 
 @dataclass
 class PickResult:
@@ -110,6 +116,7 @@ class Eye:
         self.label: str | None = None
         self.uv: tuple[float, float] | None = None
         self.bgr = None
+        self.hits = 0                 # detections since the last reset
 
     def all(self) -> list[Detection]:
         self.bgr = self.arm.frame()
@@ -134,6 +141,7 @@ class Eye:
                 else:
                     d = min(dets, key=lambda d: (d.u - self.uv[0]) ** 2 + (d.v - self.uv[1]) ** 2)
                 self.uv, self.label = (d.u, d.v), d.label
+                self.hits += 1
                 return d
             time.sleep(0.08)
         return None
@@ -155,7 +163,7 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     first and takes the detection nearest it. ``label``: only detections with this label.
     ``avoid(xy)``: detections casting to where this is True are ignored (e.g. racks).
     """
-    cfg = cfg or PickConfig()
+    cfg = cfg or PickConfig.for_arm(arm)
     eye = Eye(arm, target, avoid)
     eye.label = label
     roll = float(arm.joints()[arm.roll])
@@ -170,6 +178,9 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     xy = arm.cast((det.u, det.v), arm.joints())       # None without a hand-eye transform
     arm.log(f"        {det.label or target.name} at ({det.u:.0f},{det.v:.0f})px"
             + ("" if xy is None else f" -> ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm"))
+    if near_xy is None and xy is not None:           # face it before anything else
+        det = _find(arm, eye, xy) or det
+        xy = arm.cast((det.u, det.v), arm.joints()) or xy
 
     # ---- PROBE, AIM ----------------------------------------------------------------
     arm.phase("PROBE", "measuring how far the base moves the object")
@@ -180,7 +191,11 @@ def pick(arm: Arm, target: Target, near_xy=None, label: str | None = None,
     # ---- APPROACH at the look angle, then HOVER ------------------------------------
     arm.phase("APPROACH", "reaching over it, keeping it in view")
     pitch_see = pitch_of(arm, arm.joints())
+    eye.hits = 0
     r_goal, off = _approach(arm, eye, gain, xy, pitch_see, roll, cfg)
+    if eye.hits == 0:
+        raise RuntimeError(f"lost the {label or target.name} before reaching it "
+                           f"— not going down blind")
     if r_goal is None:
         tip = arm.tip(arm.joints())
         r_goal = math.hypot(tip[0], tip[1])

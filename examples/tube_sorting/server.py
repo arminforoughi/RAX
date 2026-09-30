@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rig_app import App, overhead_frame  # noqa: E402
 
 from rax.perception.tube_caps import find_caps  # noqa: E402
-from rax.pick import ColourTarget, PickConfig, pick, place, scan  # noqa: E402
+from rax.pick import ColourTarget, pick, place, scan  # noqa: E402
 from rax.pick.arm import bearing_of, move_to, solve  # noqa: E402
 from rax.pick.episodes import EpisodeLog  # noqa: E402
 
@@ -39,17 +39,6 @@ UI = os.path.join(HERE, "ui")
 TUBE = ColourTarget(name="tube", colours=("green", "blue", "red"),
                     ignore=((0.0, 340.0, 200.0, 1e4),), grasp_z=0.010, open_pct=45.0)
 TUBE_D_M, TUBE_L_M = 0.016, 0.100
-
-#: The pick, as tuned on this rig. Everything not named here is the library default.
-RIG = PickConfig(
-    default_gain=-7.5,      # base px/deg measured here: -5.1 .. -10.4
-    aim_offset_px=80.0,     # the operator's set point: the hand lands on the tube's right
-    twist_fraction=0.5,     # the operator: "do half of the angle"
-    twist_max=45.0,
-    twist_ambiguous=70.0,   # nearly perpendicular: roll negative, what worked here
-    target_v=405.0,         # reach until the cap is in the grip cells (the grid's bottom
-    along_tol_px=18.0,      # row, 384-480px): the operator's "put it in the grid"
-)
 
 #: Jaw stop that means something is held (percent open): below it, the jaws shut on air.
 GRIP_BLOCKED_PCT = 3.5
@@ -199,14 +188,7 @@ class TubeApp(App):
         """The grid, the grip cells (between the two fingertips) and the caps."""
         clean = img.copy()
         self.draw_grid(img)
-        h, w = img.shape[:2]
-        (fu, fv), (ju, jv) = self.arm.p.gripper.hand_uv, self.arm.jaw_uv
-        mu, mv = 2 * ju - fu, 2 * jv - fv            # the other fingertip
-        cells = {(min(5, int((fu + (mu - fu) * t) * 6 / w)), min(4, int((fv + (mv - fv) * t) * 5 / h)))
-                 for t in np.linspace(0, 1, 21)}
-        for c, r in cells:
-            cv2.rectangle(img, (c * w // 6, r * h // 5), ((c + 1) * w // 6, (r + 1) * h // 5),
-                          (0, 220, 220), 1)
+        ju, jv = self.arm.jaw_uv
         dets = TUBE.detect(clean)
         dets = [d for d in dets if not in_rack_zone(self.arm.cast((d.u, d.v), q) or (9, 9))]
         if self.focus["colour"] is not None:
@@ -346,7 +328,7 @@ class TubeApp(App):
                 raise RuntimeError("not reachable: past the guardrail, toward the racks")
             arm.min_bearing_deg, arm.pace = PICK_MIN_BEARING_DEG, 1.0   # the pick's own pace
             try:
-                res = pick(arm, TUBE, near_xy=xy, label=colour, cfg=RIG, avoid=in_rack_zone)
+                res = pick(arm, TUBE, near_xy=xy, label=colour, avoid=in_rack_zone)
             finally:
                 arm.min_bearing_deg, arm.pace = None, FAST
             self.held = True

@@ -207,11 +207,21 @@ class App:
         """Draw this UI's overlay on the wrist frame (BGR, in place)."""
 
     def draw_grid(self, img):
+        """The 6x5 grid, the grip cells (yellow: between the two fingertips) and the
+        grip centre. The pick is done when the object sits in the yellow cells."""
         h, w = img.shape[:2]
         for c in range(1, 6):
             cv2.line(img, (c * w // 6, 0), (c * w // 6, h), (80, 80, 80), 1)
         for r in range(1, 5):
             cv2.line(img, (0, r * h // 5), (w, r * h // 5), (80, 80, 80), 1)
+        (fu, fv), (ju, jv) = self.arm.tip_uv, self.arm.jaw_uv
+        mu, mv = 2 * ju - fu, 2 * jv - fv            # the other fingertip
+        cells = {(min(5, max(0, int((fu + (mu - fu) * t) * 6 / w))),
+                  min(4, max(0, int((fv + (mv - fv) * t) * 5 / h))))
+                 for t in np.linspace(0, 1, 21)}
+        for c, r in cells:
+            cv2.rectangle(img, (c * w // 6, r * h // 5), ((c + 1) * w // 6, (r + 1) * h // 5),
+                          (0, 220, 220), 1)
         ju, jv = (int(v) for v in self.arm.jaw_uv)
         cv2.drawMarker(img, (ju, jv), (255, 120, 255), cv2.MARKER_TILTED_CROSS, 16, 2)
 

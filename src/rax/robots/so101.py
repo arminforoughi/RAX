@@ -29,6 +29,15 @@ class So101(WristCameraArm):
     roll_gain = 1.0                       # measured +0.96 / +1.01
     grip_levels = {"air": 1.2, "blocked": 3.5, "jammed": 36.0, "two": 16.0}
     close_by_current = True
+    pick_tuning = {
+        "default_gain": -7.5,     # base px/deg measured here: -5.1 .. -10.4
+        "aim_offset_px": 80.0,    # the operator's set point: the hand lands on the object's right
+        "twist_fraction": 0.5,    # the operator: "do half of the angle"
+        "twist_max": 45.0,
+        "twist_ambiguous": 70.0,  # nearly perpendicular: roll negative, what worked here
+        "target_v": 405.0,        # reach until it sits in the grip cells (the grid's bottom
+        "along_tol_px": 18.0,     # row, 384-480px): the operator's "put it in the grid"
+    }
     #: The moving fingertip in the wrist image (the fixed one is the profile's hand_uv).
     MOVING_TIP_UV = (210.0, 476.0)
 

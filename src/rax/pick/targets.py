@@ -14,6 +14,7 @@ enough), not touching the pick.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 
 import cv2
@@ -140,10 +141,15 @@ class PromptTarget(Target):
 
     prompt: str = "cup"
     model_path: str = "yolov8s-worldv2.pt"
-    min_confidence: float = 0.2
+    min_confidence: float = 0.06    # the old server's floor: YOLO-World scores real objects low
     _detector: object = field(default=None, repr=False)
+    _lock: object = field(default_factory=threading.Lock, repr=False)
 
     def detect(self, bgr):
+        with self._lock:               # one model, called from the view and the pick
+            return self._detect(bgr)
+
+    def _detect(self, bgr):
         if self._detector is None:
             from ultralytics import YOLOWorld  # pip install "rax[detect]"
             self._detector = YOLOWorld(self.model_path)
