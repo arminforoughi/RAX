@@ -100,8 +100,8 @@ def test_place_releases_over_the_spot():
 
 def test_tube_mode_rules():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples",
-                                    "mission_server"))
-    import tube_mode as tm
+                                    "tube_sorting"))
+    import server as tm
     hole = tm.top_px_to_xy(*tm.TOP_RACKS[0]["holes_px"][0])
     assert tm.in_rack_zone(hole) and not tm.in_rack_zone((0.25, 0.10))
     assert tm.xy_to_top_px(*tm.top_px_to_xy(600, 300)) == pytest.approx((600, 300), abs=1.0)
