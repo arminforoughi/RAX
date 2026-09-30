@@ -71,6 +71,7 @@ class PickConfig:
     aim_offset_px: float = 0.0   # >0 puts the object this far LEFT of the grip centre
     centre_tol_px: float = 28.0  # across the reach
     along_tol_px: float = 45.0   # along the reach
+    target_v: float | None = None  # image row to reach the object to; None: the landing point
 
     approach_steps: int = 12
     approach_lead_m: float = 0.02   # stop this short of the cast
@@ -374,10 +375,10 @@ def _trim(arm: Arm, eye: Eye, target: Target, gain, r_goal, pitch, roll, cfg: Pi
             break
         gu = _grasp_uv(arm, target)
         ex = (gu[0] - cfg.aim_offset_px) - d.u
-        dy = gu[1] - d.v
+        dy = (gu[1] if cfg.target_v is None else cfg.target_v) - d.v
         off = abs(ex)
         if abs(ex) <= cfg.centre_tol_px and abs(dy) <= cfg.along_tol_px:
-            arm.log(f"        trim {k+1}: on the landing point ({ex:+.0f}, {dy:+.0f}px)")
+            arm.log(f"        trim {k+1}: on target ({ex:+.0f}, {dy:+.0f}px)")
             break
         q = arm.joints()
         if abs(ex) > cfg.centre_tol_px:                   # sideways: turn the base

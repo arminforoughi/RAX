@@ -42,6 +42,8 @@ RIG = PickConfig(
     twist_fraction=0.5,     # the operator: "do half of the angle"
     twist_max=45.0,
     twist_ambiguous=70.0,   # nearly perpendicular: roll negative, what worked here
+    target_v=405.0,         # reach until the cap is in the grip cells (the grid's bottom
+    along_tol_px=18.0,      # row, 384-480px): the operator's "put it in the grid"
 )
 
 #: Jaw stop that means something is held (percent open): below it, the jaws shut on air.
