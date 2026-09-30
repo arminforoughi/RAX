@@ -107,3 +107,4 @@ examples/legacy/
 examples/tube_sorting/server.log*
 examples/*/server.log*
 examples/.server_stdin.txt
+examples/*/handeye_*.json

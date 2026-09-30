@@ -107,3 +107,17 @@ def test_tube_mode_rules():
     assert tm.xy_to_top_px(*tm.top_px_to_xy(600, 300)) == pytest.approx((600, 300), abs=1.0)
     assert tm.tag_of(RuntimeError("closed on nothing (jaws at 1.0)")) == "missed grasp"
     assert tm.tag_of(RuntimeError("no green in view")) == "not found"
+
+
+def test_hand_eye_fit_recovers_the_camera_from_nothing():
+    from scipy.spatial.transform import Rotation as R
+
+    from rax.perception.handeye import calibrate
+    arm = SimArm([Tube(0.25, 0.03, yaw_deg=40)])
+    truth = arm.geom.pose.T_ee_cam.copy()
+    arm.has_handeye = False                       # a new arm: nothing to start from
+    fit = calibrate(arm, ColourTarget())
+    assert fit.converged
+    assert np.linalg.norm(fit.T_ee_cam[:3, 3] - truth[:3, 3]) < 0.005
+    err = R.from_matrix(fit.T_ee_cam[:3, :3]) * R.from_matrix(truth[:3, :3]).inv()
+    assert np.degrees(np.linalg.norm(err.as_rotvec())) < 2.0

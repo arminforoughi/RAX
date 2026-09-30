@@ -20,6 +20,7 @@ from flask import jsonify, request, send_from_directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rig_app import RigApp, arm_from_args  # noqa: E402
 
+from rax.perception.handeye import calibrate  # noqa: E402
 from rax.pick import SIDE, TOP, PickConfig, PromptTarget, pick, place, scan  # noqa: E402
 from rax.pick.episodes import EpisodeLog  # noqa: E402
 
@@ -132,6 +133,18 @@ class PickApp(RigApp):
         @app.route("/scan", methods=["POST"])
         def r_scan():
             return self.start_job(self.do_scan)
+
+        @app.route("/calibrate", methods=["POST"])
+        def r_calibrate():
+            """Fit the wrist camera's pose from one still object of the current prompt,
+            in view. Saved per arm and loaded automatically from then on."""
+            path = os.path.join(HERE, f"handeye_{self.arm.p.name}.json")
+
+            def job():
+                fit = calibrate(self.arm, self.target, save_to=path)
+                self.phase("DONE" if fit.converged else "FAILED",
+                           f"hand-eye {'saved to ' + os.path.basename(path) if fit.converged else fit.reason}")
+            return self.start_job(job)
 
         @app.route("/pick", methods=["POST"])
         def r_pick():

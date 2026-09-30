@@ -74,6 +74,7 @@ class WristCameraArm:
         self.home = np.array(self.p.home_deg, float)
         self.motors = list(self.p.joint_names)
         self.jaw_uv = tuple(self.p.gripper.hand_uv)
+        self.tip_uv = tuple(self.p.gripper.hand_uv)   # where the fingertip frame appears
         self.table_z = float(self.p.table_z_m)
 
         self.kin = make_kinematics(self.p.urdf_path, self.p.ee_frame, self.motors)

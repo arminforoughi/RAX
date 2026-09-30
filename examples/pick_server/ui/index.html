@@ -42,7 +42,9 @@
       <div class="row"><input type="text" id="prompt" placeholder="e.g. cup, red block, screwdriver">
         <button id="set">Set</button></div>
       <div class="warn" id="nohe" hidden>This arm has no hand-eye calibration: scanning and
-        distances are off until it is fitted.</div>
+        distances are off until it is fitted. Put one object of the prompt in view and
+        press Calibrate camera.</div>
+      <div class="row" style="margin-top:8px"><button class="ghost" id="calib">Calibrate camera</button></div>
     </div>
     <div class="card">
       <h3>Pick</h3>
@@ -80,6 +82,7 @@ const doPick = id => post('/pick', {id, grasp: grasp(), place: placeAt()});
 $('set').onclick = () => post('/prompt', {prompt: $('prompt').value});
 $('prompt').onkeydown = e => { if (e.key === 'Enter') $('set').click(); };
 $('scan').onclick = () => post('/scan');
+$('calib').onclick = () => post('/calibrate');
 $('pickview').onclick = () => doPick(null);
 $('stop').onclick = () => post('/stop');
 $('home').onclick = () => post('/home');
@@ -93,7 +96,7 @@ async function tick() {
     $('phase').textContent = `${s.phase} · ${s.note}`;
     if (!promptSet) { $('prompt').value = s.prompt; promptSet = true; }
     $('nohe').hidden = s.has_handeye;
-    for (const b of ['scan', 'pickview', 'home']) $(b).disabled = s.running;
+    for (const b of ['scan', 'pickview', 'home', 'calib']) $(b).disabled = s.running;
     $('objs').innerHTML = s.objects.map(o =>
       `<tr><td>#${o.id} ${o.label}</td><td>${(o.x * 100).toFixed(0)}, ${(o.y * 100).toFixed(0)} cm</td>` +
       `<td><button ${s.running ? 'disabled' : ''} onclick="doPick(${o.id})">Pick</button></td></tr>`).join('');

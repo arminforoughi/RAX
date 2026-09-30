@@ -70,6 +70,8 @@ class SimArm:
         self.home = np.array(p.home_deg, float)
         self.q = self.home.copy()
         self.jaw_uv = self.geom.tip_pixel(self.q)
+        self.tip_uv = self.jaw_uv
+        self.has_handeye = True
         self.jaw_axis_deg = self._closing_axis_deg()
         self.roll_gain = 1.0
         self.tubes = list(tubes)
