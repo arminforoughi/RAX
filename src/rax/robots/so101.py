@@ -170,6 +170,15 @@ class So101:
         time.sleep(0.3)
         self.log_fn("        servo bus stopped answering — reopened the port")
 
+    def _reconnect_camera(self) -> None:
+        self.log_fn("        wrist camera stopped — reconnecting it")
+        try:
+            self.cam.disconnect()
+        except Exception:
+            pass
+        time.sleep(2.0)                   # let the device finish rebooting
+        self.cam.connect()
+
     # ---- raw I/O ------------------------------------------------------------------
     def observe(self, check_stop: bool = True):
         """Read the joints, the gripper and a frame. Retries a flaky bus."""
@@ -188,6 +197,13 @@ class So101:
                         self._reopen_bus()
                 else:
                     time.sleep(0.08)
+            except RuntimeError as e:
+                # The OAK-D crashes now and then (X_LINK_ERROR) and reboots on its own;
+                # its read thread is then dead. Reconnect it rather than stay blind.
+                if "OAKD" not in str(e) or attempt == 11:
+                    raise
+                with self.bus_lock:
+                    self._reconnect_camera()
         self.q = np.array([float(obs[f"{m}.pos"]) for m in self.motors])
         self.gripper_pct = float(obs.get("gripper.pos", 0.0))
         self.rgb = np.asarray(obs["front"])

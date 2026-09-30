@@ -173,7 +173,9 @@ def overhead_frame():
             a, b = buf.find(b"\xff\xd8"), buf.find(b"\xff\xd9", 2)
             if a != -1 and b != -1:
                 r.close()
-                return cv2.imdecode(np.frombuffer(buf[a:b + 2], np.uint8), cv2.IMREAD_COLOR)
+                img = cv2.imdecode(np.frombuffer(buf[a:b + 2], np.uint8), cv2.IMREAD_COLOR)
+                # a camera that lost its USB link streams black: that is no view at all
+                return None if img is None or float(img.mean()) < 5.0 else img
         r.close()
     except Exception:
         pass
