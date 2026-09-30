@@ -28,6 +28,12 @@ h1 .tail{color:var(--ink-dim);font-weight:400;font-size:12px;margin-left:0;
   font-family:var(--mono)}
 
 .cams{display:flex;flex-direction:column;gap:14px;min-width:0}
+.camrow{display:flex;gap:14px;align-items:flex-start}
+.camrow>div{flex:1;min-width:0}
+.camrow>div:first-child{flex:0 1 75%}
+.views{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.views canvas{width:100%;height:300px;border:1px solid #2b3540;border-radius:6px;
+  background:#0b0f14;display:block;touch-action:none}
 img{width:100%;border:1px solid var(--line);border-radius:var(--r);background:#000;display:block}
 .lbl{font-size:10.5px;color:var(--ink-dim);letter-spacing:.12em;text-transform:uppercase;
   margin:0 0 6px;font-family:var(--mono);font-weight:600}
@@ -126,21 +132,19 @@ a{color:var(--info)}
 </style></head><body><main>
 <h1>RAX · pick anything<span class="tail" id="armname"></span></h1>
 <div class="cams">
+  <div class="camrow">
   <div><p class="lbl">wrist camera</p><img src="/stream" alt="gripper view"></div>
   <!-- /stream2 PROXIES the room camera and answers 200 with an empty body when that
        camera is unplugged, so `onerror` never fires and this sat as a black rectangle
        looking connected. /camstatus probes for a real frame instead. -->
   <div class="phone-hide" id="roomwrap" style="display:none">
     <p class="lbl">room camera</p><img id="roomcam" alt="room view"></div>
-  <div class="phone-hide">
-    <p class="lbl">robot + objects 3d · drag to rotate</p>
-    <canvas id="v3d"
-       style="width:100%;height:340px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+  </div>
+  <div class="views phone-hide">
+    <div><p class="lbl">robot + objects 3d · drag to rotate</p><canvas id="v3d"></canvas></div>
+    <div><p class="lbl">2D map · top-down · click a dot to go on top</p><canvas id="v2d"></canvas></div>
   </div>
   <div class="phone-hide">
-    <p class="lbl">2D map (top-down · base frame) · click a dot / row to go on top</p>
-    <canvas id="v2d"
-       style="width:100%;height:300px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
     <table id="map2dtab" style="margin-top:6px"><tbody></tbody></table>
     <div class="btns">
       <button class="dim" id="b-scan2d" onclick="fetch('/scan2d',{method:'POST'})"
