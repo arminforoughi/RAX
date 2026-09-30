@@ -14,6 +14,8 @@ from .arm import Arm
 from .pick import SIDE, TOP, Grasp, PickConfig, PickResult, pick
 from .place import Found, place, scan
 from .targets import ColourTarget, Detection, PromptTarget, Target
+from .track import StickyTarget
 
 __all__ = ["Arm", "pick", "place", "scan", "Grasp", "TOP", "SIDE", "PickConfig",
-           "PickResult", "Found", "Target", "ColourTarget", "PromptTarget", "Detection"]
+           "PickResult", "Found", "Target", "ColourTarget", "PromptTarget", "StickyTarget",
+           "Detection"]

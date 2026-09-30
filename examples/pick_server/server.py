@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rig_app import App  # noqa: E402
 
 from rax.perception.handeye import calibrate  # noqa: E402
-from rax.pick import SIDE, TOP, PromptTarget, pick, place, scan  # noqa: E402
+from rax.pick import SIDE, TOP, PromptTarget, StickyTarget, pick, place, scan  # noqa: E402
 from rax.pick.arm import pitch_of, steepest  # noqa: E402
 from rax.pick.episodes import EpisodeLog  # noqa: E402
 
@@ -43,8 +43,7 @@ class PickApp(App):
 
     def __init__(self, rig):
         super().__init__(rig)
-        self.target = PromptTarget(prompt=os.environ.get("RAX_PROMPT", "red cube, green cube"),
-                                   grasp_z=0.02)
+        self.target = self.make_target(os.environ.get("RAX_PROMPT", "red cube, green cube"))
         self.cfg = None                        # the arm's own tuning (PickConfig.for_arm)
         self.objects: list[dict] = []          # the 2D map
         self.dets: list = []                   # latest detections, for the view
@@ -54,6 +53,11 @@ class PickApp(App):
                                                              for v in self.arm.q]},
                                    note=self.say)
         self._routes()
+
+    @staticmethod
+    def make_target(prompt):
+        """YOLO-World finds it; OpenCV holds on to it when YOLO drops out for a moment."""
+        return StickyTarget(PromptTarget(prompt=prompt, grasp_z=0.02))
 
     # ---- detection runs on its own thread: the model is slower than the camera ------
     def detect_loop(self):
@@ -72,9 +76,11 @@ class PickApp(App):
         ju, jv = (int(v) for v in self.arm.jaw_uv)
         for d in self.dets:
             x0, y0, x1, y1 = (int(v) for v in d.box)
-            cv2.rectangle(img, (x0, y0), (x1, y1), (60, 220, 90), 2)
-            cv2.putText(img, d.label, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (60, 220, 90), 1, cv2.LINE_AA)
+            held = d.source == "tracked"            # orange: OpenCV is holding the lock
+            col = (0, 160, 255) if held else (60, 220, 90)
+            cv2.rectangle(img, (x0, y0), (x1, y1), col, 2)
+            cv2.putText(img, d.label + (" (held)" if held else ""), (x0, y0 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
             cv2.line(img, (int(d.u), int(d.v)), (ju, jv), (0, 255, 255), 1, cv2.LINE_AA)
 
     # ---- the map --------------------------------------------------------------------
@@ -211,7 +217,7 @@ class PickApp(App):
             q = (request.args.get("q") or "").strip()
             if not q:
                 return jsonify(ok=False)
-            self.target = PromptTarget(prompt=q, grasp_z=self.target.grasp_z)
+            self.target = self.make_target(q)
             self.say(f"query: '{q}'")
             return jsonify(ok=True)
 

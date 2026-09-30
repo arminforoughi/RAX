@@ -259,9 +259,12 @@ def _find(arm: Arm, eye: Eye, near_xy, tilts=(0.0, 25.0)):
                 return d
             continue
         best = None
-        for d in eye.all():
-            if eye.label is not None and d.label != eye.label:
-                continue
+        for _ in range(4):                   # a few frames: detectors flicker
+            dets = [d for d in eye.all() if eye.label is None or d.label == eye.label]
+            if dets:
+                break
+            time.sleep(0.08)
+        for d in dets:
             xy = arm.cast((d.u, d.v), q)
             dist = 9.9 if xy is None else math.hypot(xy[0] - near_xy[0], xy[1] - near_xy[1])
             if best is None or dist < best[0]:

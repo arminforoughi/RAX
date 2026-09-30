@@ -121,3 +121,25 @@ def test_hand_eye_fit_recovers_the_camera_from_nothing():
     assert np.linalg.norm(fit.T_ee_cam[:3, 3] - truth[:3, 3]) < 0.005
     err = R.from_matrix(fit.T_ee_cam[:3, :3]) * R.from_matrix(truth[:3, :3]).inv()
     assert np.degrees(np.linalg.norm(err.as_rotvec())) < 2.0
+
+
+def test_sticky_target_holds_the_object_when_the_detector_drops_out():
+    from rax.pick import StickyTarget
+
+    class Never(ColourTarget):
+        def detect(self, bgr):
+            return []
+
+    arm = SimArm([Tube(0.25, 0.05, yaw_deg=70)])
+    truth, sticky = ColourTarget(), StickyTarget(ColourTarget())
+    sticky.detect(arm.frame())                    # one real detection to learn from
+    sticky.inner = Never()                        # then the detector goes quiet
+    q = arm.q.copy()
+    for _ in range(8):                            # the arm keeps moving between looks
+        q[0] += 1.5
+        q[3] += 1.0
+        arm.move(q)
+        img = arm.frame()
+        t, d = truth.detect(img)[0], sticky.detect(img)
+        assert d and d[0].source == "tracked"
+        assert math.hypot(d[0].u - t.u, d[0].v - t.v) < 12

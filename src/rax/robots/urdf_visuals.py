@@ -203,14 +203,32 @@ def decimate(V: np.ndarray, F: np.ndarray, voxel: float) -> tuple[np.ndarray, np
     return Vn, Fn
 
 
-def _meshes_via_lerobot(mesh_dir: str) -> dict:
-    """The STL path, delegated. Absent lerobot is not an error — just no meshes."""
-    try:
-        from lerobot.utils.urdf_visual_meshes import load_link_visual_meshes_cached
-        return load_link_visual_meshes_cached(mesh_dir) or {}
-    except Exception as e:
-        logger.debug("urdf_visuals: no mesh loader (%s: %s)", type(e).__name__, e)
-        return {}
+def read_stl(path) -> tuple[np.ndarray, np.ndarray]:
+    """(V, F) from a binary or ASCII STL, one vertex per corner (decimate() merges them)."""
+    data = pathlib.Path(path).read_bytes()
+    n = int.from_bytes(data[80:84], "little") if len(data) >= 84 else 0
+    if len(data) == 84 + 50 * n:                       # binary
+        rec = np.frombuffer(data, dtype=np.dtype([("n", "<3f4"), ("v", "<9f4"),
+                                                  ("a", "<u2")]), count=n, offset=84)
+        V = rec["v"].reshape(-1, 3).astype(np.float64)
+    else:                                               # ASCII
+        V = np.array([[float(x) for x in ln.split()[1:4]]
+                      for ln in data.decode("ascii", "ignore").splitlines()
+                      if ln.strip().startswith("vertex")], np.float64)
+    return V, np.arange(len(V)).reshape(-1, 3)
+
+
+def _mesh(vis, geom, base_dir: pathlib.Path):
+    """A ``<mesh>`` visual, read from its STL and placed by the visual's origin."""
+    m = geom.find("mesh")
+    fn = m.get("filename", "").replace("package://", "")
+    p = pathlib.Path(fn) if pathlib.Path(fn).is_absolute() else base_dir / fn
+    if not p.exists() or p.suffix.lower() != ".stl":
+        logger.debug("urdf_visuals: no STL at %s", p)
+        return None
+    V, F = read_stl(p)
+    scale = [float(v) for v in m.get("scale", "1 1 1").split()]
+    return V * np.asarray(scale[:3]), F
 
 
 def link_visuals(urdf_path: str | pathlib.Path, *, mesh_dir: str | None = None,
@@ -219,8 +237,8 @@ def link_visuals(urdf_path: str | pathlib.Path, *, mesh_dir: str | None = None,
                  ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """``{link_name: (V, F)}`` in link-local coordinates, ready to draw.
 
-    Primitives are tessellated here; ``<mesh>`` links are filled in from lerobot's loader
-    when it is available and DECIMATED to ``voxel`` on the way out — pass ``voxel=None``
+    Primitives are tessellated here; ``<mesh>`` STLs are read from ``mesh_dir`` (the
+    URDF's own directory by default) and DECIMATED to ``voxel`` — pass ``voxel=None``
     to keep them dense. Decimation is not optional in practice: the SO-101's raw meshes are
     ~399k triangles against a viewer that redraws at 5 Hz next to a camera stream.
 
@@ -230,7 +248,7 @@ def link_visuals(urdf_path: str | pathlib.Path, *, mesh_dir: str | None = None,
     path = pathlib.Path(urdf_path)
     root = ET.parse(path).getroot()
     out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    wants_mesh = False
+    base_dir = pathlib.Path(mesh_dir) if mesh_dir else path.parent
 
     for link in root.findall("link"):
         name = link.get("name")
@@ -242,9 +260,11 @@ def link_visuals(urdf_path: str | pathlib.Path, *, mesh_dir: str | None = None,
             if geom is None:
                 continue
             if geom.find("mesh") is not None:
-                wants_mesh = True
-                continue
-            prim = _primitive(geom)
+                prim = _mesh(vis, geom, base_dir)
+                if prim is not None and voxel:
+                    prim = decimate(*prim, float(voxel))
+            else:
+                prim = _primitive(geom)
             if prim is None:
                 continue
             V, F = prim
@@ -260,12 +280,4 @@ def link_visuals(urdf_path: str | pathlib.Path, *, mesh_dir: str | None = None,
                 offs.append(k)
             out[name] = (np.vstack(Vs), np.vstack(Fs))
 
-    if wants_mesh:
-        for name, (V, F) in _meshes_via_lerobot(mesh_dir or str(path.parent)).items():
-            V, F = np.asarray(V, np.float64), np.asarray(F, np.int64)
-            if voxel:
-                V, F = decimate(V, F, float(voxel))
-            # A mesh wins over a primitive for the same link: if someone drops the real
-            # vendor URDF in, its meshes are what they wanted drawn.
-            out[name] = (V, F)
     return out

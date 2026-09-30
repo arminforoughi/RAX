@@ -29,6 +29,7 @@ class Detection:
     v: float
     box: tuple[float, float, float, float]
     label: str = ""
+    source: str = "detector"          # or "tracked": held by OpenCV between detections
 
     @property
     def area(self) -> float:

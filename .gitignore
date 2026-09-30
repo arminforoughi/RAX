@@ -109,3 +109,4 @@ examples/*/server.log*
 examples/.server_stdin.txt
 examples/*/handeye_*.json
 examples/server.log*
+examples/server.prev.log*

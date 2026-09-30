@@ -26,6 +26,11 @@ Start-Sleep -Seconds 3
 Get-Servers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 if ($Stop) { 'stopped'; return }
 
+# keep the last run's log: a restart must not erase why that run failed
+foreach ($f in @($log, "$log.err")) {
+  if (Test-Path $f) { Copy-Item $f ($f -replace 'server\.log', 'server.prev.log') -Force }
+}
+
 if (-not $Port) { $Port = if ($Arm -eq 'x250') { 'COM5' } else { 'COM4' } }
 
 # lerobot asks on stdin whether to reuse the stored calibration; blank lines take the
