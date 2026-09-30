@@ -1,17 +1,17 @@
-"""Keep hold of an object between detections, with plain OpenCV.
+"""Keep hold of objects between detections, with plain OpenCV.
 
 An open-vocabulary detector comes and goes: the same cup scores 0.3 in one frame and
-nothing in the next. :class:`StickyTarget` wraps any :class:`Target`. Every time the
-detector finds the object it learns two cheap appearance features from the box:
+nothing in the next. :class:`StickyTarget` wraps any :class:`Target` and keeps ONE lock
+per label, the way the old mission server kept one tracker per label.
 
-* a hue-saturation histogram (what colour it is), and
-* a grey template (what it looks like).
-
-When the detector misses, it searches around the last box (the arm moves between
-looks): template matching over a range of sizes gives the position, and the colour
-histogram has to agree before the match is believed. A sure match refreshes the
-template, so the look can change as the hand closes in; the colour never relearns. A lock is dropped after ``hold_s`` without a fresh detection, so a tracker can
-bridge flicker but never replaces the detector for long.
+Every time the detector finds a label it (re)learns two cheap appearance features from
+that box: a hue-saturation histogram (what colour it is) and a grey template (what it
+looks like). When the detector misses that label, it searches around the last box (the
+arm moves between looks): template matching over a range of sizes gives the position,
+and the colour histogram has to agree before the match is believed. A sure match
+refreshes the template, so the look can follow the hand closing in; the colour never
+relearns. A lock is dropped after ``hold_s`` (the old server's 4 s) without a fresh
+detection, so tracking bridges flicker but never replaces the detector for long.
 """
 
 from __future__ import annotations
@@ -37,19 +37,28 @@ def _clip(box, w, h):
     return (max(0.0, x0), max(0.0, y0), min(float(w), x1), min(float(h), y1))
 
 
-class StickyTarget(Target):
-    """``inner``'s detections, plus an OpenCV track of the chosen one when it drops out."""
+class _Lock:
+    """What one label looked like when last detected, and where it is now."""
 
-    def __init__(self, inner: Target, hold_s: float = 3.0, min_ncc: float = 0.5,
+    def __init__(self, bgr, box, label):
+        x0, y0, x1, y1 = (int(round(v)) for v in box)
+        self.box, self.label, self.t = box, label, time.time()
+        self.hist = _hist(bgr, box)
+        self.tmpl = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+
+
+class StickyTarget(Target):
+    """``inner``'s detections, plus an OpenCV hold on each label while it drops out."""
+
+    def __init__(self, inner: Target, hold_s: float = 4.0, min_ncc: float = 0.5,
                  min_colour: float = 0.5, search_px: int = 120):
         self.inner = inner
         self.name, self.grasp_z, self.open_pct = inner.name, inner.grasp_z, inner.open_pct
         self.max_grip_pct = inner.max_grip_pct
         self.hold_s, self.min_ncc, self.min_colour = hold_s, min_ncc, min_colour
         self.search_px = search_px
-        self._box = self._label = self._hist = self._tmpl = None
-        self._t = 0.0
-        self._lock = threading.Lock()            # the live view and the pick share it
+        self._locks: dict[str, _Lock] = {}
+        self._mutex = threading.Lock()           # the live view and the pick share it
 
     def __getattr__(self, name):                 # prompt, colours, ... of the inner target
         return getattr(self.__dict__["inner"], name)
@@ -58,47 +67,46 @@ class StickyTarget(Target):
         return self.inner.axis(bgr, det)
 
     def detect(self, bgr):
-        with self._lock:
+        with self._mutex:
             return self._detect(bgr)
 
     def _detect(self, bgr):
         dets = self.inner.detect(bgr)
-        if dets:
-            self._learn(bgr, self._choose(dets))
-            return dets
-        d = self._track(bgr)
-        return [d] if d is not None else []
+        h, w = bgr.shape[:2]
+        for label in {d.label for d in dets}:    # relearn each label from its best box
+            d = self._choose([x for x in dets if x.label == label])
+            box = _clip(d.box, w, h)
+            if box[2] - box[0] >= 8 and box[3] - box[1] >= 8:
+                self._locks[label] = _Lock(bgr, box, label)
+        seen = {d.label for d in dets}
+        for label, lock in list(self._locks.items()):
+            if label in seen:
+                continue
+            if time.time() - lock.t > self.hold_s:
+                del self._locks[label]               # held long enough: let it go
+                continue
+            d = self._track(bgr, lock)
+            if d is not None:
+                dets.append(d)
+        return dets
 
-    # ---- learning and tracking ------------------------------------------------------
     def _choose(self, dets):
-        if self._box is None:
+        lock = self._locks.get(dets[0].label)
+        if lock is None:
             return max(dets, key=lambda d: d.area)
-        cx, cy = (self._box[0] + self._box[2]) / 2, (self._box[1] + self._box[3]) / 2
+        cx, cy = (lock.box[0] + lock.box[2]) / 2, (lock.box[1] + lock.box[3]) / 2
         return min(dets, key=lambda d: (d.u - cx) ** 2 + (d.v - cy) ** 2)
 
-    def _learn(self, bgr, d):
+    def _track(self, bgr, lock: _Lock):
         h, w = bgr.shape[:2]
-        box = _clip(d.box, w, h)
-        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
-            return
-        x0, y0, x1, y1 = (int(round(v)) for v in box)
-        self._box, self._label, self._t = box, d.label, time.time()
-        self._hist = _hist(bgr, box)
-        self._tmpl = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-
-    def _track(self, bgr):
-        if self._box is None or time.time() - self._t > self.hold_s:
-            return None
-        h, w = bgr.shape[:2]
-        x0, y0, x1, y1 = self._box
-        # the arm moves between looks: search well around the box, at a range of sizes
-        m = max(self.search_px, x1 - x0, y1 - y0)
+        x0, y0, x1, y1 = lock.box
+        m = max(self.search_px, x1 - x0, y1 - y0)        # the arm moves between looks
         sx0, sy0 = int(max(0, x0 - m)), int(max(0, y0 - m))
         sx1, sy1 = int(min(w, x1 + m)), int(min(h, y1 + m))
         grey = cv2.cvtColor(bgr[sy0:sy1, sx0:sx1], cv2.COLOR_BGR2GRAY)
         best = None
         for s in (0.7, 0.85, 1.0, 1.18, 1.4):
-            t = cv2.resize(self._tmpl, None, fx=s, fy=s)
+            t = cv2.resize(lock.tmpl, None, fx=s, fy=s)
             if t.shape[0] >= grey.shape[0] or t.shape[1] >= grey.shape[1] or min(t.shape) < 6:
                 continue
             _, ncc, _, (px, py) = cv2.minMaxLoc(cv2.matchTemplate(grey, t, cv2.TM_CCOEFF_NORMED))
@@ -108,12 +116,12 @@ class StickyTarget(Target):
             return None
         ncc, bx, by, tw, th = best
         box = _clip((bx, by, bx + tw, by + th), w, h)
-        colour = cv2.compareHist(self._hist, _hist(bgr, box), cv2.HISTCMP_CORREL)
-        if colour < self.min_colour:
+        if cv2.compareHist(lock.hist, _hist(bgr, box), cv2.HISTCMP_CORREL) < self.min_colour:
             return None
-        self._box = box
-        if ncc > 0.8:                             # a sure match: follow its changing look
+        lock.box = box
+        if ncc > 0.8:                                    # a sure match: follow its look
             x0, y0, x1, y1 = (int(round(v)) for v in box)
-            self._tmpl = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        return Detection((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, box, self._label,
+            lock.tmpl = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        return Detection((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, box, lock.label,
                          source="tracked")
+

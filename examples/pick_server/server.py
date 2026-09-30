@@ -61,13 +61,22 @@ class PickApp(App):
 
     # ---- detection runs on its own thread: the model is slower than the camera ------
     def detect_loop(self):
+        import traceback
+        n, t_log = 0, 0.0
         while True:
             rgb = self.arm.rgb
             if rgb is not None:
                 try:
+                    t0 = time.time()
                     self.dets = self.target.detect(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                    n += 1
+                    if n == 1 or time.time() - t_log > 60:
+                        t_log = time.time()
+                        self.say(f"detector: '{self.target.prompt}' {time.time() - t0:.2f}s, "
+                                 f"{len(self.dets)} in view")
                 except Exception as e:
                     self.say(f"detector: {type(e).__name__}: {e}")
+                    print(traceback.format_exc(), flush=True)
                     time.sleep(5.0)
             time.sleep(0.4)
 
@@ -76,10 +85,12 @@ class PickApp(App):
         ju, jv = (int(v) for v in self.arm.jaw_uv)
         for d in self.dets:
             x0, y0, x1, y1 = (int(v) for v in d.box)
-            held = d.source == "tracked"            # orange: OpenCV is holding the lock
-            col = (0, 160, 255) if held else (60, 220, 90)
+            # green: YOLO; magenta: found by its colour; orange: held by the tracker
+            col = {"tracked": (0, 160, 255), "colour": (255, 80, 220)}.get(d.source,
+                                                                         (60, 220, 90))
+            tag = {"tracked": " (held)", "colour": " (colour)"}.get(d.source, "")
             cv2.rectangle(img, (x0, y0), (x1, y1), col, 2)
-            cv2.putText(img, d.label + (" (held)" if held else ""), (x0, y0 - 5),
+            cv2.putText(img, d.label + tag, (x0, y0 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
             cv2.line(img, (int(d.u), int(d.v)), (ju, jv), (0, 255, 255), 1, cv2.LINE_AA)
 
@@ -204,7 +215,9 @@ class PickApp(App):
                            gripper=round(arm.gripper_pct, 1),
                            jog_xyz=[round(float(v), 3) for v in tip],
                            pitch=round(pitch_of(arm, q)), carry=self.held,
-                           relaxed=arm.relaxed, has_handeye=arm.has_handeye, log=log)
+                           relaxed=arm.relaxed, has_handeye=arm.has_handeye, log=log,
+                           detections=[{"label": d.label, "u": round(d.u), "v": round(d.v),
+                                        "source": d.source} for d in self.dets])
 
         @app.route("/geom")
         def r_geom():

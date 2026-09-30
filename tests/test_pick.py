@@ -143,3 +143,42 @@ def test_sticky_target_holds_the_object_when_the_detector_drops_out():
         t, d = truth.detect(img)[0], sticky.detect(img)
         assert d and d[0].source == "tracked"
         assert math.hypot(d[0].u - t.u, d[0].v - t.v) < 12
+
+
+def test_sticky_target_holds_every_label_not_just_one():
+    from rax.pick import StickyTarget
+
+    class Never(ColourTarget):
+        def detect(self, bgr):
+            return []
+
+    arm = SimArm([Tube(0.24, 0.07, 30, "green"), Tube(0.27, 0.0, 120, "red")])
+    sticky = StickyTarget(ColourTarget())
+    assert {d.label for d in sticky.detect(arm.frame())} == {"green", "red"}
+    sticky.inner = Never()
+    held = sticky.detect(arm.frame())
+    assert {d.label for d in held} == {"green", "red"}
+    assert all(d.source == "tracked" for d in held)
+
+
+def test_colour_gate_rejects_a_box_of_the_wrong_colour():
+    from rax.pick.targets import colour_fraction
+    img = np.zeros((100, 200, 3), np.uint8)
+    img[:, :100] = (40, 40, 200)                  # red (BGR)
+    img[:, 100:] = (40, 200, 40)                  # green
+    assert colour_fraction(img, (0, 0, 100, 100), "red cube") > 0.9
+    assert colour_fraction(img, (100, 0, 200, 100), "red cube") < 0.05
+    assert colour_fraction(img, (100, 0, 200, 100), "cup") == 1.0      # no colour named
+    assert colour_fraction(img, (100, 0, 200, 100), "bored cat") == 1.0  # not a word
+
+
+def test_colour_blob_finds_a_coloured_block_the_detector_missed():
+    from rax.pick.targets import colour_blob
+    img = np.full((240, 320, 3), (150, 170, 190), np.uint8)     # pale wood
+    cv2.rectangle(img, (40, 60), (110, 130), (40, 40, 200), -1)  # red block
+    cv2.rectangle(img, (200, 80), (260, 140), (40, 180, 40), -1)  # green block
+    x0, y0, x1, y1 = colour_blob(img, "red cube")
+    assert abs(x0 - 40) <= 3 and abs(x1 - 110) <= 3
+    assert colour_blob(img, "green cube")[0] >= 195
+    assert colour_blob(img, "blue cube") is None                 # nothing blue there
+    assert colour_blob(img, "cup") is None                       # no colour: no fallback
