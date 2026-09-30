@@ -25,15 +25,17 @@ def place(arm: Arm, xy, release_z: float, pitch: float, roll: float,
     (x, y) the object was released at.
     """
     hover_z = release_z + 0.05 if hover_z is None else hover_z
+    pitch = _usable_pitch(arm, xy, (hover_z, release_z), pitch, roll)
 
-    # UP, TURN, OVER, DOWN: the object passes above everything on the table
-    carry_z = max(carry_z, hover_z)
+    # UP, TURN, OVER, DOWN: the object passes above everything on the table, as high
+    # as the arm can hold this hand angle here (straight down, it cannot go very high)
     tip = arm.tip(arm.joints())
-    move_to(arm, (tip[0], tip[1], carry_z), pitch, roll, "the carry height",
-            speed=1.5, settle=0.1, tol=0.02)
+    lift = _highest(arm, tip[:2], max(carry_z, hover_z), hover_z, pitch, roll)
+    if lift is not None:
+        arm.move(lift, speed=1.5, settle=0.1)
     q = arm.joints()
     arm.move(with_pan(arm, q, pan_for_bearing(arm, q, bearing_of(xy))), speed=1.5, settle=0.1)
-    high = solve(arm, (xy[0], xy[1], carry_z), pitch, roll, tol=0.02)
+    high = _highest(arm, xy, max(carry_z, hover_z), hover_z, pitch, roll)
     if high is not None:
         arm.move(high, speed=1.5, settle=0.1)
     over = move_to(arm, (xy[0], xy[1], hover_z), pitch, roll, "the hover", speed=1.2)
@@ -68,9 +70,35 @@ def place(arm: Arm, xy, release_z: float, pitch: float, roll: float,
             speed=0.8, settle=0.3)
     arm.release()
     time.sleep(0.5)
-    move_to(arm, (aim[0], aim[1], hover_z + 0.03), pitch, roll, "back up",
-            speed=1.4, settle=0.1, tol=0.03)
+    up = _highest(arm, aim, hover_z + 0.03, release_z + 0.01, pitch, roll)  # back up,
+    if up is not None:                                   # as far as this angle allows
+        arm.move(up, speed=1.4, settle=0.1)
     return float(aim[0]), float(aim[1])
+
+
+def _usable_pitch(arm: Arm, xy, heights, pitch: float, roll: float) -> float:
+    """The hand angle nearest ``pitch`` (within 40deg) that reaches ``xy`` at every one of
+    ``heights``. Far out, the arm cannot point straight down; it tilts, like the pick."""
+    for d in (0, -5, 5, -10, 10, -15, 15, -20, 20, -25, 25, -30, 30, -35, 35, -40, 40):
+        p = pitch + d
+        if all(solve(arm, (xy[0], xy[1], z), p, roll, tol=0.01) is not None for z in heights):
+            if d:
+                arm.log(f"        placing at {p:.0f}deg: {pitch:.0f} does not reach there")
+            return float(p)
+    raise RuntimeError(f"cannot reach ({xy[0]*100:+.1f},{xy[1]*100:+.1f})cm at any "
+                       f"angle near {pitch:.0f}deg")
+
+
+def _highest(arm: Arm, xy, z_top: float, z_min: float, pitch: float, roll: float):
+    """Joints for the highest fingertip height in [z_min, z_top] above ``xy`` that holds
+    ``pitch``, or None."""
+    z = z_top
+    while z >= z_min - 1e-6:
+        q = solve(arm, (xy[0], xy[1], z), pitch, roll, tol=0.01)
+        if q is not None:
+            return q
+        z -= 0.02
+    return None
 
 
 @dataclass
