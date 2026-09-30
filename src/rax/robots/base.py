@@ -101,6 +101,7 @@ class WristCameraArm:
         self.gripper_pct = 0.0
         self.min_bearing_deg: float | None = None   # a guardrail, set by the caller
         self.pace = 1.0                    # speed multiplier on every move
+        self.relaxed = False
 
     # ---- hardware: a subclass implements these ------------------------------------
     def _connect(self) -> None:
@@ -118,6 +119,10 @@ class WristCameraArm:
 
     def _gripper_current(self):
         return None
+
+    def _torque(self, on: bool) -> None:
+        """Energise or release every servo, holding the present pose (no snap)."""
+        raise NotImplementedError
 
     # ---- lifecycle --------------------------------------------------------------
     def connect(self) -> None:
@@ -145,7 +150,21 @@ class WristCameraArm:
             self.rgb = np.asarray(rgb)
         return self.q.copy()
 
+    def relax(self) -> None:
+        """Fold home, then cut torque so nothing is held and nothing heats up.
+        The next motion wakes the arm."""
+        self.move(self.home, speed=1.0, settle=0.4)
+        with self.io_lock:
+            self._torque(False)
+        self.relaxed = True
+        self.log("arm relaxed: torque off")
+
     def send(self, q, gripper=None) -> None:
+        if self.relaxed:
+            with self.io_lock:
+                self._torque(True)
+            self.relaxed = False
+            self.log("arm awake")
         with self.io_lock:
             self._write(np.asarray(q, float), self.gripper_pct if gripper is None else gripper)
 

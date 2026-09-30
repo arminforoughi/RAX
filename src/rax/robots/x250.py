@@ -81,6 +81,13 @@ class X250(WristCameraArm):
         if self.cap is not None:
             self.cap.release()
 
+    def _torque(self, on: bool) -> None:
+        present = self.bus.read_positions(MOTOR_IDS.values())
+        for i in MOTOR_IDS.values():
+            if on:
+                self.bus.write(i, "goal_position", present[i])
+            self.bus.write(i, "torque_enable", 1 if on else 0)
+
     def _read(self):
         import cv2
         raw = self.bus.read_positions(MOTOR_IDS.values())

@@ -109,6 +109,15 @@ class So101(WristCameraArm):
                     raise
                 self._reopen_bus()
 
+    def _torque(self, on: bool) -> None:
+        if on:
+            obs = self.robot.get_observation()
+            hold = {k: v for k, v in obs.items() if k.endswith(".pos")}
+            self.robot.bus.enable_torque()
+            self.robot.send_action(hold)          # hold where it is, do not snap
+        else:
+            self.robot.bus.disable_torque()
+
     def _gripper_current(self):
         try:
             with self.io_lock:

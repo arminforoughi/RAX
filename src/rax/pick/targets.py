@@ -147,10 +147,11 @@ class PromptTarget(Target):
         if self._detector is None:
             from ultralytics import YOLOWorld  # pip install "rax[detect]"
             self._detector = YOLOWorld(self.model_path)
-            self._detector.set_classes([self.prompt])
+            # "red cube, green cube" is two classes; each detection keeps its own name
+            self._detector.set_classes([c.strip() for c in self.prompt.split(",") if c.strip()])
         out = []
         for r in self._detector.predict(bgr, conf=self.min_confidence, verbose=False):
-            for x0, y0, x1, y1 in r.boxes.xyxy.tolist():
+            for (x0, y0, x1, y1), c in zip(r.boxes.xyxy.tolist(), r.boxes.cls.tolist()):
                 out.append(Detection((x0 + x1) / 2, (y0 + y1) / 2, (x0, y0, x1, y1),
-                                     self.prompt))
+                                     r.names[int(c)]))
         return out

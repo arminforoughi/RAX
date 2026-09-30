@@ -1,6 +1,7 @@
 """Tube sorting: map the mat, pick each tube, stand it up in its rack.
 
-    python examples/tube_sorting/server.py --arm so101 --port COM4    (UI on :8486)
+A UI on the shared rig (examples/rig_app.py), served on :8486 by examples/server.py
+next to the general pick UI on :8484.
 
 The pick and the place are the generic ones in :mod:`rax.pick`; this file adds what is
 specific to this bench: which caps count, where the racks are (from an overhead
@@ -20,17 +21,15 @@ import time
 
 import cv2
 import numpy as np
-import requests
 from flask import Response, jsonify, request, send_from_directory
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from rig_app import RigApp, arm_from_args  # noqa: E402
+from rig_app import App, overhead_frame  # noqa: E402
 
 from rax.perception.tube_caps import find_caps  # noqa: E402
 from rax.pick import ColourTarget, PickConfig, pick, place, scan  # noqa: E402
 from rax.pick.arm import bearing_of, move_to, solve  # noqa: E402
 from rax.pick.episodes import EpisodeLog  # noqa: E402
-from rax.robots.urdf_visuals import link_visuals  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI = os.path.join(HERE, "ui")
@@ -62,9 +61,6 @@ SCAN_TILTS_DEG = (0.0, 25.0)
 MAP_MAX_Y_PX = 330.0
 
 # ---- the overhead camera and the racks ----------------------------------------------
-CAMSURV_URL = os.environ.get("RAX_CAMSURV_URL", "http://127.0.0.1:5000")
-CAMSURV_PASSWORD = os.environ.get("RAX_CAMSURV_PASSWORD", "")
-CAMSURV_STREAM = os.environ.get("RAX_CAMSURV_STREAM", "0")
 TOP_ROI = (164, 80, 1017, 560)   # the work area, shown zoomed on /topstream
 
 #: Top camera pixel <-> table, a similarity fitted by eye off two fingertip positions
@@ -131,12 +127,6 @@ CARRY_Z_M = 0.25
 #: Pace of everything but the pick (scan, carry, drop, going home).
 FAST = 1.35
 
-#: The moving jaw is not in the FK chain: URDF joint `gripper`, parent gripper_link.
-_c, _s = math.cos(1.5708), math.sin(1.5708)
-JAW_T = np.array([[1, 0, 0, 0.0202], [0, _c, -_s, 0.0188], [0, _s, _c, -0.0234],
-                  [0, 0, 0, 1.0]])
-
-
 def in_rack_zone(xy, margin=RACK_EXCLUDE_M):
     x, y = xy
     for r in TOP_RACKS:
@@ -162,27 +152,6 @@ def tag_of(e: Exception) -> str:
     return "error"
 
 
-def overhead_frame():
-    """One frame from the overhead camera, or None."""
-    try:
-        s = requests.Session()
-        s.post(CAMSURV_URL + "/", data={"password": CAMSURV_PASSWORD}, timeout=4)
-        r = s.get(CAMSURV_URL + "/stream/" + CAMSURV_STREAM, stream=True, timeout=8)
-        buf = b""
-        for chunk in r.iter_content(4096):
-            buf += chunk
-            a, b = buf.find(b"\xff\xd8"), buf.find(b"\xff\xd9", 2)
-            if a != -1 and b != -1:
-                r.close()
-                img = cv2.imdecode(np.frombuffer(buf[a:b + 2], np.uint8), cv2.IMREAD_COLOR)
-                # a camera that lost its USB link streams black: that is no view at all
-                return None if img is None or float(img.mean()) < 5.0 else img
-        r.close()
-    except Exception:
-        pass
-    return None
-
-
 def top_caps(colour):
     """Caps of this colour in the top view, as [(u, v)], or None without a frame."""
     img = overhead_frame()
@@ -194,11 +163,14 @@ def top_caps(colour):
                                max_area=900, gates=TOP_CAP_GATES)]
 
 
-class TubeApp(RigApp):
+class TubeApp(App):
     """The state of one sorting session: the arm, the map, the racks and the results."""
 
-    def __init__(self, arm):
-        super().__init__(arm, "tube_sorting")
+    name = "tube"
+
+    def __init__(self, rig):
+        super().__init__(rig)
+        arm = self.arm
         self.held = False
         self.used_holes: dict[str, list[int]] = {}
         self.tube_map: dict[int, dict] = {}
@@ -207,6 +179,17 @@ class TubeApp(RigApp):
         self.episodes = EpisodeLog(os.path.join(HERE, "episodes.jsonl"),
                                    probe=lambda: {"joints": [round(float(v), 1) for v in arm.q]},
                                    note=self.say)
+        add_routes(self)
+
+    def start_job(self, target):
+        """Tube jobs move at the tube pace (the pick inside keeps its own)."""
+        def run():
+            self.arm.pace = FAST
+            try:
+                target()
+            finally:
+                self.arm.pace = 1.0
+        return super().start_job(run)
 
     def holding(self):
         return self.arm.gripper_pct > GRIP_BLOCKED_PCT
@@ -241,7 +224,7 @@ class TubeApp(RigApp):
     # ---- the map --------------------------------------------------------------------
     def tubes(self):
         now, f = time.time(), self.focus
-        with self.lock:
+        with self.rig.lock:
             return [{"id": e["id"], "colour": e["colour"], "x": round(e["x"], 4),
                      "y": round(e["y"], 4), "z": 0.0, "held": False, "rack": None,
                      "hole": None, "source": "mapped", "d": TUBE_D_M, "l": TUBE_L_M,
@@ -256,7 +239,7 @@ class TubeApp(RigApp):
         found = scan(self.arm, TUBE, SCAN_BEARINGS_DEG, SCAN_TILTS_DEG, max_v=MAP_MAX_Y_PX,
                      avoid=in_rack_zone,
                      reach=(self.arm.p.reach_min_m, self.arm.p.reach_max_m))
-        with self.lock:
+        with self.rig.lock:
             self.tube_map = {i: {"id": i, "colour": f.label, "x": f.x, "y": f.y, "n": f.n,
                                  "t": time.time(), "picked": False}
                              for i, f in enumerate(found, 1)}
@@ -380,11 +363,11 @@ class TubeApp(RigApp):
                 pass
         self.focus.update(colour=None, xy=None)
         self.episodes.end(ep, ok, f"[{tag}] {detail}")
-        with self.lock:
-            self.results.append({"t": time.strftime("%H:%M:%S"), "colour": colour,
+        with self.rig.lock:
+            self.rig.results.append({"t": time.strftime("%H:%M:%S"), "colour": colour,
                                  "ok": bool(ok), "tag": tag, "detail": str(detail)[:160],
                                  "x": round(xy[0], 3), "y": round(xy[1], 3)})
-            del self.results[:-60]
+            del self.rig.results[:-60]
             if ok and t["id"] in self.tube_map:
                 self.tube_map[t["id"]]["picked"] = True
         self.say(f"[{tag.upper()}] {colour}: {detail}")
@@ -418,47 +401,26 @@ class TubeApp(RigApp):
 
 def add_routes(tube: TubeApp) -> None:
     app, arm = tube.app, tube.arm
-    urdf = [None]
-
-    @app.route("/urdf")
-    def r_urdf():
-        if urdf[0] is None:
-            urdf[0] = [{"name": n, "v": [round(float(x), 4) for x in V.ravel()],
-                        "f": [int(i) for i in F.ravel()]}
-                       for n, (V, F) in link_visuals(arm.p.urdf_path,
-                                                     mesh_dir=arm.p.mesh_path).items()]
-        return jsonify(links=urdf[0], arm=arm.p.name)
-
     @app.route("/geom")
     def r_geom():
-        q = arm.q.copy()
-        qr = q.copy()
-        qr[arm.roll] += arm.p.gripper.render_offset_deg       # display only
-        chain = dict(arm.kin.get_link_transforms_chain(qr))
-        xf = {n: [round(float(v), 5) for v in np.asarray(T, float).ravel()]
-              for n, T in chain.items()}
-        if "gripper_link" in chain:
-            xf["moving_jaw_so101_v1_link"] = [
-                round(float(v), 5) for v in (np.asarray(chain["gripper_link"]) @ JAW_T).ravel()]
         g = arm.p.gripper
-        return jsonify(arm=arm.p.name, simulated=False, xf=xf,
-                       tip=[round(float(v), 4) for v in arm.tip(q)],
-                       opening=float(np.clip((arm.gripper_pct - g.closed_pct)
-                                             / (g.open_pct - g.closed_pct), 0, 1)),
-                       tubes=tube.tubes(), racks=tube.racks(), caps=tube.caps,
-                       phase=tube.phase_name, note=tube.note,
-                       joints=[round(float(v), 2) for v in q], joint_names=arm.motors)
+        return jsonify(tube.geom(dict(
+            simulated=False, tubes=tube.tubes(), racks=tube.racks(), caps=tube.caps,
+            phase=tube.rig.phase_name, note=tube.rig.note,
+            opening=float(np.clip((arm.gripper_pct - g.closed_pct)
+                                  / (g.open_pct - g.closed_pct), 0, 1)))))
 
     @app.route("/state")
     def r_state():
-        with tube.lock:
-            res = list(tube.results)
-            log = list(tube.log)[-150:]
+        rig = tube.rig
+        with rig.lock:
+            res = list(rig.results)
+            log = list(rig.log)[-150:]
         tags = {}
         for r in res:
             tags[r["tag"]] = tags.get(r["tag"], 0) + 1
-        return jsonify(arm=arm.p.name, simulated=False, phase=tube.phase_name, note=tube.note,
-                       running=tube.running, held=tube.held, grip_detail="",
+        return jsonify(arm=arm.p.name, simulated=False, phase=rig.phase_name, note=rig.note,
+                       running=rig.running, held=tube.held, grip_detail="",
                        gripper=round(arm.gripper_pct, 1), log=log,
                        episodes=tube.episodes.tally("tube_pick"), target=None, dest=None,
                        results=res[-30:], tags=tags)
@@ -540,8 +502,9 @@ def add_routes(tube: TubeApp) -> None:
 
     @app.route("/clearmap", methods=["POST"])
     def r_clearmap():
-        with tube.lock:
-            tube.tube_map, tube.used_holes, tube.results = {}, {}, []
+        with tube.rig.lock:
+            tube.tube_map, tube.used_holes = {}, {}
+            tube.rig.results.clear()
         tube.say("map, used holes and results cleared")
         return jsonify(ok=True)
 
@@ -555,15 +518,3 @@ def add_routes(tube: TubeApp) -> None:
         resp = send_from_directory(UI, "tube.html")
         resp.headers["Cache-Control"] = "no-store"
         return resp
-
-
-def main():
-    a, arm = arm_from_args(__doc__.split("\n\n")[0], 8486, HERE)
-    arm.pace = FAST
-    tube = TubeApp(arm)
-    add_routes(tube)
-    tube.run(a.http)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,0 +1,440 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAX pick</title><style>
+/* One palette, on a scale, instead of six hand-picked greys. */
+:root{
+  --bg:#0b0f16; --bg-2:#111826; --panel:#131b2a; --panel-2:#18212f;
+  --line:#22304a; --line-hi:#2e4260;
+  --ink:#e8eef7; --ink-dim:#8da2bd; --ink-faint:#5d708c;
+  --ok:#34d399; --bad:#fb7185; --warn:#fbbf24; --info:#4cc9f0; --accent:#6366f1;
+  --mono:ui-monospace,"SF Mono",Consolas,monospace;
+  --r:12px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:
+    radial-gradient(90vw 60vh at 12% -10%,#16203a 0,transparent 60%),
+    radial-gradient(70vw 50vh at 95% 0,#12243a 0,transparent 55%),var(--bg);
+  color:var(--ink);font:14.5px/1.55 ui-rounded,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+main{max-width:1320px;margin:0 auto;padding:20px;display:grid;
+  grid-template-columns:minmax(0,2fr) minmax(320px,1fr);gap:16px;align-items:start}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+
+h1{font-size:15px;font-weight:700;margin:0 0 6px;grid-column:1/-1;letter-spacing:-.2px;
+  display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+h1::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--ok);
+  box-shadow:0 0 0 4px rgba(52,211,153,.16)}
+h1 .tail{color:var(--ink-dim);font-weight:400;font-size:12px;margin-left:0;
+  font-family:var(--mono)}
+
+.cams{display:flex;flex-direction:column;gap:14px;min-width:0}
+img{width:100%;border:1px solid var(--line);border-radius:var(--r);background:#000;display:block}
+.lbl{font-size:10.5px;color:var(--ink-dim);letter-spacing:.12em;text-transform:uppercase;
+  margin:0 0 6px;font-family:var(--mono);font-weight:600}
+
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  border:1px solid var(--line);border-radius:var(--r);padding:14px;
+  box-shadow:0 1px 0 rgba(255,255,255,.03) inset,0 10px 30px rgba(0,0,0,.28)}
+
+.phase{font:700 19px/1.2 var(--mono);color:var(--ok);letter-spacing:-.3px}
+.phase.bad{color:var(--bad)}
+.detail{color:var(--ink-dim);font-size:12.5px;min-height:18px;margin:5px 0 12px}
+
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+td{padding:5px 7px;border-bottom:1px solid var(--line);color:var(--ink-dim)}
+td+td{color:var(--ink);text-align:right;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:0}
+
+.btns{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+button{flex:1;min-width:88px;padding:10px 12px;border:1px solid transparent;
+  border-radius:9px;font:600 12.5px/1 inherit;cursor:pointer;color:var(--ink);
+  background:var(--bg-2);transition:filter .12s,transform .07s}
+button:hover{filter:brightness(1.18)}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:default;transform:none}
+.dim{background:var(--bg-2);border-color:var(--line-hi);color:var(--ink-dim)}
+#b-start{background:linear-gradient(140deg,var(--ok),#0e9f6e);color:#04241a}
+#b-stop{background:linear-gradient(140deg,var(--bad),#9f1239);color:#fff}
+#b-home{background:var(--bg-2);border-color:var(--line-hi)}
+#b-relax{background:var(--bg-2);border-color:var(--line-hi);color:var(--ink-dim)}
+
+pre{background:#080c13;border:1px solid var(--line);border-radius:var(--r);padding:11px;
+  font:11.5px/1.6 var(--mono);height:250px;overflow-y:auto;white-space:pre-wrap;
+  margin:13px 0 0;color:var(--ink-dim)}
+pre::-webkit-scrollbar{width:9px}
+pre::-webkit-scrollbar-thumb{background:var(--line-hi);border-radius:9px}
+
+.jog{margin-top:15px}
+#jogmsg{color:var(--info);font-family:var(--mono);font-size:11px;margin-left:8px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:7px}
+.pad .j{padding:14px 0;background:var(--bg-2);color:var(--ink);
+  border:1px solid var(--line-hi);border-radius:9px;font:600 13.5px inherit;
+  cursor:pointer;touch-action:manipulation;user-select:none;flex:none}
+.pad .j:active{background:var(--accent);border-color:var(--accent)}
+.pad .g{background:#14332a;border-color:#1f5943}
+.stp{grid-column:1/-1;display:flex;align-items:center;gap:9px;color:var(--ink-dim);
+  font-size:12px;margin-top:5px}
+.stp input{flex:1;accent-color:var(--accent)}
+
+.qbox{margin-top:15px}
+.qrow{display:flex;gap:8px;margin-top:7px;align-items:center;flex-wrap:wrap}
+.qrow input{flex:1;min-width:0;padding:10px 11px;background:#080c13;
+  border:1px solid var(--line-hi);border-radius:9px;color:var(--ink);font:14px inherit}
+.qrow input:focus{outline:0;border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(99,102,241,.22)}
+.qrow input[type=number]{max-width:92px;font-family:var(--mono)}
+.qrow label{color:var(--ink-dim);font-size:12px;white-space:nowrap;min-width:72px}
+.qrow button{flex:0 0 auto;padding:10px 18px;
+  background:linear-gradient(140deg,var(--accent),#4338ca);color:#fff}
+
+.sticks{display:flex;gap:22px;justify-content:center;align-items:center;
+  margin:10px 0 18px;flex-wrap:wrap}
+.stick{position:relative;width:118px;height:118px;border-radius:50%;flex:0 0 auto;
+  background:radial-gradient(circle at 50% 38%,#1d2941,#0c1220 74%);
+  border:1px solid var(--line-hi);touch-action:none;user-select:none;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 22px rgba(0,0,0,.36),0 1px 0 rgba(255,255,255,.05) inset}
+.stick::before{content:"";position:absolute;inset:0;border-radius:50%;opacity:.5;
+  background:linear-gradient(var(--line),var(--line)) center/1px 54% no-repeat,
+             linear-gradient(var(--line),var(--line)) center/54% 1px no-repeat}
+.stick.vert{border-radius:32px;width:76px}
+.stick.vert::before{background:linear-gradient(var(--line),var(--line)) center/1px 54% no-repeat}
+/* The nub is centred BY FLEX LAYOUT, never by transform: joystick.js drives
+   `transform` with the stick deflection in PIXELS, so a centring transform here
+   would be overwritten. */
+.nub{width:46px;height:46px;border-radius:50%;pointer-events:none;flex:0 0 auto;
+  background:linear-gradient(145deg,var(--info),var(--accent));
+  border:1px solid rgba(255,255,255,.18);box-shadow:0 4px 14px rgba(0,0,0,.55)}
+.stick.vert .nub{width:44px;height:32px;border-radius:13px}
+.sl{position:absolute;bottom:-16px;left:50%;transform:translateX(-50%);white-space:nowrap;
+  font:600 9px var(--mono);letter-spacing:.5px;color:var(--ink-dim);text-transform:uppercase}
+
+.obj{color:var(--info)}
+#placehint{color:var(--warn);font-size:12px;margin-top:5px;font-family:var(--mono)}
+#g-url{font-family:var(--mono);font-size:11.5px;color:var(--info);word-break:break-all}
+a{color:var(--info)}
+
+@media(max-width:760px){
+  main{padding:11px;gap:11px}
+  .panel{display:flex;flex-direction:column}
+  .jog{order:-1;margin-top:0}
+  .cams img{max-height:42vh;object-fit:contain}
+  .phone-hide{display:none}
+  .pad{grid-template-columns:repeat(2,1fr)}
+  .sticks{gap:16px}
+}
+</style></head><body><main>
+<h1>RAX · pick anything<span class="tail" id="armname"></span></h1>
+<div class="cams">
+  <div><p class="lbl">wrist camera</p><img src="/stream" alt="gripper view"></div>
+  <!-- /stream2 PROXIES the room camera and answers 200 with an empty body when that
+       camera is unplugged, so `onerror` never fires and this sat as a black rectangle
+       looking connected. /camstatus probes for a real frame instead. -->
+  <div class="phone-hide" id="roomwrap" style="display:none">
+    <p class="lbl">room camera</p><img id="roomcam" alt="room view"></div>
+  <div class="phone-hide">
+    <p class="lbl">robot + objects 3d · drag to rotate</p>
+    <canvas id="v3d"
+       style="width:100%;height:340px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+  </div>
+  <div class="phone-hide">
+    <p class="lbl">2D map (top-down · base frame) · click a dot / row to go on top</p>
+    <canvas id="v2d"
+       style="width:100%;height:300px;border:1px solid #2b3540;border-radius:6px;background:#0b0f14;display:block;touch-action:none"></canvas>
+    <table id="map2dtab" style="margin-top:6px"><tbody></tbody></table>
+    <div class="btns">
+      <button class="dim" id="b-scan2d" onclick="fetch('/scan2d',{method:'POST'})"
+        style="background:#2e6ea5;color:#fff">Scan → 2D map</button>
+      <button class="dim" onclick="fetch('/clearmap2d',{method:'POST'})">Clear 2D map</button>
+      <button class="dim" id="b-place" onclick="armPlace()"
+        title="Then click the map: an object to stack on, or bare table to drop at">Place held →</button>
+      <button class="dim" id="b-pickplace" onclick="armPickPlace()"
+        title="Pick the queried object, then place it where you click">Pick → Place →</button>
+    </div>
+    <div id="placehint" style="color:#e0b040;font-size:12px;margin-top:4px"></div>
+    <div class="qrow" style="margin-top:6px">
+      <input id="task" type="text" placeholder="task: green on red, blue on green"
+        title="One step per comma: '<object> on <destination>'. Both must be on the map.">
+      <button id="t-run" onclick="runTask()">Run task</button>
+    </div>
+  </div>
+</div>
+<div class="panel">
+  <div class="phase" id="phase">—</div><div class="detail" id="detail"></div>
+  <table><tbody id="rows"></tbody></table>
+  <div class="btns">
+    <button id="b-start" onclick="fetch('/start?grasp='+grasp(),{method:'POST'})" title="Pick the query object in view">Start</button>
+    <button id="b-stop" onclick="fetch('/stop',{method:'POST'})">Stop</button>
+    <button id="b-home" onclick="fetch('/home',{method:'POST'})">Fold home</button>
+    <button id="b-relax" onclick="fetch('/relax',{method:'POST'})"
+      title="Fold home then cut servo torque so nothing is held. Any motion command wakes it automatically.">Relax</button>
+  </div>
+  <div class="btns">
+    <button id="b-home" onclick="fetch('/reset',{method:'POST'})">Reset pose</button>
+    <button id="b-home" onclick="fetch('/survey',{method:'POST'})"
+      title="Find the query object in view and report where it is, without moving.">Locate only</button>
+    <button id="b-home" onclick="fetch('/calibrate',{method:'POST'})"
+      title="Fit where the wrist camera sits on the gripper: put one object of the query in view first. Needed once per arm (the X250 has none).">Calibrate camera</button>
+  </div>
+  <div class="jog">
+    <p class="lbl">FPV polar · drag sticks, or W/S radius · A/D base · R/F height · T/G tilt · Q/E roll · space grip <span id="jogmsg"></span></p>
+    <div class="sticks">
+      <div class="stick" id="st-move"><div class="nub"></div><span class="sl">reach · base</span></div>
+      <div class="stick vert" id="st-lift"><div class="nub"></div><span class="sl">height</span></div>
+    </div>
+    <div class="pad">
+      <button data-d="up"    class="j">R ▲ higher</button>
+      <button data-d="fwd"   class="j">W radius+</button>
+      <button data-d="down"  class="j">F ▼ lower</button>
+      <button data-d="left"  class="j">A ↺ base</button>
+      <button data-d="back"  class="j">S radius−</button>
+      <button data-d="right" class="j">D ↻ base</button>
+      <button data-d="roll_ccw" class="j">Q ↺ roll</button>
+      <button data-d="roll_cw"  class="j">E ↻ roll</button>
+      <button data-d="pitch_up" class="j">T ⤒ tilt up</button>
+      <button data-d="pitch_dn" class="j">G ⤓ tilt dn</button>
+      <button data-d="open"  class="j g">OPEN gripper</button>
+      <button data-d="close" class="j g">CLOSE gripper</button>
+    </div>
+  </div>
+  <div class="qbox">
+    <p class="lbl">detection query (YOLO-World prompt) · grasp
+      <label style="text-transform:none"><input type="radio" name="grasp" value="top" checked> 90° down</label>
+      <label style="text-transform:none"><input type="radio" name="grasp" value="side"> flat to bed</label></p>
+    <div class="qrow">
+      <input id="query" type="text" placeholder="e.g. red cube, toy block">
+      <button id="q-set" onclick="setQuery()">Set</button>
+    </div>
+    <div class="qrow">
+      <button onclick="preset('coco')" title="All 80 COCO classes — everything YOLO knows">All YOLO classes</button>
+      <button onclick="preset('table')" title="The tabletop subset this arm can actually pick">Tabletop</button>
+      <button onclick="preset('cubes')" title="The original two cubes">Cubes</button>
+    </div>
+  </div>
+  <pre id="log"></pre>
+</div></main>
+<script src="/ui/joystick.js"></script>
+<script src="/ui/viewer3d.js"></script>
+<script>
+function grasp(){ const g=document.querySelector('input[name=grasp]:checked'); return g?g.value:'top'; }
+function jmsg(t){ document.getElementById('jogmsg').textContent = t; }
+// Placement is a two-step gesture: arm it, then click the 2D map to say WHERE.
+// Clicking an object stacks on top of it (release height from its measured
+// height); clicking bare table drops at that (x, y).
+window.placeArm = null;
+function setPlaceUI(){
+  const hint = document.getElementById('placehint');
+  const on = !!window.placeArm;
+  hint.textContent = on ? (window.placeArm==='pickplace'
+      ? 'click the map: where to PUT it after picking (object = stack on it)'
+      : 'click the map: where to PLACE what is held (object = stack on it)') : '';
+  for(const id of ['b-place','b-pickplace']){
+    const b=document.getElementById(id); if(!b) continue;
+    const mine = (id==='b-place'&&window.placeArm==='place')||(id==='b-pickplace'&&window.placeArm==='pickplace');
+    b.style.background = mine ? '#e0b040' : '';
+    b.style.color = mine ? '#111' : '';
+  }
+}
+function armPlace(){ window.placeArm = (window.placeArm==='place')?null:'place'; setPlaceUI(); }
+function armPickPlace(){ window.placeArm = (window.placeArm==='pickplace')?null:'pickplace'; setPlaceUI(); }
+async function runTask(){
+  const q = document.getElementById('task').value.trim();
+  if(!q) return;
+  const b = document.getElementById('t-run'); b.textContent='…'; b.disabled=true;
+  try{
+    const r = await (await fetch('/task?q='+encodeURIComponent(q),{method:'POST'})).json();
+    if(!r.ok) alert('task: '+(r.reason||'failed'));
+  }catch(e){ alert(e.message); }
+  finally{ b.disabled=false; b.textContent='Run task'; }
+}
+document.getElementById('task').addEventListener('keydown', e=>{ if(e.key==='Enter') runTask(); });
+(function(){
+  // Show the room camera only once something is actually behind it, and attach the
+  // stream at that moment rather than at load — pointing an <img> at a dead proxy
+  // leaves a black box that reads as "connected".
+  let roomOn = false;
+  async function pollCams(){
+    try{
+      const c = await (await fetch('/camstatus')).json();
+      if(c.room && !roomOn){
+        roomOn = true;
+        document.getElementById('roomcam').src = '/stream2';
+        document.getElementById('roomwrap').style.display = '';
+      }else if(!c.room && roomOn){
+        roomOn = false;
+        document.getElementById('roomcam').removeAttribute('src');
+        document.getElementById('roomwrap').style.display = 'none';
+      }
+    }catch(e){}
+  }
+  pollCams(); setInterval(pollCams, 15000);
+})();
+async function setQuery(){
+  const q = document.getElementById('query').value.trim();
+  if(!q) return;
+  const btn = document.getElementById('q-set'); btn.textContent = '…';
+  try{ const r = await (await fetch('/setquery?q='+encodeURIComponent(q),{method:'POST'})).json();
+    btn.textContent = r.ok ? 'Set ✓' : 'Set'; }
+  catch(e){ btn.textContent = 'Set'; }
+  setTimeout(()=>document.getElementById('q-set').textContent='Set', 1200);
+}
+document.getElementById('query').addEventListener('keydown', e => { if(e.key==='Enter') setQuery(); });
+async function preset(name){
+  try{ const r = await (await fetch('/preset?name='+name)).json();
+    if(r.q){ document.getElementById('query').value = r.q; setQuery(); } }
+  catch(e){ alert(e.message); }
+}
+async function press(d){ try{ const r = await (await fetch(`/jogpress?dir=${d}`,{method:'POST'})).json();
+  if(!r.ok) jmsg('✗ '+r.reason); else if(r.grip) jmsg(r.grip); }catch(e){} }
+async function release(d){ try{ await fetch(`/jogrelease?dir=${d}`,{method:'POST'}); }catch(e){} }
+const HOLD = new Set(['fwd','back','left','right','up','down','roll_ccw','roll_cw','pitch_up','pitch_dn']);
+// buttons: hold-to-move (pointer events cover mouse + touch)
+document.querySelectorAll('.j').forEach(b => {
+  const d = b.dataset.d;
+  if(HOLD.has(d)){
+    const go = e => { e.preventDefault(); press(d); };
+    const stop = () => release(d);
+    b.addEventListener('pointerdown', go);
+    b.addEventListener('pointerup', stop);
+    b.addEventListener('pointerleave', stop);
+    b.addEventListener('pointercancel', stop);
+  } else {
+    b.addEventListener('click', () => press(d));   // open/close = one shot
+  }
+});
+// ---- phone joysticks: shared with the guest page, see ui/joystick.js -------
+RAXStick.init({move:'st-move', lift:'st-lift'});
+// keyboard: keydown starts, keyup stops; guard OS key-repeat with a held set
+const KEYMAP = {w:'fwd', s:'back', a:'left', d:'right', r:'up', f:'down',
+  q:'roll_ccw', e:'roll_cw', t:'pitch_up', g:'pitch_dn'};
+const down = new Set();
+document.addEventListener('keydown', ev => {
+  if(ev.target.tagName === 'INPUT') return;
+  const k = ev.key.toLowerCase();
+  if(KEYMAP[k]){ ev.preventDefault(); if(!down.has(k)){ down.add(k); press(KEYMAP[k]); } }
+  else if(k === 'o'){ ev.preventDefault(); press('open'); }     // O = open
+  else if(k === 'c'){ ev.preventDefault(); press('close'); }    // C = close
+  else if(ev.key === ' '){ ev.preventDefault(); if(!down.has(' ')){ down.add(' ');
+    press(window._gripOpen ? 'close':'open'); window._gripOpen = !window._gripOpen; } }
+});
+document.addEventListener('keyup', ev => {
+  const k = ev.key.toLowerCase();
+  if(KEYMAP[k]){ down.delete(k); release(KEYMAP[k]); }
+  else if(ev.key === ' '){ down.delete(' '); }
+});
+window.addEventListener('blur', () => { down.clear(); release('all'); });  // safety
+async function tick(){
+  try{
+    const s = await (await fetch('/status')).json();
+    const ph = document.getElementById('phase');
+    ph.textContent = s.phase; ph.className = 'phase' + (/ABORT|ERROR/.test(s.phase) ? ' bad':'');
+    document.getElementById('detail').textContent = s.detail || '';
+    const rows = [
+      ['joints (deg)', (s.joints||[]).join('  ')],
+      ['gripper %', s.gripper ?? '—'],
+      ['gripper xyz (m)', s.jog_xyz ? s.jog_xyz.join(', ') : '—'],
+      ['gripper angle', s.pitch != null ? s.pitch + '°  (0=flat, 90=down)' : '—'],
+      ['located object (m)', s.located ? s.located.join(', ') : '—'],
+      ['target radius/angle', s.target_polar ? (s.target_polar[0]+' cm  '+s.target_polar[1]+'°  h='+s.target_polar[2]+' cm') : '—'],
+      ['elapsed', s.t0 && s.running ? Math.round(Date.now()/1000 - s.t0) + ' s' : '—'],
+      ['in the jaws', s.carry || '— (empty)'],
+      ['servos', s.relaxed ? '💤 RELAXED (torque off)'
+          : ('live · idle ' + (s.idle_for||0) + 's'
+             + (s.idle_relax_s ? ' / relax at ' + s.idle_relax_s + 's' : ' / auto-relax off'))],
+      ['camera calibration', s.has_handeye ? 'fitted' : 'NONE — press Calibrate camera'],
+    ];
+    document.getElementById('rows').innerHTML =
+      rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+    document.getElementById('log').textContent = (s.log||[]).join('\\n');
+    document.getElementById('armname').textContent = s.arm || '';
+    const qi = document.getElementById('query');
+    if(s.query && !qi.value && document.activeElement !== qi) qi.value = s.query;
+  }catch(e){}
+  setTimeout(tick, 700);
+}
+tick();
+
+// ---- 2D top-down object map ----
+(function(){
+  const cv=document.getElementById('v2d'); if(!cv) return;
+  const ctx=cv.getContext('2d'); let objs=[];
+  function resize(){const r=cv.getBoundingClientRect(),dpr=devicePixelRatio||1;
+    cv.width=Math.round(r.width*dpr);cv.height=Math.round(r.height*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);}
+  addEventListener('resize',resize);resize();
+  // base at bottom-centre; +x = up (forward), +y = left. scale: fit ~55cm radius.
+  function W2S(x,y){const W=cv.clientWidth,H=cv.clientHeight,s=Math.min(W/1.4,(H-30)/0.80);
+    return [W/2 - y*s, H-20 - x*s];}
+  function col(l){return /red/.test(l)?'#e2574c':/green/.test(l)?'#3fc46b':/blue/.test(l)?'#4a93c9':'#e0b040';}
+  function draw(){const W=cv.clientWidth,H=cv.clientHeight;ctx.clearRect(0,0,W,H);
+    const s=Math.min(W/1.4,(H-30)/0.80),[ox,oy]=W2S(0,0);
+    ctx.strokeStyle='#1b2733';ctx.fillStyle='#4a5a68';ctx.font='10px ui-monospace,Consolas';
+    for(let r=10;r<=70;r+=10){ctx.beginPath();ctx.arc(ox,oy,r/100*s,Math.PI,2*Math.PI);ctx.stroke();
+      ctx.fillText(r+'cm',ox+3,oy-r/100*s+11);}
+    // reach limit ~42cm
+    ctx.strokeStyle='#3a5a3a';ctx.beginPath();ctx.arc(ox,oy,0.62*s,Math.PI,2*Math.PI);ctx.stroke();
+    ctx.fillStyle='#c9524a';ctx.beginPath();ctx.arc(ox,oy,5,0,7);ctx.fill();
+    ctx.fillStyle='#8aa';ctx.fillText('base',ox+7,oy+4);
+    for(const o of objs){
+      const c=col(o.label);
+      const yaw=Math.PI/180*(o.yaw||0);
+      const cw=(o.w_m||o.size||0.03)/2;
+      const cd=(o.d_m||o.size||0.03)/2;
+      // footprint corners in base frame, rotated by yaw, then to screen
+      const corners=[[-cd,-cw],[-cd,cw],[cd,cw],[cd,-cw]];
+      const cos=Math.cos(yaw), sin=Math.sin(yaw);
+      const P=corners.map(([dx,dy])=>{
+        const rx=dx*cos-dy*sin, ry=dx*sin+dy*cos;
+        return W2S(o.x+rx,o.y+ry);
+      });
+      const [sx,sy]=W2S(o.x,o.y);
+      if(o.yaw_known){
+        ctx.beginPath();ctx.moveTo(P[0][0],P[0][1]);for(let k=1;k<4;k++)ctx.lineTo(P[k][0],P[k][1]);ctx.closePath();
+        ctx.globalAlpha=0.30;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.stroke();
+        const [ex,ey]=W2S(o.x+0.03*Math.cos(yaw), o.y+0.03*Math.sin(yaw));
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(ex,ey);ctx.stroke();
+      }else{
+        // ORIENTATION UNKNOWN. Nothing measured a yaw for this object, so drawing
+        // an oriented rectangle would invent one - every object ends up looking
+        // axis-aligned and identical. A circle says "here, this big, angle unknown".
+        const rad=Math.max(cw,cd)*Math.min(cv.clientWidth/1.4,(cv.clientHeight-30)/0.80);
+        ctx.beginPath();ctx.arc(sx,sy,Math.max(4,rad),0,7);
+        ctx.globalAlpha=0.22;ctx.fillStyle=c;ctx.fill();ctx.globalAlpha=1;
+        ctx.strokeStyle=c;ctx.lineWidth=2;ctx.setLineDash([4,3]);ctx.stroke();ctx.setLineDash([]);
+      }
+      ctx.fillStyle=c;ctx.beginPath();ctx.arc(sx,sy,2,0,7);ctx.fill();
+      ctx.fillStyle=o.measured?'#e6ecf1':'#8d9aa6';ctx.font='11px ui-monospace,Consolas';
+      const dims=(o.w_m*100).toFixed(0)+'x'+(o.d_m*100).toFixed(0)+'x'+(o.h_m*100).toFixed(0);
+      ctx.fillText(o.label.split(' ')[0]+'#'+o.tag+' '+(o.shape||'cube')+' '+dims+(o.measured?'':'?'),sx+9,sy-6);}
+  }
+  // S2W is the inverse of W2S: it turns a click into a base-frame (x, y) so a bare
+  // patch of table can be a placement destination, not just a mapped object.
+  function S2W(sx,sy){const W=cv.clientWidth,H=cv.clientHeight,s=Math.min(W/1.4,(H-30)/0.80);
+    return [(H-20-sy)/s, (W/2-sx)/s];}
+  cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    let best=null,bd=22;for(const o of objs){const[sx,sy]=W2S(o.x,o.y);const d=Math.hypot(sx-mx,sy-my);
+      if(d<bd){bd=d;best=o;}}
+    if(window.placeArm){
+      const q = best ? ('tag='+best.tag)
+                     : (()=>{const[wx,wy]=S2W(mx,my);return 'x='+(wx*100).toFixed(1)+'&y='+(wy*100).toFixed(1);})();
+      const ep = window.placeArm; window.placeArm=null; setPlaceUI();
+      fetch('/'+ep+'?'+q+'&grasp='+grasp(),{method:'POST'}).then(r=>r.json()).then(j=>{
+        if(!j.ok) alert(ep+': '+(j.reason||'failed'));});
+      return;}
+    if(best)fetch('/goto2d?tag='+best.tag,{method:'POST'});});
+  async function poll(){try{const d=await(await fetch('/map2d')).json();objs=d.objs||[];draw();
+    const tb=document.querySelector('#map2dtab tbody');
+    const head='<tr style="color:#93a1ae;font-size:11px"><td>label#tag</td><td>x</td><td>y</td>'+
+      '<td>shape</td><td>w×d×h cm</td><td>yaw</td><td>r</td><td>n</td></tr>';
+    const rows=objs.map(o=>`<tr class="obj" style="cursor:pointer;${o.measured?'':'color:#8d9aa6'}" onclick="fetch('/goto2d?tag=${o.tag}',{method:'POST'})">`+
+      `<td>${o.label}#${o.tag}</td><td>${(o.x*100).toFixed(0)}</td><td>${(o.y*100).toFixed(0)}</td>`+
+      `<td>${o.shape||'cube'}</td>`+
+      `<td>${(o.w_m*100).toFixed(1)}×${(o.d_m*100).toFixed(1)}×${(o.h_m*100).toFixed(1)}${o.measured?'':' (prior)'}</td>`+
+      `<td>${o.yaw.toFixed(0)}°</td>`+
+      `<td>${o.r_cm}cm</td><td>${o.n}</td></tr>`).join('')
+      ||'<tr><td colspan=8 style="color:#8aa">empty — Scan → 2D map</td></tr>';
+    tb.innerHTML=head+rows;
+  }catch(e){} setTimeout(poll,500);}
+  poll();
+})();
+</script></body></html>
